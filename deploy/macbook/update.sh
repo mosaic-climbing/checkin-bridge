@@ -15,6 +15,18 @@
 # Requires: curl, shasum, launchctl.
 # Runs as root (it restarts a LaunchDaemon); the actual
 # bridge process keeps running as the `mosaic` user.
+#
+# SHA256 verification:
+#   By default the SHA256 file is fetched from the same GitHub release as
+#   the binary. A GitHub-side compromise could swap both in lockstep, so
+#   for belt-and-suspenders assurance supply the hash out of band:
+#
+#     sudo EXPECTED_SHA256=<64-hex> /usr/local/mosaic-bridge/update.sh v0.3.2
+#
+#   When EXPECTED_SHA256 is set, update.sh does NOT fetch the .sha256 file
+#   from the release; it verifies the binary against that value only. The
+#   expected hash should be published through a separate channel (release
+#   notes commit, staff Slack, email) so a GitHub takeover can't forge it.
 # ──────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -88,12 +100,28 @@ trap 'rm -rf "$TMP"' EXIT
 
 BASE="https://github.com/${REPO}/releases/download/${TAG}"
 log "downloading $ASSET"
-curl -fsSL --retry 3 -o "$TMP/$ASSET"         "$BASE/$ASSET"
-curl -fsSL --retry 3 -o "$TMP/$ASSET.sha256"  "$BASE/$ASSET.sha256"
+curl -fsSL --retry 3 -o "$TMP/$ASSET" "$BASE/$ASSET"
 
-log "verifying SHA256"
-( cd "$TMP" && shasum -a 256 -c "$ASSET.sha256" ) \
-    || fatal "checksum mismatch — refusing to install"
+if [ -n "${EXPECTED_SHA256:-}" ]; then
+    # Out-of-band hash supplied by the operator. Don't fetch the .sha256
+    # from the release — that's the channel we're trying to verify
+    # independently. Validate format first so a typo'd env var fails
+    # noisily instead of silently skipping verification.
+    if ! [[ "$EXPECTED_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        fatal "EXPECTED_SHA256 must be exactly 64 hex characters"
+    fi
+    log "verifying SHA256 against EXPECTED_SHA256 (out-of-band)"
+    ACTUAL=$(shasum -a 256 "$TMP/$ASSET" | awk '{print $1}')
+    EXPECTED_LC=$(printf '%s' "$EXPECTED_SHA256" | tr 'A-F' 'a-f')
+    if [ "$ACTUAL" != "$EXPECTED_LC" ]; then
+        fatal "checksum mismatch — expected $EXPECTED_LC, got $ACTUAL"
+    fi
+else
+    curl -fsSL --retry 3 -o "$TMP/$ASSET.sha256" "$BASE/$ASSET.sha256"
+    log "verifying SHA256 (from release channel — set EXPECTED_SHA256 for out-of-band)"
+    ( cd "$TMP" && shasum -a 256 -c "$ASSET.sha256" ) \
+        || fatal "checksum mismatch — refusing to install"
+fi
 
 chmod +x "$TMP/$ASSET"
 # Quarantine removal so launchd can exec it without a Gatekeeper prompt
