@@ -28,11 +28,12 @@ jobs:
             | sh -s -- -b /usr/local/bin
           trufflehog --version
       - name: Run preflight secret check
+        # check-secrets.sh --ci runs a full-tree TruffleHog scan plus the
+        # four other sections (staged envs, known-leaked substrings,
+        # key-shape regex, template placeholder check). No need to layer
+        # gitleaks-action on top — it now requires a paid license for
+        # organizations and would duplicate TruffleHog's coverage.
         run: ./scripts/check-secrets.sh --ci
-      - name: Gitleaks (belt & suspenders)
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   test:
     name: Test & vet
