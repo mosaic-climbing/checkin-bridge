@@ -99,6 +99,14 @@ type Config struct {
 	// default matches config.Bridge.UnmatchedGraceDays so zero-value
 	// Config{} doesn't accidentally produce an immediate-expiry loop.
 	UnmatchedGraceDays int
+	// LegacyNFCStatusLoop gates Step 2 of RunSync — the GetMemberByNFC-
+	// driven activation/deactivation pass. When false, RunSync still runs
+	// the C2 matching phase (Step 1.5) and the pending-expiry pass (Step 4)
+	// but skips Step 2 entirely. Set false for gyms that don't populate the
+	// legacy members table via /directory/sync + /ingest/unifi, to avoid
+	// noisy "name=Unknown, would DEACTIVATE" decisions against a
+	// half-populated cache. Mirrors config.Bridge.LegacyNFCStatusLoop.
+	LegacyNFCStatusLoop bool
 }
 
 // Syncer manages the daily Redpoint → UniFi status synchronisation.
@@ -392,105 +400,124 @@ func (s *Syncer) RunSync(ctx context.Context) (*SyncResult, error) {
 	// reads, never UA-Hub writes, so shadow mode is a no-op here.
 	s.runMatchingPhase(ctx, unifiUsers, result)
 
-	// Step 2: Build NFC token → UniFi user lookup
-	// Each user can have multiple NFC tokens; we need to match them against our store
-	// which is keyed by NFC UID.
-	for _, user := range unifiUsers {
-		if len(user.NfcTokens) == 0 {
-			result.Unmatched++
-			continue
-		}
-
-		// Try to find this user in our store by any of their NFC tokens
-		var cached *store.Member
-		var lookupErr error
-		for _, token := range user.NfcTokens {
-			cached, lookupErr = s.store.GetMemberByNFC(ctx, token)
-			if lookupErr != nil {
-				s.logger.Error("failed to look up member by NFC token",
-					"token", token,
-					"error", lookupErr,
-				)
-				result.Errors++
-				break
-			}
-			if cached != nil {
-				break
-			}
-		}
-
-		if cached == nil {
-			// Not in our store — could be a staff member, admin, etc. Leave alone.
-			result.Unmatched++
-			continue
-		}
-
-		result.Matched++
-
-		// Step 3: Compare status and update if needed
-		memberAllowed := cached.IsAllowed()
-		unifiActive := user.Status == "ACTIVE"
-
-		if memberAllowed && !unifiActive {
-			// Member is valid in Redpoint but locked out in UniFi → reactivate
-			action := "REACTIVATING user in UniFi"
-			if s.shadowMode {
-				action = "SHADOW: would REACTIVATE user in UniFi"
-			}
-			s.logger.Info(action,
-				"name", cached.FullName(),
-				"unifiId", user.ID,
-				"unifiStatus", user.Status,
-				"badgeStatus", cached.BadgeStatus,
-			)
-			if s.shadowMode {
-				result.Activated++
+	// Step 2: Legacy NFC-token status loop. Gated by LegacyNFCStatusLoop.
+	//
+	// This pass drives the old status-enforcement flow: for every UA user
+	// with NFC tokens, look them up in the local members cache (populated
+	// by /directory/sync + /ingest/unifi), and issue an ACTIVE/DEACTIVATED
+	// update against UA-Hub if the Redpoint-derived IsAllowed() disagrees
+	// with the current UA status.
+	//
+	// At LEF we've deprecated the members-cache path in favour of the C2
+	// ua_user_mappings matching phase (Step 1.5 above), and the cache is
+	// typically half-populated or empty. Running Step 2 there produces a
+	// stream of "cached == nil → result.Unmatched++" against every real
+	// user and (in shadow mode) spurious "would DEACTIVATE name=Unknown"
+	// log noise for the handful of partially-cached rows. When
+	// LegacyNFCStatusLoop is false, we skip this pass entirely; Step 4's
+	// pending-expiry still runs so grace-window deadlines are enforced,
+	// and a follow-up change will replace Step 2 with a mapping-driven
+	// status pass that reads from ua_user_mappings.
+	if s.config.LegacyNFCStatusLoop {
+		for _, user := range unifiUsers {
+			if len(user.NfcTokens) == 0 {
+				result.Unmatched++
 				continue
 			}
-			if err := s.unifi.UpdateUserStatus(ctx, user.ID, "ACTIVE"); err != nil {
-				s.logger.Error("failed to reactivate user",
-					"name", cached.FullName(),
-					"unifiId", user.ID,
-					"error", err,
-				)
-				result.Errors++
-			} else {
-				result.Activated++
-			}
-			time.Sleep(s.config.RateLimitDelay)
 
-		} else if !memberAllowed && unifiActive {
-			// Member is expired/frozen in Redpoint but still active in UniFi → deactivate
-			action := "DEACTIVATING user in UniFi"
-			if s.shadowMode {
-				action = "SHADOW: would DEACTIVATE user in UniFi"
+			// Try to find this user in our store by any of their NFC tokens
+			var cached *store.Member
+			var lookupErr error
+			for _, token := range user.NfcTokens {
+				cached, lookupErr = s.store.GetMemberByNFC(ctx, token)
+				if lookupErr != nil {
+					s.logger.Error("failed to look up member by NFC token",
+						"token", token,
+						"error", lookupErr,
+					)
+					result.Errors++
+					break
+				}
+				if cached != nil {
+					break
+				}
 			}
-			s.logger.Info(action,
-				"name", cached.FullName(),
-				"unifiId", user.ID,
-				"badgeStatus", cached.BadgeStatus,
-				"active", cached.Active,
-				"reason", cached.DenyReason(),
-			)
-			if s.shadowMode {
-				result.Deactivated++
+
+			if cached == nil {
+				// Not in our store — could be a staff member, admin, etc. Leave alone.
+				result.Unmatched++
 				continue
 			}
-			if err := s.unifi.UpdateUserStatus(ctx, user.ID, "DEACTIVATED"); err != nil {
-				s.logger.Error("failed to deactivate user",
+
+			result.Matched++
+
+			// Step 3: Compare status and update if needed
+			memberAllowed := cached.IsAllowed()
+			unifiActive := user.Status == "ACTIVE"
+
+			if memberAllowed && !unifiActive {
+				// Member is valid in Redpoint but locked out in UniFi → reactivate
+				action := "REACTIVATING user in UniFi"
+				if s.shadowMode {
+					action = "SHADOW: would REACTIVATE user in UniFi"
+				}
+				s.logger.Info(action,
 					"name", cached.FullName(),
 					"unifiId", user.ID,
-					"error", err,
+					"unifiStatus", user.Status,
+					"badgeStatus", cached.BadgeStatus,
 				)
-				result.Errors++
-			} else {
-				result.Deactivated++
-			}
-			time.Sleep(s.config.RateLimitDelay)
+				if s.shadowMode {
+					result.Activated++
+					continue
+				}
+				if err := s.unifi.UpdateUserStatus(ctx, user.ID, "ACTIVE"); err != nil {
+					s.logger.Error("failed to reactivate user",
+						"name", cached.FullName(),
+						"unifiId", user.ID,
+						"error", err,
+					)
+					result.Errors++
+				} else {
+					result.Activated++
+				}
+				time.Sleep(s.config.RateLimitDelay)
 
-		} else {
-			result.Unchanged++
+			} else if !memberAllowed && unifiActive {
+				// Member is expired/frozen in Redpoint but still active in UniFi → deactivate
+				action := "DEACTIVATING user in UniFi"
+				if s.shadowMode {
+					action = "SHADOW: would DEACTIVATE user in UniFi"
+				}
+				s.logger.Info(action,
+					"name", cached.FullName(),
+					"unifiId", user.ID,
+					"badgeStatus", cached.BadgeStatus,
+					"active", cached.Active,
+					"reason", cached.DenyReason(),
+				)
+				if s.shadowMode {
+					result.Deactivated++
+					continue
+				}
+				if err := s.unifi.UpdateUserStatus(ctx, user.ID, "DEACTIVATED"); err != nil {
+					s.logger.Error("failed to deactivate user",
+						"name", cached.FullName(),
+						"unifiId", user.ID,
+						"error", err,
+					)
+					result.Errors++
+				} else {
+					result.Deactivated++
+				}
+				time.Sleep(s.config.RateLimitDelay)
+
+			} else {
+				result.Unchanged++
+			}
 		}
+	} else {
+		s.logger.Debug("legacy NFC status loop disabled by config; skipping Step 2")
 	}
 
 	// Step 4: Pending expiry pass. After matching is populated and status

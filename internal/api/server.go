@@ -88,6 +88,17 @@ type Server struct {
 	// htmlCache caches rendered HTML fragments with TTL invalidation.
 	// See P1 in docs/architecture-review.md.
 	htmlCache *htmlCache
+	// breakerResetter, when non-nil, is called by POST /debug/reset-breakers
+	// to force-close the recheck circuit breaker. Wired via
+	// SetBreakerResetter from cmd/bridge after the recheck.Service is
+	// constructed. We use a function-typed setter rather than a direct
+	// *recheck.Service reference to avoid an import cycle back into recheck
+	// (which is deliberately upstream of api) and to keep the Server's
+	// dependency surface narrow — the debug endpoint genuinely only needs
+	// "press the reset button" and nothing else from the Service. The
+	// return value propagates the "was it open?" flag up into the HTTP
+	// response so operators can tell a meaningful reset from a no-op.
+	breakerResetter func() (wasOpen bool)
 }
 
 func NewServer(
@@ -149,6 +160,20 @@ func (s *Server) clientIP(r *http.Request) string {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
+}
+
+// SetBreakerResetter registers the callback used by POST /debug/reset-breakers
+// to force-close the recheck circuit breaker. Pass nil to disable the
+// endpoint (it will 503); cmd/bridge always wires the recheck.Service's
+// ResetBreaker method here.
+//
+// Setter-based rather than constructor-arg because NewServer's signature
+// is already wide (19 positional args as of C2 Layer 4d) and the
+// rechecker is constructed after the Server in cmd/bridge today. Adding
+// this as a 20th positional arg would be a noisy refactor for a single
+// debug-only wire-up.
+func (s *Server) SetBreakerResetter(fn func() bool) {
+	s.breakerResetter = fn
 }
 
 // ControlHandler returns the control-plane http.Handler: the mux that owns
@@ -282,6 +307,14 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /ingest/unmatched", withTimeout(longTimeout, s.handleUnmatched))
 	s.mux.HandleFunc("POST /status-sync", withTimeout(syncTimeout, s.handleStatusSync))
 	s.mux.HandleFunc("GET /status-sync", withTimeout(shortTimeout, s.handleStatusSyncStatus))
+
+	// Debug / incident-recovery routes. Gated by SecurityMiddleware's
+	// admin-key-OR-session path since /debug/* is neither public nor /ui/*.
+	// Intentionally kept on the public data-plane mux (not the control
+	// plane) because operators trigger it from the same staff browser
+	// session they use for /ui/*, and the action is auditable & reversible
+	// rather than door-touching. See P3 in docs/architecture-review.md.
+	s.mux.HandleFunc("POST /debug/reset-breakers", withTimeout(shortTimeout, s.handleDebugResetBreakers))
 
 	// ── Control-plane routes ────────────────────────────────
 	//
@@ -1240,28 +1273,62 @@ func (s *Server) handleUnmatched(w http.ResponseWriter, r *http.Request) {
 // ─── UniFi Status Sync ──────────────────────────────────────
 
 // POST /status-sync — trigger a manual sync of Redpoint membership status → UniFi user status.
+//
+// Runs asynchronously in the supervised background group so that a long sync
+// (a matching pass against a large UA-Hub population can take many minutes)
+// isn't killed when the triggering HTTP client disconnects. The request
+// returns 202 with a pointer to GET /status-sync for progress polling. If a
+// sync is already in flight, returns 200 with a "sync already in progress"
+// message rather than queueing another one — RunSync enforces the
+// single-runner invariant internally too, but returning early here avoids
+// logging a bogus "start" event.
 func (s *Server) handleStatusSync(w http.ResponseWriter, r *http.Request) {
 	if s.statusSyncer == nil {
 		writeError(w, http.StatusServiceUnavailable, "status syncer not configured")
+		return
+	}
+	if s.statusSyncer.IsRunning() {
+		writeJSON(w, map[string]any{
+			"message": "sync already in progress — poll GET /status-sync to monitor",
+			"running": true,
+		})
 		return
 	}
 
 	s.logger.Info("manual UniFi status sync triggered via API")
 	s.audit.Log("status_sync_start", r.RemoteAddr, nil)
 
-	result, err := s.statusSyncer.RunSync(r.Context())
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "status sync failed: "+err.Error())
-		return
-	}
-	s.audit.Log("status_sync_complete", r.RemoteAddr, map[string]any{
-		"activated": result.Activated, "deactivated": result.Deactivated,
-		"unchanged": result.Unchanged, "errors": result.Errors,
+	// Snapshot the caller's IP so the completion audit event has the same
+	// attribution as the start event. The background goroutine runs with
+	// its own context, so r.RemoteAddr is not safe to read there.
+	peer := r.RemoteAddr
+
+	// Run in background via the supervised group. ctx is the bridge
+	// shutdown context, not the request context — so a client disconnect
+	// mid-sync no longer cancels in-flight Redpoint or DB work.
+	s.bg.Go("status-sync", func(ctx context.Context) error {
+		result, err := s.statusSyncer.RunSync(ctx)
+		if err != nil {
+			s.logger.Error("background status sync failed", "error", err)
+			s.audit.Log("status_sync_error", peer, map[string]any{"error": err.Error()})
+			return nil // swallow — bg.Go's error is logged but we've already handled it
+		}
+		s.audit.Log("status_sync_complete", peer, map[string]any{
+			"activated":    result.Activated,
+			"deactivated":  result.Deactivated,
+			"unchanged":    result.Unchanged,
+			"errors":       result.Errors,
+			"newlyMatched": result.NewlyMatched,
+			"newlyPending": result.NewlyPending,
+			"duration":     result.Duration,
+		})
+		return nil
 	})
 
-	writeJSON(w, map[string]any{
-		"success": true,
-		"result":  result,
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"message": "sync started — poll GET /status-sync to monitor",
 	})
 }
 
@@ -1275,6 +1342,51 @@ func (s *Server) handleStatusSyncStatus(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, map[string]any{
 		"running":    s.statusSyncer.IsRunning(),
 		"lastResult": s.statusSyncer.LastResult(),
+	})
+}
+
+// POST /debug/reset-breakers — force-close the recheck circuit breaker.
+//
+// Operator-invoked recovery endpoint for the case where the breaker has
+// tripped (e.g. during a brief Redpoint outage) and the operator wants
+// to short-circuit the 60s cooldown because they've already confirmed
+// upstream is healthy. Without this, the only remediation was a bridge
+// restart — which drops the UA-Hub WebSocket, pauses the check-in queue,
+// and takes ~5-10s to come back.
+//
+// Auth: SecurityMiddleware gates this under the admin-key-OR-session
+// branch (it's not /health, not /ui/*, not /ui/login). Listed in the
+// audit log for both success and no-op cases so the forensic trail shows
+// when an on-call operator manually overrode the breaker.
+//
+// Response shape is deliberately small so a curl one-liner from a
+// runbook prints cleanly:
+//
+//	{ "ok": true, "wasOpen": true, "breaker": "recheck" }
+//
+// `wasOpen` distinguishes a meaningful recovery from a no-op press.
+func (s *Server) handleDebugResetBreakers(w http.ResponseWriter, r *http.Request) {
+	if s.breakerResetter == nil {
+		writeError(w, http.StatusServiceUnavailable, "breaker resetter not configured")
+		return
+	}
+	wasOpen := s.breakerResetter()
+	peer := s.clientIP(r)
+	s.logger.Info("manual breaker reset via /debug/reset-breakers",
+		"breaker", "recheck",
+		"wasOpen", wasOpen,
+		"peer", peer,
+	)
+	if s.audit != nil {
+		s.audit.Log("breaker_reset", peer, map[string]any{
+			"breaker": "recheck",
+			"wasOpen": wasOpen,
+		})
+	}
+	writeJSON(w, map[string]any{
+		"ok":      true,
+		"breaker": "recheck",
+		"wasOpen": wasOpen,
 	})
 }
 

@@ -264,8 +264,9 @@ func TestShadowMode_NoUniFiWrites(t *testing.T) {
 	}
 
 	syncer := New(unifiClient, rpClient, db, Config{
-		SyncInterval:   time.Hour,
-		RateLimitDelay: time.Millisecond,
+		SyncInterval:        time.Hour,
+		RateLimitDelay:      time.Millisecond,
+		LegacyNFCStatusLoop: true, // this test exercises the Step 2 NFC-cache loop
 	}, logger)
 	syncer.SetShadowMode(true)
 
@@ -289,6 +290,111 @@ func TestShadowMode_NoUniFiWrites(t *testing.T) {
 	// The contract: zero PUT /users/:id calls reached UniFi.
 	if got := fakeUnifi.StatusUpdateCount(); got != 0 {
 		t.Errorf("shadow mode sent %d UniFi status update(s); want 0", got)
+	}
+}
+
+// TestRunSync_LegacyNFCStatusLoopDisabled pins the P2 patch: when the
+// LegacyNFCStatusLoop flag is false, Step 2's members-cache-driven
+// activation/deactivation pass is skipped entirely. The same UA-side
+// scenario as TestShadowMode_NoUniFiWrites (one ACTIVE UniFi user with
+// an NFC token whose cache entry is FROZEN) must produce zero Matched /
+// zero Deactivated / zero UA-Hub writes — the legacy loop simply did
+// not run. Steps 1 (fetch UA users), 1.5 (C2 matcher), and 4 (pending
+// expiry) still run, which is why result.Unmatched / Matching are not
+// asserted to zero: the matcher phase is unaffected by this flag, and
+// its counters are independent of the Step-2 accounting.
+//
+// This test is what catches a future refactor that quietly re-enables
+// Step 2 by default (e.g. removing the gate during a cleanup pass) —
+// LEF ships with LegacyNFCStatusLoop=false and depends on this contract.
+func TestRunSync_LegacyNFCStatusLoopDisabled(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	fakeUnifi := testutil.NewFakeUniFi()
+	defer fakeUnifi.Close()
+	fakeUnifi.Users = []map[string]any{
+		{
+			"id":         "unifi-user-1",
+			"first_name": "Frozen",
+			"last_name":  "Member",
+			"status":     "ACTIVE",
+			"credentials": []any{
+				map[string]any{
+					"type":  "nfc",
+					"token": "TOKEN-FROZEN",
+				},
+			},
+		},
+	}
+
+	fakeRedpoint := testutil.NewFakeRedpoint()
+	defer fakeRedpoint.Close()
+
+	unifiClient := unifi.NewClient(
+		"wss://unused",
+		fakeUnifi.BaseURL(),
+		"test-token",
+		500,
+		"",
+		logger,
+	)
+	rpClient := redpoint.NewClient(
+		fakeRedpoint.GraphQLURL(),
+		"test-api-key",
+		"TEST",
+		logger,
+	)
+
+	dir := t.TempDir()
+	db, err := store.Open(dir, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Seed the frozen-member cache entry. If Step 2 were still running,
+	// this would trigger a Matched + Deactivated.
+	if err := db.UpsertMember(context.Background(), &store.Member{
+		NfcUID:      "TOKEN-FROZEN",
+		CustomerID:  "rp-cust-1",
+		FirstName:   "Frozen",
+		LastName:    "Member",
+		BadgeStatus: "FROZEN",
+		Active:      true,
+		CachedAt:    time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	syncer := New(unifiClient, rpClient, db, Config{
+		SyncInterval:        time.Hour,
+		RateLimitDelay:      time.Millisecond,
+		LegacyNFCStatusLoop: false, // <-- the P2 gate
+	}, logger)
+
+	result, err := syncer.RunSync(context.Background())
+	if err != nil {
+		t.Fatalf("RunSync: %v", err)
+	}
+	if result.Matched != 0 {
+		t.Errorf("Matched = %d, want 0 when legacy loop disabled", result.Matched)
+	}
+	if result.Deactivated != 0 {
+		t.Errorf("Deactivated = %d, want 0 when legacy loop disabled", result.Deactivated)
+	}
+	if result.Activated != 0 {
+		t.Errorf("Activated = %d, want 0 when legacy loop disabled", result.Activated)
+	}
+	if result.Unchanged != 0 {
+		t.Errorf("Unchanged = %d, want 0 when legacy loop disabled", result.Unchanged)
+	}
+	if result.Unmatched != 0 {
+		// Step 2 is the only contributor to Unmatched today. With the
+		// gate tripped, this counter must stay at zero.
+		t.Errorf("Unmatched = %d, want 0 when legacy loop disabled", result.Unmatched)
+	}
+	if got := fakeUnifi.StatusUpdateCount(); got != 0 {
+		t.Errorf("legacy-disabled sync sent %d UniFi status update(s); want 0", got)
 	}
 }
 
