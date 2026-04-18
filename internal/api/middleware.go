@@ -80,6 +80,30 @@ func SecurityMiddleware(cfg SecurityConfig, next http.Handler) http.Handler {
 		// Staff UI pages and fragments: require session cookie
 		if path == "/ui" || path == "/ui/" || strings.HasPrefix(path, "/ui/page/") || strings.HasPrefix(path, "/ui/frag/") {
 			if cfg.Sessions != nil && cfg.Sessions.GetSessionFromRequest(r) {
+				// Mutating /ui/frag/* routes (door-policy add/delete,
+				// unmatched-queue match/skip/defer) need the same CSRF
+				// gate as the root-level session path. Prior to this,
+				// the /ui/* branch returned immediately after session
+				// auth, which meant an attacker page lured to a logged-in
+				// staff browser could fire those mutations cross-origin.
+				// GETs are pure reads and don't need CSRF.
+				if isMutatingMethod(r.Method) {
+					if r.Header.Get("X-Requested-With") == "" {
+						writeError(w, http.StatusForbidden, "missing X-Requested-With header")
+						return
+					}
+					if cfg.Sessions == nil || !cfg.Sessions.VerifyCSRF(r) {
+						if cfg.Logger != nil {
+							cfg.Logger.Warn("CSRF check failed",
+								"path", r.URL.Path,
+								"method", r.Method,
+								"ip", extractClientIP(r, cfg.TrustedProxies),
+							)
+						}
+						writeError(w, http.StatusForbidden, "CSRF token mismatch")
+						return
+					}
+				}
 				next.ServeHTTP(w, r)
 				return
 			}

@@ -51,9 +51,18 @@ pmset -g | grep -E '^ (sleep|hibernatemode|disksleep)'   # verify: all 0
 **System Settings → enable these**:
 - Battery → Options → "Prevent automatic sleeping when the display is off" ✓
 - Battery → Options → "Wake for network access" ✓
-- General → Login Items → add your admin user to auto-login, OR set automatic login via Users & Groups
+- **Users & Groups → "Automatically log in as" → pick your admin user** → enter that user's password to confirm. (Note: the `General → Login Items` pane is for *apps* that launch after login — it does NOT control auto-login. Auto-login lives in Users & Groups, and is only available when FileVault is OFF; if the menu is greyed out, disable FileVault first.)
 - General → Sharing → Remote Login ✓ (so you can SSH in from your laptop)
 - FileVault: **OFF** (or record recovery key — FileVault + reboot means bridge doesn't start until someone physically unlocks the disk)
+
+**About sudo over SSH:** the heredoc form (`ssh $GYM 'bash -s' <<REMOTE`) is non-interactive and `sudo` inside it can't prompt for a password. Do **not** try to "fix" this with `ssh -tt` + `sudo -v` at the top of the heredoc — the tty and heredoc stdin are the same stream, so sudo reads the heredoc lines as failed password attempts and the whole thing hangs.
+
+Two patterns that actually work:
+
+1. **For the one-time install (Step 2):** don't use a heredoc. Open an interactive root shell instead, paste the commands, exit. Step 2 has been rewritten this way.
+2. **For recurring `make deploy` runs later:** grant NOPASSWD *only* to the one script that runs non-interactively — `update.sh` — not the whole user. Do this after Step 4, once `update.sh` is installed and root-owned (instructions below in Step 4).
+
+The pattern to avoid: `NOPASSWD:ALL` for a human admin account. It sounds convenient but means any compromise of that account is instant root. The scoped approach keeps root access pinned to a root-owned binary the admin can't edit.
 
 **On the UDM Pro:** create a DHCP reservation pinning the MacBook's Ethernet MAC to a fixed IP. Note the IP — you'll use it below.
 
@@ -66,52 +75,72 @@ Why it matters: `DEPLOY.md` §1.
 From your laptop:
 
 ```bash
-export GYM=<macbook-fixed-ip>    # e.g. 192.168.1.42
+export GYM=<admin-username>@<macbook-fixed-ip>    # e.g. mosaicadmin@192.168.1.42
+# Verify it works — whoami should print the admin username on the Mac:
+ssh $GYM 'whoami'
 ```
 
+Omitting the `<admin-username>@` part makes SSH fall back to your *local* username,
+which typically isn't the account on the gym Mac and causes every subsequent
+`ssh $GYM ...` command to fail with "Permission denied (publickey)".
+
+Open an interactive root shell and paste the commands. The `-t` on ssh allocates a tty for the password prompt; `sudo -i` gives you a root login shell on the gym Mac so the pasted commands run as root without per-line `sudo`.
+
 ```bash
-ssh $GYM 'bash -s' <<'REMOTE'
+ssh -t $GYM 'sudo -i'
+# type your Mac admin password at the prompt
+```
+
+Now paste this block into that root shell (it's the same commands but without `sudo` prefixes — you're already root):
+
+```bash
 set -euo pipefail
 
 # 1. Dedicated non-root service user
 if ! id mosaic >/dev/null 2>&1; then
-  sudo dscl . -create /Users/mosaic
-  sudo dscl . -create /Users/mosaic UserShell /usr/bin/false
-  sudo dscl . -create /Users/mosaic RealName "Mosaic Bridge"
-  sudo dscl . -create /Users/mosaic UniqueID "701"
-  sudo dscl . -create /Users/mosaic PrimaryGroupID 20
-  sudo dscl . -create /Users/mosaic NFSHomeDirectory /var/empty
+  dscl . -create /Users/mosaic
+  dscl . -create /Users/mosaic UserShell /usr/bin/false
+  dscl . -create /Users/mosaic RealName "Mosaic Bridge"
+  dscl . -create /Users/mosaic UniqueID "701"
+  dscl . -create /Users/mosaic PrimaryGroupID 20
+  dscl . -create /Users/mosaic NFSHomeDirectory /var/empty
 fi
 
 # 2. Install dir + data dir with tight perms
-sudo mkdir -p /usr/local/mosaic-bridge/data
-sudo chmod 700 /usr/local/mosaic-bridge/data
-sudo chown -R mosaic:staff /usr/local/mosaic-bridge
+mkdir -p /usr/local/mosaic-bridge/data
+chmod 700 /usr/local/mosaic-bridge/data
+chown -R mosaic:staff /usr/local/mosaic-bridge
 
 # 3. Pre-create log files so launchd can write to them
-sudo touch /usr/local/mosaic-bridge/bridge.log /usr/local/mosaic-bridge/bridge.err
-sudo chown mosaic:staff /usr/local/mosaic-bridge/bridge.log /usr/local/mosaic-bridge/bridge.err
-REMOTE
+touch /usr/local/mosaic-bridge/bridge.log /usr/local/mosaic-bridge/bridge.err
+chown mosaic:staff /usr/local/mosaic-bridge/bridge.log /usr/local/mosaic-bridge/bridge.err
+
+# verify
+id mosaic
+ls -la /usr/local/mosaic-bridge
 ```
 
-**Drop an `.env` from your laptop:**
+Expect `id mosaic` to print the new user with UID 701, and `ls -la` to show `data/` owned by `mosaic:staff` mode 700. Then `exit` to leave the root shell, `exit` again to close the ssh session.
+
+Verify from your laptop (read-only, no sudo needed):
 
 ```bash
-scp .env.shadow.example $GYM:/tmp/bridge.env
-ssh $GYM '
-  sudo mv /tmp/bridge.env /usr/local/mosaic-bridge/.env
-  sudo chmod 600 /usr/local/mosaic-bridge/.env
-  sudo chown mosaic:staff /usr/local/mosaic-bridge/.env
-'
+ssh $GYM 'id mosaic && ls -la /usr/local/mosaic-bridge'
 ```
 
-**Edit the `.env`** to fill in your values:
+For the later `scp .env.shadow.example ...` + `ssh '... sudo mv ...'` block, the sudo call is a single command (not a heredoc), so either run `ssh -t $GYM 'sudo mv ...'` and type your password once, or do the mv inside the same `sudo -i` session earlier.
+
+**Populate `.env` on your laptop, then ship the completed file** — editing in a real editor is much less error-prone than vi over SSH.
 
 ```bash
-ssh $GYM 'sudo -u mosaic vi /usr/local/mosaic-bridge/.env'
+# Copy the tracked template to a gitignored working copy
+cp .env.shadow.example .env
+
+# Sanity-check it's gitignored (no output = ignored)
+git check-ignore -v .env && echo "GITIGNORED ✓"
 ```
 
-Required changes:
+Open `.env` in your editor and fill in:
 
 ```ini
 UNIFI_HOST=<udm-lan-ip>
@@ -131,6 +160,25 @@ BIND_ADDR=127.0.0.1
 # Optional: pin sync to quiet hours
 SYNC_TIME_LOCAL=04:00
 ```
+
+Ship it, preserving 600 mode through the `/tmp` hop, then atomically install into the final path:
+
+```bash
+chmod 600 .env
+scp -p .env $GYM:/tmp/bridge.env
+ssh -t $GYM 'sudo install -o mosaic -g staff -m 600 /tmp/bridge.env /usr/local/mosaic-bridge/.env && sudo rm /tmp/bridge.env'
+```
+
+`install` is deliberate — it sets owner, group, and mode in one atomic operation, so there's no brief window where the file is world-readable at the final path. The `rm` wipes the `/tmp` copy immediately.
+
+**Verify:**
+
+```bash
+ssh $GYM 'ls -la /usr/local/mosaic-bridge/.env'
+# expect: -rw-------  1 mosaic  staff  <size> ...
+```
+
+The local `.env` can stay in your repo dir for reference — it's gitignored, CI's secret scan scopes env-file checks to staged files only, and having a copy is useful if you ever need to diff or re-deploy. Just never `git add` it.
 
 **Sanity-check UA-Hub is reachable:**
 
@@ -472,6 +520,7 @@ ssh $GYM 'sudo /usr/local/mosaic-bridge/update.sh rollback'      # revert
 
 | Symptom | First check |
 |---|---|
+| `sudo: a terminal is required to read the password` in heredoc output, **or the heredoc hangs** | Don't try to fix this with `ssh -tt` + `sudo -v` — the tty and heredoc stdin collide and sudo consumes heredoc lines as password attempts. Use an interactive root shell instead: `ssh -t $GYM 'sudo -i'` then paste the commands without `sudo` prefixes. See Step 1's sudo-over-SSH note. |
 | `update.sh` says "checksum mismatch" | Re-run; if it persists, the release asset may be corrupted — re-publish from GitHub Actions |
 | `update.sh` rolled back after install | `ssh $GYM 'cat /usr/local/mosaic-bridge/bridge.err'` — usually a missing `.env` var in the new build's config schema |
 | Bridge won't start (no `.prev`) | `ssh $GYM 'cat /usr/local/mosaic-bridge/bridge.err'` — missing `.env` value or bad `DATA_DIR` |

@@ -242,6 +242,82 @@ func TestCSRFProtection(t *testing.T) {
 	}
 }
 
+// TestCSRFProtection_UIFragMutating locks in CSRF enforcement on the
+// /ui/frag/* branch. Before the S8 fix the /ui/* branch returned early
+// after session auth, so POST /ui/frag/door-policy (and the match/skip/
+// defer siblings) accepted session-only requests with no CSRF token —
+// an attacker page could fire mutations at a logged-in staff browser.
+// These cases keep the bug from regressing.
+func TestCSRFProtection_UIFragMutating(t *testing.T) {
+	sm := NewSessionManager("test-pass")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := SecurityMiddleware(SecurityConfig{
+		AdminAPIKey: "test-key",
+		Sessions:    sm,
+		Logger:      logger,
+	}, inner)
+
+	token, csrf, _ := sm.CreateSession()
+
+	// Mutating POST to /ui/frag/* with session but NO CSRF → 403
+	req := httptest.NewRequest("POST", "/ui/frag/door-policy", strings.NewReader(`{}`))
+	req.AddCookie(&http.Cookie{Name: sm.cookieName, Value: token})
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("POST /ui/frag/door-policy without CSRF: got %d, want 403", w.Code)
+	}
+
+	// Mutating POST to /ui/frag/* with session + missing X-Requested-With → 403
+	req = httptest.NewRequest("POST", "/ui/frag/unmatched/abc/match", strings.NewReader(`{}`))
+	req.AddCookie(&http.Cookie{Name: sm.cookieName, Value: token})
+	req.AddCookie(&http.Cookie{Name: sm.csrfCookieName, Value: csrf})
+	req.Header.Set("X-CSRF-Token", csrf)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("POST /ui/frag/unmatched/*/match without X-Requested-With: got %d, want 403", w.Code)
+	}
+
+	// Mutating DELETE to /ui/frag/* with mismatched CSRF → 403
+	req = httptest.NewRequest("DELETE", "/ui/frag/door-policy/door-123", nil)
+	req.AddCookie(&http.Cookie{Name: sm.cookieName, Value: token})
+	req.AddCookie(&http.Cookie{Name: sm.csrfCookieName, Value: csrf})
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("X-CSRF-Token", "wrong-token")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("DELETE /ui/frag/door-policy with mismatched CSRF: got %d, want 403", w.Code)
+	}
+
+	// Happy path: mutating POST with full session + CSRF → 200
+	req = httptest.NewRequest("POST", "/ui/frag/door-policy", strings.NewReader(`{}`))
+	req.AddCookie(&http.Cookie{Name: sm.cookieName, Value: token})
+	req.AddCookie(&http.Cookie{Name: sm.csrfCookieName, Value: csrf})
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("X-CSRF-Token", csrf)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("POST /ui/frag/door-policy with full auth: got %d, want 200", w.Code)
+	}
+
+	// GET to /ui/frag/* with session → 200 (no CSRF required on reads)
+	req = httptest.NewRequest("GET", "/ui/frag/unmatched-list", nil)
+	req.AddCookie(&http.Cookie{Name: sm.cookieName, Value: token})
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("GET /ui/frag/unmatched-list with session: got %d, want 200", w.Code)
+	}
+}
+
 // TestExtractClientIP_TrustModel covers the S1 fix: forwarding headers
 // are honoured only when r.RemoteAddr's IP is itself inside one of the
 // configured trusted-proxy CIDRs. Every row in this table is a case that
