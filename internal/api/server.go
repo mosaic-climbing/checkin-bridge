@@ -234,8 +234,9 @@ func (s *Server) routes() {
 	// "Needs Match" staff UI (C2). List + detail fragments read the
 	// ua_user_mappings_pending table directly; mutations (match / skip /
 	// defer) hit UA-Hub + audit trail + pending table in a single
-	// transaction-ish sequence. All five endpoints share the /ui/frag/*
-	// session-auth + CSRF middleware gate.
+	// transaction-ish sequence. All five endpoints go through the
+	// /ui/frag/* session-auth branch; mutating methods additionally pass
+	// the CSRF gate (middleware.go: SecurityMiddleware /ui/* branch).
 	s.mux.HandleFunc("GET /ui/frag/unmatched-list", withTimeout(longTimeout, s.handleFragUnmatchedList))
 	s.mux.HandleFunc("GET /ui/frag/unmatched/{uaUserId}/detail", withTimeout(longTimeout, s.handleFragUnmatchedDetail))
 	s.mux.HandleFunc("POST /ui/frag/unmatched/{uaUserId}/search", withTimeout(longTimeout, s.handleFragUnmatchedSearch))
