@@ -564,10 +564,7 @@ func retryable(err error) bool {
 		return herr.Status == http.StatusTooManyRequests || herr.Status >= 500
 	}
 	var terr *transportError
-	if errors.As(err, &terr) {
-		return true
-	}
-	return false
+	return errors.As(err, &terr)
 }
 
 // execWithRetry wraps exec with classified retry: exponential backoff +

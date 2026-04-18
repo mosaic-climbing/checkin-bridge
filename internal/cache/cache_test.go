@@ -8,13 +8,6 @@ import (
 	"testing"
 )
 
-func testLogger() *testLog {
-	return &testLog{}
-}
-
-// minimal slog-compatible logger for tests (discards output)
-type testLog struct{}
-
 func newTestCache(t *testing.T) (*MemberCache, string) {
 	t.Helper()
 	dir := t.TempDir()

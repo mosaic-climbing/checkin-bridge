@@ -82,8 +82,8 @@ func (g *Gauge) Dec() {
 func (g *Gauge) Value() float64 { return math.Float64frombits(uint64(g.value.Load())) }
 
 // Histogram tracks value distributions using pre-defined buckets.
+// All fields are accessed via atomics; no mutex needed.
 type Histogram struct {
-	mu      sync.Mutex
 	buckets []float64      // upper bounds
 	counts  []atomic.Int64 // one per bucket + 1 for +Inf
 	sum     atomic.Int64   // sum as float64 bits

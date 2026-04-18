@@ -247,7 +247,7 @@ func (s *Service) RecheckDeniedTap(ctx context.Context, nfcToken string) (*Resul
 		// Count this as a breaker failure — network/5xx/auth errors are
 		// the signals the breaker exists to protect against.
 		s.breaker.failure()
-		return nil, fmt.Errorf("Redpoint live query failed: %w", err)
+		return nil, fmt.Errorf("redpoint live query failed: %w", err)
 	}
 	// Redpoint responded successfully; reset the breaker regardless of
 	// whether the customer was found. A missing customer is an
