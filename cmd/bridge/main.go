@@ -303,6 +303,20 @@ func main() {
 		logger.Info("IP allowlist enabled", "networks", cidrStrs)
 	}
 
+	// Surface-area warning: the public data plane is reachable off-host
+	// AND there is no CIDR allowlist. The staff UI is still password-
+	// protected and admin endpoints still require ADMIN_API_KEY, but any
+	// host on the routable network can probe /ui/login and /health. On
+	// the UDM Pro's nspawn container in particular, "" or "0.0.0.0"
+	// means the whole LAN. Operators who intentionally expose the
+	// dashboard should set ALLOWED_NETWORKS to the staff subnet; loud
+	// log-at-boot is cheaper than a quiet misconfiguration.
+	if cfg.Bridge.BindAddr != "127.0.0.1" && cfg.Bridge.BindAddr != "localhost" && len(allowedNets) == 0 {
+		logger.Warn("public listener reachable off-host with no IP allowlist",
+			"bind_addr", cfg.Bridge.BindAddr,
+			"hint", "set ALLOWED_NETWORKS to the staff subnet, or BIND_ADDR=127.0.0.1")
+	}
+
 	// ── Trusted reverse-proxy CIDRs (S1) ─────────────────────
 	// Empty list is the default and correct stance when nothing proxies
 	// the bridge. When populated, X-Forwarded-For / X-Real-IP headers
@@ -518,16 +532,23 @@ func main() {
 	bgGroup.Go("statusync", statusSyncer.Run)
 
 	// ── HTTP server with graceful shutdown ────────────────────
-	// Default bind is all interfaces; BIND_ADDR lets the operator restrict
-	// to localhost or a specific LAN IP. On the UDM Pro the nspawn container
-	// shares host networking, so 127.0.0.1 is strongly recommended unless
-	// ALLOWED_NETWORKS is set.
+	// Default bind is 127.0.0.1 (loopback-only). Operators who need LAN
+	// reachability must set BIND_ADDR explicitly AND set ALLOWED_NETWORKS
+	// to the staff subnet; the startup warning above fires if only one is
+	// set. On the UDM Pro the nspawn container shares host networking, so
+	// 127.0.0.1 is strongly recommended unless ALLOWED_NETWORKS is set.
+	//
+	// WriteTimeout is intentionally tight (30s) for the public data plane:
+	// every route here — /ui/*, /health, /checkins, /directory/search —
+	// responds in well under a second, so anything slower is either a
+	// slow-client attack or a bug. (The control plane below matches 30s
+	// too; the longer-running sync endpoints complete well under a minute.)
 	addr := fmt.Sprintf("%s:%d", cfg.Bridge.BindAddr, cfg.Bridge.Port)
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Minute,
+		WriteTimeout:      30 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
 		MaxHeaderBytes:    1 << 16, // 64KB
 	}

@@ -71,7 +71,11 @@ type BridgeConfig struct {
 	// identity. Set this when fronting the bridge with nginx, Traefik,
 	// Caddy, or a load balancer on the UDM Pro; otherwise leave empty.
 	TrustedProxies   string `json:"trustedProxies"`
-	BindAddr         string `json:"bindAddr"`         // optional TCP bind address; empty means listen on all interfaces
+	// BindAddr is the TCP bind address for the public data-plane listener.
+	// Defaults to "127.0.0.1" (loopback-only); operators who need LAN
+	// reachability must set this explicitly AND set ALLOWED_NETWORKS to
+	// the staff subnet. Setting BindAddr="" means "all interfaces".
+	BindAddr         string `json:"bindAddr"`
 
 	// ControlPort is the TCP port for the control-plane listener which hosts
 	// the mutating admin endpoints (POST /unlock/{doorId}, /cache/sync,
@@ -254,6 +258,7 @@ func defaults() *Config {
 			DataDir:            "data",
 			UnlockDurationMs:   5000,
 			UnmatchedGraceDays: 7,
+			BindAddr:           "127.0.0.1",
 			ControlBindAddr:    "127.0.0.1",
 		},
 		Sync: SyncConfig{
