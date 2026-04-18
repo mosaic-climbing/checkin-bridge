@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mosaic Bridge</title>
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg: #f4f5f7; --sidebar: #1e1e2e; --sidebar-hover: #2a2a3e;
+            --accent: #6c5ce7; --accent-light: #a29bfe;
+            --text: #2d3436; --text-muted: #636e72;
+            --card: #fff; --border: #dfe6e9;
+            --success: #00b894; --danger: #d63031; --warning: #fdcb6e;
+        }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); display: flex; min-height: 100vh; }
+
+        /* Sidebar */
+        .sidebar { width: 220px; background: var(--sidebar); color: #fff; padding: 20px 0; flex-shrink: 0; position: fixed; top: 0; bottom: 0; overflow-y: auto; }
+        .sidebar h1 { font-size: 18px; padding: 0 20px 20px; border-bottom: 1px solid rgba(255,255,255,0.1); margin-bottom: 10px; }
+        .sidebar h1 span { color: var(--accent-light); }
+        .nav-section { padding: 8px 20px 4px; font-size: 11px; text-transform: uppercase; color: rgba(255,255,255,0.4); letter-spacing: 1px; }
+        .nav-link { display: block; padding: 10px 20px; color: rgba(255,255,255,0.7); text-decoration: none; font-size: 14px; transition: all 0.15s; }
+        .nav-link:hover, .nav-link.active { background: var(--sidebar-hover); color: #fff; }
+
+        /* Main content */
+        .main { margin-left: 220px; padding: 24px; flex: 1; min-width: 0; }
+        .page-header { margin-bottom: 24px; }
+        .page-header h2 { font-size: 22px; font-weight: 600; }
+        .page-header p { color: var(--text-muted); margin-top: 4px; }
+
+        /* Cards */
+        .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+        .card h3 { font-size: 15px; font-weight: 600; margin-bottom: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+
+        /* Stats grid */
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 20px; }
+        .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+        .stat-value { font-size: 28px; font-weight: 700; color: var(--accent); }
+        .stat-label { font-size: 12px; color: var(--text-muted); margin-top: 2px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+        /* Tables */
+        table { width: 100%; border-collapse: collapse; font-size: 14px; }
+        th { text-align: left; padding: 10px 12px; border-bottom: 2px solid var(--border); font-weight: 600; color: var(--text-muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+        td { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+        tr:hover td { background: #f8f9fa; }
+
+        /* Badges */
+        .badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+        .badge-active { background: #d4edda; color: #155724; }
+        .badge-frozen { background: #cce5ff; color: #004085; }
+        .badge-expired { background: #f8d7da; color: #721c24; }
+        .badge-denied { background: #f8d7da; color: #721c24; }
+        .badge-allowed { background: #d4edda; color: #155724; }
+        .badge-pending { background: #fff3cd; color: #856404; }
+        .badge-running { background: #cce5ff; color: #004085; }
+        .badge-completed { background: #d4edda; color: #155724; }
+        .badge-failed { background: #f8d7da; color: #721c24; }
+
+        /* Forms */
+        input, select { padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; width: 100%; }
+        input:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(108,92,231,0.1); }
+        .form-row { display: flex; gap: 12px; align-items: end; margin-bottom: 12px; }
+        .form-group { flex: 1; }
+        .form-group label { display: block; font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+        /* Buttons */
+        .btn { padding: 8px 16px; border: none; border-radius: 6px; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.15s; text-decoration: none; display: inline-block; }
+        .btn-primary { background: var(--accent); color: #fff; }
+        .btn-primary:hover { background: #5b4bd5; }
+        .btn-danger { background: var(--danger); color: #fff; }
+        .btn-danger:hover { background: #c0392b; }
+        .btn-success { background: var(--success); color: #fff; }
+        .btn-success:hover { background: #00a382; }
+        .btn-sm { padding: 5px 10px; font-size: 12px; }
+
+        /* HTMX indicator */
+        .htmx-indicator { display: none; }
+        .htmx-request .htmx-indicator { display: inline-block; }
+        .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(0,0,0,0.1); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.6s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Alerts */
+        .alert { padding: 12px 16px; border-radius: 6px; margin-bottom: 12px; font-size: 14px; }
+        .alert-success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .alert-error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+
+        /* Connection status */
+        .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+        .status-dot.connected { background: var(--success); }
+        .status-dot.disconnected { background: var(--danger); }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .sidebar { width: 60px; }
+            .sidebar h1, .nav-section { display: none; }
+            .nav-link { text-align: center; padding: 12px; font-size: 0; }
+            .main { margin-left: 60px; }
+        }
+    </style>
+</head>
+<body hx-headers='{"X-Requested-With":"XMLHttpRequest","X-CSRF-Token":"{{CSRF_TOKEN}}"}'>
+    <nav class="sidebar">
+        <h1><span>Mosaic</span> Bridge</h1>
+        <div class="nav-section">Dashboard</div>
+        <a class="nav-link" href="/ui/" hx-get="/ui/page/dashboard" hx-target="#content" hx-push-url="/ui/">Dashboard</a>
+        <div class="nav-section">Members</div>
+        <a class="nav-link" href="/ui/members" hx-get="/ui/page/members" hx-target="#content" hx-push-url="/ui/members">Members</a>
+        <a class="nav-link" href="/ui/needs-match" hx-get="/ui/page/needs-match" hx-target="#content" hx-push-url="/ui/needs-match">Needs Match</a>
+        <a class="nav-link" href="/ui/checkins" hx-get="/ui/page/checkins" hx-target="#content" hx-push-url="/ui/checkins">Check-ins</a>
+        <div class="nav-section">System</div>
+        <a class="nav-link" href="/ui/sync" hx-get="/ui/page/sync" hx-target="#content" hx-push-url="/ui/sync">Sync &amp; Jobs</a>
+        <a class="nav-link" href="/ui/doors" hx-get="/ui/page/doors" hx-target="#content" hx-push-url="/ui/doors">Door Policies</a>
+        <a class="nav-link" href="/ui/metrics" hx-get="/ui/page/metrics" hx-target="#content" hx-push-url="/ui/metrics">Metrics</a>
+        <div style="margin-top:auto; padding:20px;">
+            <button class="btn btn-danger btn-sm" style="width:100%"
+                hx-post="/ui/logout"
+                hx-swap="none"
+                hx-on::after-request="window.location='/ui/'">Logout</button>
+        </div>
+    </nav>
+    <main class="main">
+        <div id="content">{{CONTENT}}</div>
+    </main>
+</body>
+</html>

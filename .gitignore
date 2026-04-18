@@ -1,0 +1,74 @@
+# ═══════════════════════════════════════════════════════════
+# Secrets — NEVER commit any of these
+# ═══════════════════════════════════════════════════════════
+.env
+.env.*
+# …but allow the committed template and the scrubbed placeholder:
+!.env.example
+!.env.shadow
+!.env.shadow.example
+
+# Anything that looks like credentials or a local config override
+bridge.json
+config.json
+secrets.json
+*.secret
+*.secrets
+*credentials*
+*.pem
+*.key
+*.crt
+!/internal/**/*.crt          # test fixtures only
+!/internal/**/*.key          # test fixtures only
+
+# ═══════════════════════════════════════════════════════════
+# Runtime data (PII + customer records)
+# ═══════════════════════════════════════════════════════════
+data/
+backups/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+member_cache.json
+customers.db
+
+# ═══════════════════════════════════════════════════════════
+# Build artifacts
+# ═══════════════════════════════════════════════════════════
+# Leading slash anchors these patterns to the repo root ONLY — without it,
+# gitignore would match any path component named "bridge", silently excluding
+# cmd/bridge/ (the Go main package) from commits. Discovered the hard way.
+/mosaic-bridge
+/mosaic-bridge-*
+/bridge
+/bridge-*
+*-go-tmp-umask
+*.exe
+*.test
+coverage.out
+coverage.html
+
+# ═══════════════════════════════════════════════════════════
+# Logs
+# ═══════════════════════════════════════════════════════════
+*.log
+*.err
+bridge.log*
+bridge.err*
+
+# ═══════════════════════════════════════════════════════════
+# IDE / OS
+# ═══════════════════════════════════════════════════════════
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+Thumbs.db
+
+# ═══════════════════════════════════════════════════════════
+# Go
+# ═══════════════════════════════════════════════════════════
+vendor/

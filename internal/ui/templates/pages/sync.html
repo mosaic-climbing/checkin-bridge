@@ -1,0 +1,79 @@
+<div class="page-header">
+    <h2>Sync &amp; Jobs</h2>
+    <p>Manage data synchronization and background tasks</p>
+</div>
+
+<div class="stats-grid">
+    <div class="stat-card">
+        <div style="margin-bottom:8px">Cache Sync</div>
+        <button class="btn btn-primary btn-sm"
+                hx-post="/cache/sync"
+                hx-target="#sync-result"
+                hx-swap="innerHTML"
+                hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+                hx-indicator="#sync-spinner">
+            Run Now <span id="sync-spinner" class="htmx-indicator"><span class="spinner"></span></span>
+        </button>
+    </div>
+    <div class="stat-card">
+        <div style="margin-bottom:8px">Status Sync</div>
+        <button class="btn btn-primary btn-sm"
+                hx-post="/status-sync"
+                hx-target="#sync-result"
+                hx-swap="innerHTML"
+                hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+                hx-indicator="#status-spinner">
+            Run Now <span id="status-spinner" class="htmx-indicator"><span class="spinner"></span></span>
+        </button>
+    </div>
+    <div class="stat-card">
+        <div style="margin-bottom:8px">Directory Sync</div>
+        <button class="btn btn-primary btn-sm"
+                hx-post="/directory/sync"
+                hx-target="#sync-result"
+                hx-swap="innerHTML"
+                hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+                hx-indicator="#dir-spinner">
+            Run Now <span id="dir-spinner" class="htmx-indicator"><span class="spinner"></span></span>
+        </button>
+    </div>
+    <div class="stat-card">
+        <div style="margin-bottom:8px">UniFi Ingest</div>
+        <button class="btn btn-primary btn-sm"
+                hx-post="/ingest/unifi?dry_run=true"
+                hx-target="#sync-result"
+                hx-swap="innerHTML"
+                hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+                hx-indicator="#ingest-spinner">
+            Dry Run <span id="ingest-spinner" class="htmx-indicator"><span class="spinner"></span></span>
+        </button>
+    </div>
+</div>
+
+<div id="sync-result"></div>
+
+<div class="card">
+    <h3>Unmatched UniFi Users</h3>
+    <p style="color: var(--text-muted); margin-bottom: 12px">
+        UniFi accounts with NFC tags that couldn't be auto-paired with a Redpoint customer.
+        Fix the name/email in Redpoint (or add the member manually) so the next ingest picks them up.
+    </p>
+    <button class="btn btn-primary btn-sm"
+            hx-get="/ui/frag/unmatched-table"
+            hx-target="#unmatched-result"
+            hx-swap="innerHTML"
+            hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+            hx-indicator="#unmatched-spinner">
+        Scan UniFi <span id="unmatched-spinner" class="htmx-indicator"><span class="spinner"></span></span>
+    </button>
+    <div id="unmatched-result" style="margin-top: 16px">
+        <p style="color: var(--text-muted)">Click "Scan UniFi" to list unresolvable users. Takes ~10–30s depending on user count.</p>
+    </div>
+</div>
+
+<div class="card">
+    <h3>Recent Jobs</h3>
+    <div hx-get="/ui/frag/job-table" hx-trigger="load, every 5s" hx-swap="innerHTML">
+        <p style="color: var(--text-muted)">Loading...</p>
+    </div>
+</div>

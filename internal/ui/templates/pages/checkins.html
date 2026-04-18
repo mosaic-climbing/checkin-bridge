@@ -1,0 +1,18 @@
+<div class="page-header">
+    <h2>Check-in History</h2>
+    <p>Durable record of all NFC tap events</p>
+</div>
+
+<div class="card">
+    <h3>Today's Activity</h3>
+    <div hx-get="/ui/frag/checkin-stats" hx-trigger="load, every 10s" hx-swap="innerHTML">
+        <p style="color: var(--text-muted)">Loading...</p>
+    </div>
+</div>
+
+<div class="card">
+    <h3>Recent Events</h3>
+    <div hx-get="/ui/frag/checkin-table" hx-trigger="load, every 5s" hx-swap="innerHTML">
+        <p style="color: var(--text-muted)">Loading...</p>
+    </div>
+</div>

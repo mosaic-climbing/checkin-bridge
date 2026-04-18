@@ -1,0 +1,22 @@
+<div class="page-header">
+    <h2>Needs Match</h2>
+    <p>UA-Hub users the bridge couldn't auto-bind to a Redpoint customer. Each row is a pending ticket that will default-deactivate when its grace window closes. Pick a Redpoint customer to match, skip (deactivate now), or defer (extend grace).</p>
+</div>
+
+<div class="card">
+    <div id="needs-match-list"
+         hx-get="/ui/frag/unmatched-list"
+         hx-trigger="load, every 30s"
+         hx-swap="innerHTML"
+         hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>
+        <p style="color: var(--text-muted)">Loading unmatched users…</p>
+    </div>
+</div>
+
+<!--
+  Detail-panel sink. Row clicks set this as hx-target and request
+  /ui/frag/unmatched/{uaUserID}/detail. The fragment handles its own
+  action buttons (match / skip / defer) and swaps itself back into
+  place on any mutation.
+-->
+<div id="needs-match-detail" style="margin-top: 16px"></div>

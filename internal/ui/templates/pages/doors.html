@@ -1,0 +1,47 @@
+<div class="page-header">
+    <h2>Door Policies</h2>
+    <p>Configure per-door access rules</p>
+</div>
+
+<div class="card">
+    <h3>Add/Update Door Policy</h3>
+    <form hx-post="/ui/frag/door-policy"
+          hx-target="#policy-result"
+          hx-swap="innerHTML"
+          hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+          hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#policy-table','refresh'); }">
+        <div class="form-row">
+            <div class="form-group">
+                <label>Door ID</label>
+                <input type="text" name="doorId" required placeholder="From UniFi">
+            </div>
+            <div class="form-group">
+                <label>Door Name</label>
+                <input type="text" name="doorName" required placeholder="e.g. Front Door">
+            </div>
+            <div class="form-group">
+                <label>Policy</label>
+                <select name="policy">
+                    <option value="membership">Membership Required</option>
+                    <option value="open">Open (No Check)</option>
+                    <option value="staff_only">Staff Only</option>
+                </select>
+            </div>
+        </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label>Allowed Badges (comma-separated, blank = all)</label>
+                <input type="text" name="allowedBadges" placeholder="e.g. Monthly,Annual">
+            </div>
+            <button type="submit" class="btn btn-primary">Save Policy</button>
+        </div>
+    </form>
+    <div id="policy-result"></div>
+</div>
+
+<div class="card">
+    <h3>Current Policies</h3>
+    <div id="policy-table" hx-get="/ui/frag/policy-table" hx-trigger="load, refresh" hx-swap="innerHTML">
+        <p style="color: var(--text-muted)">Loading...</p>
+    </div>
+</div>

@@ -1,0 +1,15 @@
+<div class="page-header">
+    <h2>Metrics</h2>
+    <p>System performance and health</p>
+</div>
+
+<div hx-get="/ui/frag/metrics-summary" hx-trigger="load, every 10s" hx-swap="innerHTML">
+    <p style="color: var(--text-muted)">Loading metrics...</p>
+</div>
+
+<div class="card">
+    <h3>Prometheus Endpoint</h3>
+    <p style="font-size:14px; color: var(--text-muted)">
+        Scrape <code>/metrics</code> with your Prometheus instance for time-series data.
+    </p>
+</div>

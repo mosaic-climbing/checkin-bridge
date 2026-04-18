@@ -1,0 +1,75 @@
+<div class="page-header">
+    <h2>Members</h2>
+    <p>Manage NFC-enrolled members</p>
+</div>
+
+<div class="card">
+    <h3>Search Directory</h3>
+    <div class="form-row">
+        <div class="form-group">
+            <label>Search by name or email</label>
+            <input type="search" name="q" placeholder="e.g. Smith or john@example.com"
+                   hx-get="/ui/frag/search-results"
+                   hx-trigger="keyup changed delay:300ms"
+                   hx-target="#search-results"
+                   hx-indicator="#search-spinner"
+                   hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>
+        </div>
+        <span id="search-spinner" class="htmx-indicator"><span class="spinner"></span></span>
+    </div>
+    <div id="search-results"></div>
+</div>
+
+<div class="card">
+    <h3>Add Member Manually</h3>
+    <form hx-post="/members"
+          hx-target="#add-result"
+          hx-swap="innerHTML"
+          hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+          hx-on::after-request="if(event.detail.successful) this.reset()">
+        <div class="form-row">
+            <div class="form-group">
+                <label>Redpoint Customer ID</label>
+                <input type="text" name="redpointId" required placeholder="e.g. cust_abc123">
+            </div>
+            <div class="form-group">
+                <label>NFC Card UID</label>
+                <input type="text" name="nfcUid" required placeholder="e.g. 04AABB1122">
+            </div>
+        </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label>First Name</label>
+                <input type="text" name="firstName" placeholder="Optional">
+            </div>
+            <div class="form-group">
+                <label>Last Name</label>
+                <input type="text" name="lastName" placeholder="Optional">
+            </div>
+            <button type="submit" class="btn btn-primary">Add Member</button>
+        </div>
+    </form>
+    <div id="add-result"></div>
+</div>
+
+<div class="card">
+    <h3>All Enrolled Members</h3>
+    <div hx-get="/ui/frag/member-table" hx-trigger="load" hx-swap="innerHTML">
+        <p style="color: var(--text-muted)">Loading...</p>
+    </div>
+</div>
+
+<script>
+// If the URL carries ?q=..., prefill the search box and trigger a lookup.
+// Used by deep-links from the Sync page's Unmatched UniFi Users panel.
+(function () {
+    var params = new URLSearchParams(window.location.search);
+    var q = params.get('q');
+    if (!q) return;
+    var input = document.querySelector('input[name="q"]');
+    if (!input) return;
+    input.value = q;
+    // Fire the same keyup htmx trigger the user would have typed manually.
+    htmx.trigger(input, 'keyup');
+})();
+</script>
