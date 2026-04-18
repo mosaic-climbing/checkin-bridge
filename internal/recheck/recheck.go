@@ -141,6 +141,25 @@ type Service struct {
 	now        func() time.Time
 }
 
+// ResetBreaker forces the internal circuit breaker back to the closed
+// state. The return value reports whether the breaker had been open at
+// the moment of the reset — handy for the /debug/reset-breakers endpoint
+// response, which surfaces "was it actually tripped?" to the operator
+// so they can tell a recovery action from a no-op.
+//
+// Intended only for manual override via the admin endpoint or a test.
+// The normal failure-count / cooldown lifecycle should be doing this
+// job in steady state; needing to call ResetBreaker is a signal the
+// breaker threshold is too tight (or a genuine upstream incident has
+// been remediated faster than the cooldown allows).
+//
+// Safe to call from any goroutine; the underlying breaker mutex
+// serialises the state mutation with concurrent allow/success/failure
+// calls from the recheck path.
+func (s *Service) ResetBreaker() (wasOpen bool) {
+	return s.breaker.forceReset()
+}
+
 // New constructs a Service. The dependencies are passed as interfaces so
 // that callers from cmd/bridge can use the concrete client types (which
 // satisfy the interfaces structurally) and tests can substitute fakes.

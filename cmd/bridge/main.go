@@ -213,10 +213,11 @@ func main() {
 		redpointClient,
 		db,
 		statusync.Config{
-			SyncInterval:       cfg.Sync.Interval,
-			RateLimitDelay:     200 * time.Millisecond,
-			SyncTimeLocal:      cfg.Sync.TimeLocal,
-			UnmatchedGraceDays: cfg.Bridge.UnmatchedGraceDays,
+			SyncInterval:        cfg.Sync.Interval,
+			RateLimitDelay:      200 * time.Millisecond,
+			SyncTimeLocal:       cfg.Sync.TimeLocal,
+			UnmatchedGraceDays:  cfg.Bridge.UnmatchedGraceDays,
+			LegacyNFCStatusLoop: cfg.Bridge.LegacyNFCStatusLoop,
 		},
 		logger.With("component", "statusync"),
 	)
@@ -457,6 +458,10 @@ func main() {
 		cfg.Bridge.AllowNewMembers,
 		cfg.Bridge.DefaultAccessPolicyIDs,
 	)
+	// P3: wire the manual breaker-reset hook to the recheck.Service's
+	// exported ResetBreaker method. The /debug/reset-breakers HTTP
+	// endpoint 503s until this is set; no other caller invokes the hook.
+	apiServer.SetBreakerResetter(rechecker.ResetBreaker)
 
 	// Build HTTP handler chain
 	var httpHandler http.Handler = apiServer

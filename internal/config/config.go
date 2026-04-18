@@ -97,6 +97,23 @@ type BridgeConfig struct {
 	ControlBindAddr  string `json:"controlBindAddr"`  // default: "127.0.0.1"; set "" to mirror BindAddr
 	ShadowMode       bool   `json:"shadowMode"`       // if true: no door unlocks, no Redpoint writes, no UniFi status writes
 
+	// LegacyNFCStatusLoop controls whether Step 2 of statusync.RunSync — the
+	// GetMemberByNFC-driven activation/deactivation pass that predates C2 —
+	// runs. When true (default, for backward compatibility with gyms that
+	// already rely on the legacy member cache to drive door status), the
+	// loop runs after the C2 matching phase. When false, only the C2
+	// matching phase runs; status enforcement must come from a successor
+	// path (planned: read from ua_user_mappings + query Redpoint per
+	// mapped user).
+	//
+	// Set to false for gyms that (a) have not populated the legacy members
+	// table via /directory/sync + /ingest/unifi and (b) don't want the
+	// half-populated cache producing spurious "account inactive"
+	// deactivation decisions. Recommended for all new deployments.
+	//
+	// Env: BRIDGE_LEGACY_NFC_STATUS_LOOP=false
+	LegacyNFCStatusLoop bool `json:"legacyNFCStatusLoop"`
+
 	// RecheckMaxStaleness is the freshness budget for the cached membership
 	// state used by the denied-tap recheck path (see internal/recheck). When
 	// a tap is denied based on local cache, the recheck normally pays a
@@ -253,13 +270,14 @@ func defaults() *Config {
 			FacilityCode: "Mosaic",
 		},
 		Bridge: BridgeConfig{
-			Port:               3500,
-			LogLevel:           "info",
-			DataDir:            "data",
-			UnlockDurationMs:   5000,
-			UnmatchedGraceDays: 7,
-			BindAddr:           "127.0.0.1",
-			ControlBindAddr:    "127.0.0.1",
+			Port:                3500,
+			LogLevel:            "info",
+			DataDir:             "data",
+			UnlockDurationMs:    5000,
+			UnmatchedGraceDays:  7,
+			BindAddr:            "127.0.0.1",
+			ControlBindAddr:     "127.0.0.1",
+			LegacyNFCStatusLoop: true, // backward-compat default; set false for C2-only gyms
 		},
 		Sync: SyncConfig{
 			IntervalHours: 24,
@@ -302,6 +320,7 @@ func applyEnvOverrides(cfg *Config) {
 	envInt(&cfg.Bridge.ControlPort, "BRIDGE_CONTROL_PORT")
 	envStr(&cfg.Bridge.ControlBindAddr, "BRIDGE_CONTROL_BIND_ADDR")
 	envBool(&cfg.Bridge.ShadowMode, "BRIDGE_SHADOW_MODE")
+	envBool(&cfg.Bridge.LegacyNFCStatusLoop, "BRIDGE_LEGACY_NFC_STATUS_LOOP")
 	envDuration(&cfg.Bridge.RecheckMaxStaleness, "BRIDGE_RECHECK_MAX_STALENESS")
 	envBool(&cfg.Bridge.BackfillOnReconnect, "BRIDGE_BACKFILL_ON_RECONNECT")
 	envBool(&cfg.Bridge.AllowNewMembers, "BRIDGE_ALLOW_NEW_MEMBERS")

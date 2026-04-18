@@ -194,3 +194,44 @@ func (b *breaker) isOpen() bool {
 	}
 	return false
 }
+
+// forceReset force-closes the breaker out-of-band: clears the failure
+// counter, drops the probing flag, and puts the state back to closed.
+//
+// The return value reports whether the breaker was actually open at the
+// moment of the reset — operators use this to distinguish "reset was
+// needed" from "breaker was already closed" in /debug/reset-breakers
+// responses and audit logs. A no-op reset is still a safe operation and
+// the caller may proceed either way.
+//
+// This is the manual-override path behind POST /debug/reset-breakers
+// (P3 in docs/architecture-review.md). Prior to this, recovering from a
+// false-positive trip required a full bridge restart; having a surgical
+// reset means the on-call engineer can recover the recheck path without
+// dropping the check-in queue or WebSocket connections.
+//
+// Logs at Info level with transition="manual_reset" so the audit trail
+// shows when and how the breaker was forced closed. We deliberately log
+// even when the breaker was already closed (as a no-op confirmation) —
+// operators running the endpoint want feedback that their action landed.
+func (b *breaker) forceReset() (wasOpen bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	wasOpen = b.state == breakerOpen
+	b.state = breakerClosed
+	b.failures = 0
+	b.probing = false
+	b.logger.Info("circuit breaker transition: manual reset",
+		"transition", "manual_reset",
+		"from", func() string {
+			if wasOpen {
+				return "open"
+			}
+			return "closed"
+		}(),
+		"to", "closed",
+		"reason", "operator_reset",
+		"wasOpen", wasOpen,
+	)
+	return wasOpen
+}
