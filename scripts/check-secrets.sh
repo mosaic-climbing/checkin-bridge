@@ -217,7 +217,12 @@ if command -v trufflehog >/dev/null 2>&1; then
     fi
 
     TH_TMP=""
-    cleanup_th() { [ -n "$TH_TMP" ] && rm -rf "$TH_TMP"; }
+    # Return 0 unconditionally — the test `[ -n "$TH_TMP" ]` is false when
+    # there were no staged files to scan, which would make the function's
+    # last-command exit status propagate out through the EXIT trap and
+    # override our `exit 0` summary. That silently fails the pre-push hook
+    # with no visible error. Took a while to track down — don't remove.
+    cleanup_th() { [ -n "$TH_TMP" ] && rm -rf "$TH_TMP"; return 0; }
     trap cleanup_th EXIT
 
     TH_OUT=""
