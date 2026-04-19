@@ -95,6 +95,27 @@ func seedPending(t *testing.T, db *store.Store, uaUserID, reason, candidates str
 	}
 }
 
+// seedPendingWithIdentity seeds a pending row that also carries a cached
+// UA-Hub display name + email, matching what statusync.persistDecision
+// writes at observation time (v0.5.2). Drives the list/detail renderers
+// without any live UA-Hub dependency.
+func seedPendingWithIdentity(t *testing.T, db *store.Store,
+	uaUserID, reason, candidates, uaName, uaEmail string, graceOffset time.Duration,
+) {
+	t.Helper()
+	grace := time.Now().Add(graceOffset).UTC().Format(time.RFC3339)
+	if err := db.UpsertPending(context.Background(), &store.Pending{
+		UAUserID:   uaUserID,
+		Reason:     reason,
+		GraceUntil: grace,
+		Candidates: candidates,
+		UAName:     uaName,
+		UAEmail:    uaEmail,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestNeedsMatchList_EmptyState — zero pending rows renders the "nothing
 // to match" copy plus a 0 badge; the absence of a <table> is the invariant.
 func TestNeedsMatchList_EmptyState(t *testing.T) {
@@ -142,6 +163,38 @@ func TestNeedsMatchList_RendersPendingRows(t *testing.T) {
 	// Headline stat-card shows the pending count.
 	if !strings.Contains(body, `<div class="stat-value">2</div>`) {
 		t.Errorf("headline count should be 2; body = %q", body)
+	}
+}
+
+// TestNeedsMatchList_RendersCachedIdentity pins the v0.5.2 fix: the list
+// fragment must render the ua_name + ua_email cached on the pending row
+// WITHOUT making any live UA-Hub ListUsers call. buildNeedsMatchTestServer
+// wires a FakeUniFi with zero users, so if the handler fell back to the
+// old "walk UA-Hub, match by id, enrich" path the name/email would be
+// absent from the rendered body. Asserting their presence is the
+// regression pin.
+func TestNeedsMatchList_RendersCachedIdentity(t *testing.T) {
+	srv, db, _ := buildNeedsMatchTestServer(t)
+	seedPendingWithIdentity(t, db,
+		"ua-cached", store.PendingReasonNoMatch, "",
+		"Dana Cached", "dana.cached@example.com",
+		24*time.Hour,
+	)
+
+	req := httptest.NewRequest("GET", "/ui/frag/unmatched-list", nil)
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %q", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "Dana Cached") {
+		t.Errorf("cached ua_name missing from list; body = %q", body)
+	}
+	if !strings.Contains(body, "dana.cached@example.com") {
+		t.Errorf("cached ua_email missing from list; body = %q", body)
 	}
 }
 

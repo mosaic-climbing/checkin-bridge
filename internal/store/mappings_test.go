@@ -146,6 +146,8 @@ func TestPendingLifecycle(t *testing.T) {
 		Reason:     PendingReasonNoMatch,
 		GraceUntil: grace,
 		Candidates: "",
+		UAName:     "Alex First",
+		UAEmail:    "alex@example.com",
 	}
 	if err := s.UpsertPending(ctx, p); err != nil {
 		t.Fatal(err)
@@ -156,15 +158,19 @@ func TestPendingLifecycle(t *testing.T) {
 	firstSeen := p.FirstSeen
 
 	// Re-upserting must preserve first_seen (the grace window's anchor) but
-	// refresh reason/grace_until/candidates. This is the per-sync update
-	// path: every time the syncer walks unmatched users it re-asserts the
-	// pending row, without resetting how long they've been waiting.
+	// refresh reason/grace_until/candidates/ua_name/ua_email. This is the
+	// per-sync update path: every time the syncer walks unmatched users it
+	// re-asserts the pending row, without resetting how long they've been
+	// waiting — and the cached UA-Hub identity tracks whatever staff has
+	// typed into UA-Hub since the last observation (v0.5.2 migration 5).
 	p2 := &Pending{
 		UAUserID:   "ua-pending-1",
 		Reason:     PendingReasonAmbiguousEmail,
 		FirstSeen:  "1999-01-01T00:00:00Z", // deliberately wrong — must be ignored by SQL
 		GraceUntil: grace,
 		Candidates: "rp-X|rp-Y",
+		UAName:     "Alex Renamed",
+		UAEmail:    "alex.renamed@example.com",
 	}
 	if err := s.UpsertPending(ctx, p2); err != nil {
 		t.Fatal(err)
@@ -184,6 +190,10 @@ func TestPendingLifecycle(t *testing.T) {
 	}
 	if got.Candidates != "rp-X|rp-Y" {
 		t.Errorf("Candidates = %q, want rp-X|rp-Y", got.Candidates)
+	}
+	if got.UAName != "Alex Renamed" || got.UAEmail != "alex.renamed@example.com" {
+		t.Errorf("cached UA identity not refreshed on upsert: got name=%q email=%q; want name=%q email=%q",
+			got.UAName, got.UAEmail, "Alex Renamed", "alex.renamed@example.com")
 	}
 
 	// PendingCount and AllPending.
