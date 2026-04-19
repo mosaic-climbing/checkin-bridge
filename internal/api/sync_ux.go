@@ -32,7 +32,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/mosaic-climbing/checkin-bridge/internal/store"
 	"github.com/mosaic-climbing/checkin-bridge/internal/ui"
 )
 
@@ -191,40 +190,23 @@ func isKnownSyncJobType(t string) bool {
 	return false
 }
 
-// syncPageLastRuns is a convenience struct consumed by the /ui/sync
-// page's initial render — server-side we look up all four pills in
-// one DB round-trip rather than letting four htmx requests fan out
-// on page load. Callers use ui.SyncLastRunPill per row to stamp the
-// rendered HTML. Not used elsewhere.
-type syncPageLastRuns struct {
-	Cache     *store.Job
-	Status    *store.Job
-	Directory *store.Job
-	Ingest    *store.Job
-}
-
-// loadSyncPageLastRuns fetches the four per-type last jobs in a single
-// goroutine (not concurrent — four trivial indexed lookups on a small
-// table, and SQLite is single-writer so concurrent reads just serialise
-// anyway). Returns a zero value on store-nil or read error; the page
-// renders "never run" pills in that case rather than failing.
-func (s *Server) loadSyncPageLastRuns(ctx context.Context) syncPageLastRuns {
-	if s.store == nil {
-		return syncPageLastRuns{}
-	}
-	fetch := func(t string) *store.Job {
-		j, err := s.store.LastJobByType(ctx, t)
-		if err != nil {
-			s.logger.Warn("loadSyncPageLastRuns: LastJobByType failed",
-				"type", t, "error", err)
-			return nil
-		}
-		return j
-	}
-	return syncPageLastRuns{
-		Cache:     fetch(jobTypeCacheSync),
-		Status:    fetch(jobTypeStatusSync),
-		Directory: fetch(jobTypeDirectorySync),
-		Ingest:    fetch(jobTypeUniFiIngest),
-	}
-}
+// Note on server-side pill pre-fetch:
+//
+// An earlier draft of this file carried a syncPageLastRuns struct and
+// a loadSyncPageLastRuns helper, the idea being to stamp the four
+// "Last run" pills into the /ui/sync HTML at render time so the page
+// would arrive fully populated rather than with four in-flight
+// hx-get's. We dropped it:
+//
+//   1. sync.html is served as static HTML by ui.Handler.ServePage —
+//      no Go template substitution pass runs over it, so stamping
+//      values in would mean teaching the UI handler a new
+//      rendering mode just for this page.
+//   2. The four pills fetch in parallel on page load and each call
+//      hits a single indexed row in `jobs` — total cost is dominated
+//      by the round-trip, not the query, and the page renders
+//      "Loading…" pills for ~10ms at most.
+//
+// If we ever do want the pre-fetch, the right fix is to move
+// sync.html onto html/template and inject a ui.SyncLastRunPill
+// stamp per card rather than reintroducing the helper here.
