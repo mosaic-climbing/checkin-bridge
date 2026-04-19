@@ -1,79 +1,175 @@
 <div class="page-header">
     <h2>Sync &amp; Jobs</h2>
-    <p>Manage data synchronization and background tasks</p>
+    <p>Manually trigger background data syncs and review recent runs.</p>
 </div>
 
-<div class="stats-grid">
-    <div class="stat-card">
-        <div style="margin-bottom:8px">Cache Sync</div>
-        <button class="btn btn-primary btn-sm"
-                hx-post="/cache/sync"
-                hx-target="#sync-result"
-                hx-swap="innerHTML"
-                hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
-                hx-indicator="#sync-spinner">
-            Run Now <span id="sync-spinner" class="htmx-indicator"><span class="spinner"></span></span>
-        </button>
+<!--
+    v0.5.1 sync-page rewrite. Each card is now:
+      - a short one-line explanation of WHAT the sync does
+      - a "Last run" pill that auto-fetches via hx-get on load and
+        auto-refreshes every 15s (picks up scheduler-triggered runs)
+      - a clearly labelled action button (destructive writes are
+        highlighted + hx-confirm'd so staff can't accidentally push
+        to UA-Hub).
+    hx-post bodies land in #sync-result as a SyncResultFragment
+    alert. The OOB span emitted by SyncResultFragment re-fetches the
+    matching pill so the card state visibly advances after a click.
+-->
+
+<div class="sync-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">
+
+    <div class="stat-card" style="display:flex;flex-direction:column;gap:8px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+            <div style="font-weight:600">Cache Sync</div>
+            <span id="sync-pill-cache_sync"
+                  hx-get="/ui/frag/sync-last-run/cache_sync"
+                  hx-trigger="load, every 15s"
+                  class="badge" style="background:#eceff1;color:var(--text-muted);font-weight:500">…</span>
+        </div>
+        <div style="font-size:12px;color:var(--text-muted);line-height:1.4">
+            Recounts how many members are Active / Frozen / Expired based on
+            what's currently in the local mirror. Read-only — does not talk to
+            Redpoint or UA-Hub. Safe to run any time.
+        </div>
+        <div>
+            <button class="btn btn-primary btn-sm"
+                    hx-post="/cache/sync"
+                    hx-target="#sync-result"
+                    hx-swap="innerHTML"
+                    hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+                    hx-indicator="#sync-spinner">
+                Recount Now <span id="sync-spinner" class="htmx-indicator"><span class="spinner"></span></span>
+            </button>
+        </div>
     </div>
-    <div class="stat-card">
-        <div style="margin-bottom:8px">Status Sync</div>
-        <button class="btn btn-primary btn-sm"
-                hx-post="/status-sync"
-                hx-target="#sync-result"
-                hx-swap="innerHTML"
-                hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
-                hx-indicator="#status-spinner">
-            Run Now <span id="status-spinner" class="htmx-indicator"><span class="spinner"></span></span>
-        </button>
+
+    <div class="stat-card" style="display:flex;flex-direction:column;gap:8px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+            <div style="font-weight:600">Status Sync</div>
+            <span id="sync-pill-status_sync"
+                  hx-get="/ui/frag/sync-last-run/status_sync"
+                  hx-trigger="load, every 15s"
+                  class="badge" style="background:#eceff1;color:var(--text-muted);font-weight:500">…</span>
+        </div>
+        <div style="font-size:12px;color:var(--text-muted);line-height:1.4">
+            Pushes each mapped member's current status (Active / Frozen / Expired)
+            to UA-Hub so frozen members can't scan in. Runs hourly in the
+            background; click here to force an immediate pass. <strong>Writes to
+            UA-Hub.</strong>
+        </div>
+        <div>
+            <button class="btn btn-primary btn-sm"
+                    hx-post="/status-sync"
+                    hx-target="#sync-result"
+                    hx-swap="innerHTML"
+                    hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+                    hx-indicator="#status-spinner">
+                Run Now <span id="status-spinner" class="htmx-indicator"><span class="spinner"></span></span>
+            </button>
+        </div>
     </div>
-    <div class="stat-card">
-        <div style="margin-bottom:8px">Directory Sync</div>
-        <button class="btn btn-primary btn-sm"
-                hx-post="/directory/sync"
-                hx-target="#sync-result"
-                hx-swap="innerHTML"
-                hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
-                hx-indicator="#dir-spinner">
-            Run Now <span id="dir-spinner" class="htmx-indicator"><span class="spinner"></span></span>
-        </button>
+
+    <div class="stat-card" style="display:flex;flex-direction:column;gap:8px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+            <div style="font-weight:600">Directory Sync</div>
+            <span id="sync-pill-directory_sync"
+                  hx-get="/ui/frag/sync-last-run/directory_sync"
+                  hx-trigger="load, every 15s"
+                  class="badge" style="background:#eceff1;color:var(--text-muted);font-weight:500">…</span>
+        </div>
+        <div style="font-size:12px;color:var(--text-muted);line-height:1.4">
+            Re-pulls the full Redpoint customer directory (~82k rows) into the
+            local mirror. Runs nightly; trigger here after a big Redpoint edit.
+            Read-only against UA-Hub; takes a few minutes.
+        </div>
+        <div>
+            <button class="btn btn-primary btn-sm"
+                    hx-post="/directory/sync"
+                    hx-target="#sync-result"
+                    hx-swap="innerHTML"
+                    hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+                    hx-indicator="#dir-spinner">
+                Run Now <span id="dir-spinner" class="htmx-indicator"><span class="spinner"></span></span>
+            </button>
+        </div>
     </div>
-    <div class="stat-card">
-        <div style="margin-bottom:8px">UniFi Ingest</div>
-        <button class="btn btn-primary btn-sm"
-                hx-post="/ingest/unifi?dry_run=true"
-                hx-target="#sync-result"
-                hx-swap="innerHTML"
-                hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
-                hx-indicator="#ingest-spinner">
-            Dry Run <span id="ingest-spinner" class="htmx-indicator"><span class="spinner"></span></span>
-        </button>
+
+    <div class="stat-card" style="display:flex;flex-direction:column;gap:8px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+            <div style="font-weight:600">UniFi Ingest</div>
+            <span id="sync-pill-unifi_ingest"
+                  hx-get="/ui/frag/sync-last-run/unifi_ingest"
+                  hx-trigger="load, every 15s"
+                  class="badge" style="background:#eceff1;color:var(--text-muted);font-weight:500">…</span>
+        </div>
+        <div style="font-size:12px;color:var(--text-muted);line-height:1.4">
+            Reads every UA-Hub user with an NFC tag, matches them to a Redpoint
+            customer by email, and writes the resulting card ↔ customer mapping
+            into the cache. "Dry Run" shows what would change without writing;
+            "Apply" commits.
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button class="btn btn-sm"
+                    style="background:#eceff1"
+                    hx-post="/ingest/unifi?dry_run=true"
+                    hx-target="#sync-result"
+                    hx-swap="innerHTML"
+                    hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+                    hx-indicator="#ingest-spinner">
+                Dry Run <span id="ingest-spinner" class="htmx-indicator"><span class="spinner"></span></span>
+            </button>
+            <button class="btn btn-primary btn-sm"
+                    hx-post="/ingest/unifi"
+                    hx-target="#sync-result"
+                    hx-swap="innerHTML"
+                    hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+                    hx-confirm="Apply UniFi ingest? This writes NFC ↔ Redpoint mappings into the cache. (It does not push anything to UA-Hub.)"
+                    hx-indicator="#ingest-apply-spinner">
+                Run (writes) <span id="ingest-apply-spinner" class="htmx-indicator"><span class="spinner"></span></span>
+            </button>
+        </div>
     </div>
+
 </div>
 
-<div id="sync-result"></div>
+<div id="sync-result" style="margin-top:16px"></div>
 
-<div class="card">
+<div class="card" style="margin-top:16px">
     <h3>Unmatched UniFi Users</h3>
     <p style="color: var(--text-muted); margin-bottom: 12px">
-        UniFi accounts with NFC tags that couldn't be auto-paired with a Redpoint customer.
-        Fix the name/email in Redpoint (or add the member manually) so the next ingest picks them up.
+        UniFi accounts with NFC tags that couldn't be auto-paired with a
+        Redpoint customer on the last ingest. Fix the name/email in Redpoint
+        (or match manually in the
+        <a href="/ui/page/needs-match">Needs Match</a> tool), then re-run
+        UniFi Ingest above.
     </p>
-    <button class="btn btn-primary btn-sm"
-            hx-get="/ui/frag/unmatched-table"
+    <!--
+        v0.5.1: this button previously called /ui/frag/unmatched-table
+        which runs a full ingest synchronously (~10–30s) and masqueraded
+        as a cheap "list" call. Swapped to /ui/frag/unmatched-list which
+        reads the cached pending table only, so the sync page stays
+        snappy and ingestion stays an explicit action above.
+    -->
+    <button class="btn btn-sm"
+            style="background:#eceff1"
+            hx-get="/ui/frag/unmatched-list"
             hx-target="#unmatched-result"
             hx-swap="innerHTML"
             hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
             hx-indicator="#unmatched-spinner">
-        Scan UniFi <span id="unmatched-spinner" class="htmx-indicator"><span class="spinner"></span></span>
+        Show Pending <span id="unmatched-spinner" class="htmx-indicator"><span class="spinner"></span></span>
     </button>
     <div id="unmatched-result" style="margin-top: 16px">
-        <p style="color: var(--text-muted)">Click "Scan UniFi" to list unresolvable users. Takes ~10–30s depending on user count.</p>
+        <p style="color: var(--text-muted)">Reads the cached pending list (no UA-Hub round trip). Re-run UniFi Ingest above to refresh it.</p>
     </div>
 </div>
 
-<div class="card">
+<div class="card" style="margin-top:16px">
     <h3>Recent Jobs</h3>
+    <p style="color: var(--text-muted); margin-bottom: 12px; font-size: 12px">
+        The five most recent sync/ingest runs. Auto-refreshes every 5s.
+    </p>
     <div hx-get="/ui/frag/job-table" hx-trigger="load, every 5s" hx-swap="innerHTML">
-        <p style="color: var(--text-muted)">Loading...</p>
+        <p style="color: var(--text-muted)">Loading…</p>
     </div>
 </div>

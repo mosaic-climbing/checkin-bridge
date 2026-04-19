@@ -84,6 +84,23 @@ func (s *Store) ActiveJob(ctx context.Context, jobType string) (*Job, error) {
 	return &j, err
 }
 
+// LastJobByType returns the most recent job of a given type regardless of
+// status — running, completed, or failed. Used by the /ui/sync page to
+// render "Last run: N ago · ✓/✗" pills next to each sync trigger so
+// staff can see at a glance whether a scheduled sync has been fired
+// recently (and whether it succeeded). Returns (nil, nil) if no job of
+// that type has ever run.
+func (s *Store) LastJobByType(ctx context.Context, jobType string) (*Job, error) {
+	var j Job
+	err := s.db.GetContext(ctx, &j, `
+		SELECT * FROM jobs WHERE type = ?
+		ORDER BY created_at DESC LIMIT 1`, jobType)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return &j, err
+}
+
 // CleanOldJobs deletes completed/failed jobs older than the given duration.
 func (s *Store) CleanOldJobs(ctx context.Context, olderThan time.Duration) (int, error) {
 	s.mu.Lock()
