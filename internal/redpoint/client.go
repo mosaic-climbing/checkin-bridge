@@ -247,7 +247,16 @@ func (c *Client) exec(ctx context.Context, query string, vars map[string]any) (r
 
 	if resp.StatusCode != http.StatusOK {
 		// Typed so retryable() can decide: 429 + 5xx retry, other 4xx don't.
-		return nil, &httpError{Status: resp.StatusCode, Body: string(respBody)}
+		// RetryAfter captures the server's explicit hint (RFC 7231 §7.1.3)
+		// so the retry loop can honour it as a wait-floor — critical for
+		// the undocumented Redpoint rate limiter, which is the only channel
+		// telling us "don't come back for N seconds". We parse regardless
+		// of status; the loop only reads it on retryable errors.
+		return nil, &httpError{
+			Status:     resp.StatusCode,
+			Body:       string(respBody),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	}
 
 	var gqlResp gqlResponse
@@ -488,9 +497,17 @@ func (c *Client) ExecQuery(ctx context.Context, query string, vars map[string]an
 // non-2xx HTTP status. The retry wrapper inspects Status via errors.As to
 // classify retryable (429 / 5xx) vs permanent (other 4xx — auth, validation,
 // not found). Body is captured for logging only.
+//
+// RetryAfter holds the parsed value of the response's Retry-After header
+// (RFC 7231 §7.1.3) — either "delta-seconds" or an HTTP-date converted to
+// a duration. Zero means no hint was present or the header was malformed.
+// The retry loop reads this field to use max(backoff, RetryAfter) as the
+// wait before the next attempt, so a polite server that says "come back
+// in 10s" gets 10s instead of our default 200ms × 2^n.
 type httpError struct {
-	Status int
-	Body   string
+	Status     int
+	Body       string
+	RetryAfter time.Duration
 }
 
 func (e *httpError) Error() string {
@@ -602,6 +619,19 @@ func (c *Client) execWithRetry(ctx context.Context, query string, vars map[strin
 			break // last attempt — don't wait, return below
 		}
 		wait := backoffFor(attempt)
+		// Honour a server-supplied Retry-After as a wait-floor. The
+		// Redpoint rate limiter is undocumented, so a 429 carrying a
+		// hint is the only authoritative signal we get; ignoring it in
+		// favour of our ~200ms–800ms exponential would guarantee another
+		// 429. We take max(backoff, Retry-After) rather than replacing
+		// outright so a server that sends "Retry-After: 0" still gets a
+		// minimum jittered backoff (prevents a tight hot-loop reconnect).
+		var herr *httpError
+		if errors.As(err, &herr) && herr.RetryAfter > wait {
+			c.logger.Info("honouring Retry-After hint",
+				"status", herr.Status, "hint", herr.RetryAfter, "baseWait", wait)
+			wait = herr.RetryAfter
+		}
 		c.logger.Warn("retryable redpoint error, backing off",
 			"attempt", attempt, "of", maxAttempts, "wait", wait, "error", err)
 		select {
