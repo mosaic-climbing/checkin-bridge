@@ -591,17 +591,34 @@ func main() {
 	// set. On the UDM Pro the nspawn container shares host networking, so
 	// 127.0.0.1 is strongly recommended unless ALLOWED_NETWORKS is set.
 	//
-	// WriteTimeout is intentionally tight (30s) for the public data plane:
-	// every route here — /ui/*, /health, /checkins, /directory/search —
-	// responds in well under a second, so anything slower is either a
-	// slow-client attack or a bug. (The control plane below matches 30s
-	// too; the longer-running sync endpoints complete well under a minute.)
+	// WriteTimeout governs the longest a single response can take to
+	// finish writing. v0.4.0 had this at 30s because the then-current
+	// public routes (/ui/*, /health, /checkins, /directory/search) all
+	// responded in well under a second. v0.5.0 added /ingest/unifi and
+	// /directory/sync to the same listener — both of which can legitimately
+	// run for a minute or more against a 1600-user UA-Hub + 82k Redpoint
+	// directory. When the 30s deadline fires mid-write, the client sees
+	// "curl: (52) Empty reply from server" even though the handler still
+	// completes server-side (the ingest rows land). v0.5.1 bumps this to
+	// 60m — enough headroom for the sync-timeout-wrapped admin routes
+	// (syncTimeout=45m in internal/api/server.go) plus some buffer.
+	//
+	// The slow-client-attack concern that originally motivated the tight
+	// timeout is better handled at the header-read stage (ReadTimeout +
+	// ReadHeaderTimeout) where it actually applies. Response writes to
+	// localhost-or-LAN clients on the staff network don't need a hard
+	// body-write deadline.
+	//
+	// Per-handler bounds are still enforced via withTimeout(d, handler)
+	// inside internal/api/server.go; each route has an appropriate
+	// shortTimeout/longTimeout/syncTimeout wrapper. The server-level
+	// WriteTimeout is now just the backstop for genuinely-wedged writes.
 	addr := fmt.Sprintf("%s:%d", cfg.Bridge.BindAddr, cfg.Bridge.Port)
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      60 * time.Minute,
 		ReadHeaderTimeout: 5 * time.Second,
 		MaxHeaderBytes:    1 << 16, // 64KB
 	}

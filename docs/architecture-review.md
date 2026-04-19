@@ -122,7 +122,7 @@ For each UA-Hub NFC user:
           - **Two or more Redpoint customers** share the email (parent + child case) → run the name check locally against just those candidates: filter for normalized-equal `(firstName, lastName)` with the UA-Hub user. Exactly one survivor → record mapping (`matched_by='auto:email+name'`), proceed to writeback. Otherwise → ambiguous, fall through to staff UI.
           - **Zero matches** → fall through to (b).
       - **(b) Name match** (fallback if (a) didn't resolve): cursor-paginate `customers(filter: {active: ALL})` and filter client-side for normalized-equal `(firstName, lastName)`. Normalization: `strings.ToLower(strings.TrimSpace(unicode-NFD-strip-diacritics(s)))` on both sides. Exactly one match → **definitive** (`matched_by='auto:name'`), record mapping, proceed to writeback. Multiple matches → **ambiguous**, surface in the staff UI. Zero matches → **no match**, surface in the staff UI.
-  3. **On any resolved match (auto or staff-assigned) → mirror email into UA-Hub:** call UA-Hub `UpdateUser(email = matchedCustomer.email)` if the UA-Hub user's current email is empty or disagrees with Redpoint. Never overwrite a hand-entered UA-Hub email with a different Redpoint email without logging. Update `last_email_synced_at` in the mapping table.
+  3. **On any resolved match (auto or staff-assigned) → NO email push-back to UA-Hub.** ~~Mirror Redpoint email into UA-Hub~~. **Dropped in v0.5.1** — Redpoint is the source of truth for contact info; the bridge reads UA-Hub email only as a matching input. UA-Hub `user_email` stays whatever staff typed when creating the user (or blank). `last_email_synced_at` remains on the mapping schema for back-compat but is dead-weight; slated for migration-5 cleanup. Historical rationale (keep for the postmortem record): the original design called `UpdateUser(email=...)` on every match and logged the before/after to `match_audit` for forensics. In practice, UA-Hub email has no operator-visible consumer today (staff comms go through Redpoint), so the write was pure drift without benefit.
   4. **Unmatched users** (no email match, no definitive name match, or explicit ambiguity) surface in the staff web UI, described below. They start a grace-period timer in `ua_user_mappings_pending` and are default-deactivated in UA-Hub after the window (default 7 days) if staff hasn't resolved them.
 
 **Normalization rules (applied to both sides before comparison):**
@@ -146,7 +146,7 @@ Add to the existing HTMX-driven staff UI under `/ui/unmatched`. Everything below
       - Search box: type any substring, posts to `/ui/unmatched/{uaUserID}/search?q=...` which runs a cursor-paginated name scan and returns a candidate fragment.
   - **`POST /ui/unmatched/{uaUserID}/match`** — body: `redpointCustomerId=X`. Bridge:
       - Writes `ua_user_mappings(uaUserID, X, now, 'staff:<username>', null)`.
-      - Calls UA-Hub `UpdateUser` to mirror email from Redpoint customer X.
+      - ~~Calls UA-Hub `UpdateUser` to mirror email from Redpoint customer X.~~ (**Dropped v0.5.1** — see §Matching note above.)
       - Logs to `match_audit` table (who, when, source of decision).
       - Returns the updated row fragment with "matched by <username> at <time>" so the staff user gets instant visual confirmation.
   - **`POST /ui/unmatched/{uaUserID}/skip`** — staff explicitly marks the user as "not a member, deactivate now". Bridge immediately deactivates in UA-Hub and records reason `'staff:skip'`. Useful for ex-member cards that predate the Redpoint directory.
@@ -158,9 +158,11 @@ All five endpoints sit behind the same auth middleware as the rest of `/ui/*` (s
 
 **Safety gates on the writeback:**
 
-  - UA-Hub email writes happen only when the UA-Hub email is empty OR a previous mapping-audit row shows the current UA-Hub email was itself set by the bridge (i.e. we're just mirroring ongoing drift from Redpoint). If UA-Hub's email differs from Redpoint's AND the audit trail shows a human set it, log a warning, skip the write, and surface the divergence in the staff UI for manual review.
-  - Every UA-Hub `UpdateUser` call writes to `match_audit(ua_user_id, field, before, after, source, timestamp)` for postmortem forensics.
-  - A new `bridge.sync_email_drift_total` counter tracks how often the bridge chooses to skip a write because of the hand-entered-email rule above. Non-zero is informational, not alarming.
+**v0.5.1 supersedes this whole subsection** — the bridge no longer writes email back to UA-Hub, so the gates below are unused. Status-writes (`UpdateUserStatus` for ACTIVE/DEACTIVATED) remain the only UA-Hub mutations the bridge performs, and those have their own safety paths in `internal/statusync/syncer.go`. Historical text retained for the postmortem record:
+
+  - ~~UA-Hub email writes happen only when the UA-Hub email is empty OR a previous mapping-audit row shows the current UA-Hub email was itself set by the bridge (i.e. we're just mirroring ongoing drift from Redpoint). If UA-Hub's email differs from Redpoint's AND the audit trail shows a human set it, log a warning, skip the write, and surface the divergence in the staff UI for manual review.~~
+  - ~~Every UA-Hub `UpdateUser` call writes to `match_audit(ua_user_id, field, before, after, source, timestamp)` for postmortem forensics.~~ (`match_audit` still records `field='mapping'` rows for every bind, as well as every `UpdateUserStatus` call, which is the concrete scope of "forensics" today.)
+  - ~~A new `bridge.sync_email_drift_total` counter tracks how often the bridge chooses to skip a write because of the hand-entered-email rule above. Non-zero is informational, not alarming.~~ (Not implemented; no longer applicable.)
 
 ---
 

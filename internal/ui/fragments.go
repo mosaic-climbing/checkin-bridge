@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // StatsFragment renders the dashboard stats grid.
@@ -288,6 +289,154 @@ func AlertFragment(success bool, message string) string {
 		class = "alert-error"
 	}
 	return fmt.Sprintf(`<div class="alert %s">%s</div>`, class, HTMLEscape(message))
+}
+
+// ─── Sync page fragments (v0.5.1) ─────────────────────────────
+//
+// Three helpers support the rewired /ui/sync page:
+//
+//   1. SyncResultFragment: the rich confirmation that swaps into
+//      #sync-result after a staff click. Title + body + optional
+//      list of "kind: count" stat rows. Replaces the raw-JSON
+//      swap that v0.5.0 accidentally shipped.
+//
+//   2. SyncLastRunPill: the inline badge rendered inside each
+//      sync card showing the most recent run's age and outcome.
+//      Polled via hx-trigger="load, every 15s" per card so staff
+//      can see a scheduled sync fire without reloading the page.
+//
+//   3. FormatRelative: parses an RFC3339 timestamp and returns a
+//      compact relative string ("just now", "12m ago", "2h ago",
+//      "3d ago"). Empty or unparseable input returns "never".
+
+// SyncStat is a single labelled count row shown inside a
+// SyncResultFragment. Value is rendered as-is (free text) so
+// callers can pass "883" or "0.4s" or "dry run — no writes".
+type SyncStat struct {
+	Label string
+	Value string
+}
+
+// SyncResultFragment renders the staff-facing confirmation of a sync
+// action. success=true uses green styling; false uses red. title is
+// the one-line headline ("Cache sync complete"), body is one or two
+// sentences of context, and stats is an optional bullet list of
+// "label: value" pairs rendered as a table inside the alert.
+//
+// The fragment targets #sync-result on the /ui/sync page (see
+// internal/ui/templates/pages/sync.html). It also carries an
+// hx-swap-oob span that refreshes the per-card "Last run" pill so
+// the page-level state visibly advances without a second HTTP round
+// trip.
+func SyncResultFragment(success bool, title, body string, stats []SyncStat, pillJobType string) string {
+	kind := "alert-success"
+	icon := "✓"
+	if !success {
+		kind = "alert-error"
+		icon = "✗"
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf(`<div class="alert %s" style="display:flex;flex-direction:column;gap:8px">`, kind))
+	sb.WriteString(fmt.Sprintf(`<div style="font-weight:600;font-size:14px">%s %s</div>`,
+		icon, HTMLEscape(title)))
+	if body != "" {
+		sb.WriteString(fmt.Sprintf(`<div style="font-size:13px;line-height:1.4">%s</div>`,
+			HTMLEscape(body)))
+	}
+	if len(stats) > 0 {
+		sb.WriteString(`<div style="margin-top:4px;display:grid;grid-template-columns:max-content 1fr;gap:4px 12px;font-size:12px">`)
+		for _, st := range stats {
+			sb.WriteString(fmt.Sprintf(
+				`<div style="color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px">%s</div><div style="font-variant-numeric:tabular-nums"><code>%s</code></div>`,
+				HTMLEscape(st.Label), HTMLEscape(st.Value)))
+		}
+		sb.WriteString(`</div>`)
+	}
+	sb.WriteString(`</div>`)
+
+	// Out-of-band pill refresh. hx-swap-oob="true" on a root element
+	// with a matching id causes HTMX to replace the same-id target on
+	// the page without disturbing the primary swap. The pill handler
+	// re-reads jobs table so even a failing sync renders its error
+	// badge this way.
+	if pillJobType != "" {
+		sb.WriteString(fmt.Sprintf(
+			`<span id="sync-pill-%s" hx-get="/ui/frag/sync-last-run/%s" hx-trigger="load" hx-swap-oob="true"></span>`,
+			HTMLEscape(pillJobType), HTMLEscape(pillJobType)))
+	}
+	return sb.String()
+}
+
+// SyncLastRunPill renders the "Last run: 12m ago · ✓" badge that sits
+// inside each sync card. jobType is used for the id so the OOB swap in
+// SyncResultFragment can target it. status is one of "completed",
+// "failed", "running", or empty. createdAt is the RFC3339 string the
+// jobs table stamps at CreateJob. A nil/empty job renders the "Never
+// run" pill.
+func SyncLastRunPill(jobType, status, createdAt, errMsg string) string {
+	id := fmt.Sprintf("sync-pill-%s", HTMLEscape(jobType))
+	if status == "" {
+		return fmt.Sprintf(
+			`<span id="%s" class="badge" style="background:#eceff1;color:var(--text-muted);font-weight:500">Never run</span>`,
+			id)
+	}
+	rel := FormatRelative(createdAt)
+	switch status {
+	case "running":
+		return fmt.Sprintf(
+			`<span id="%s" class="badge badge-running" title="Started %s">⟳ Running · started %s</span>`,
+			id, HTMLEscape(createdAt), HTMLEscape(rel))
+	case "failed":
+		tooltip := "Failed"
+		if errMsg != "" {
+			tooltip = "Failed: " + errMsg
+		}
+		return fmt.Sprintf(
+			`<span id="%s" class="badge badge-failed" title="%s">✗ Failed · %s</span>`,
+			id, HTMLEscape(tooltip), HTMLEscape(rel))
+	case "completed":
+		return fmt.Sprintf(
+			`<span id="%s" class="badge badge-completed" title="Completed %s">✓ %s</span>`,
+			id, HTMLEscape(createdAt), HTMLEscape(rel))
+	default:
+		return fmt.Sprintf(
+			`<span id="%s" class="badge" style="background:#eceff1;color:var(--text-muted)">%s · %s</span>`,
+			id, HTMLEscape(status), HTMLEscape(rel))
+	}
+}
+
+// FormatRelative takes an RFC3339 timestamp and returns a compact
+// human-readable relative-time string suitable for the sync pill:
+// "just now", "12m ago", "2h ago", "3d ago". Empty or unparseable
+// input returns "never".
+func FormatRelative(ts string) string {
+	if ts == "" {
+		return "never"
+	}
+	t, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return "never"
+	}
+	d := time.Since(t)
+	if d < 0 {
+		// Future timestamps happen in tests + clock skew; pin to "just
+		// now" rather than rendering a confusing "-2s ago".
+		return "just now"
+	}
+	switch {
+	case d < 45*time.Second:
+		return "just now"
+	case d < 90*time.Second:
+		return "1m ago"
+	case d < 60*time.Minute:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	case d < 30*24*time.Hour:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	default:
+		return t.Format("Jan 2")
+	}
 }
 
 // ─── "New Member" provisioning UI (C2 Layer 4d) ───────────────────────

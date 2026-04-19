@@ -278,6 +278,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /ui/frag/shadow-decisions", withTimeout(shortTimeout, s.handleFragShadowDecisions))
 	s.mux.HandleFunc("GET /ui/frag/unmatched-table", withTimeout(longTimeout, s.handleFragUnmatchedTable))
 
+	// v0.5.1 sync-page "Last run" pills. Backs the hx-get on each
+	// sync card so the pill auto-refreshes after a click (via
+	// hx-swap-oob in SyncResultFragment) and on page load. See
+	// internal/api/sync_ux.go:handleFragSyncLastRun for the type
+	// allowlist and "never run"/"running"/"failed" variants.
+	s.mux.HandleFunc("GET /ui/frag/sync-last-run/{type}", withTimeout(shortTimeout, s.handleFragSyncLastRun))
+
 	// Door policy management (from HTMX UI)
 	s.mux.HandleFunc("POST /ui/frag/door-policy", withTimeout(shortTimeout, s.handleAddDoorPolicy))
 	s.mux.HandleFunc("DELETE /ui/frag/door-policy/{doorId}", withTimeout(shortTimeout, s.handleDeleteDoorPolicy))
@@ -702,21 +709,78 @@ func (s *Server) handleCacheMembers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"members": members})
 }
 
+// handleCacheSync refreshes every cached member's status against Redpoint
+// in a single synchronous pass. The call is wrapped in a jobs-table
+// lifecycle (running → completed / failed) so the /ui/sync page's "Last
+// run" pill and Recent Jobs list can show staff that a sync fired. The
+// HTMX response is a rich confirmation fragment; API callers still get
+// the original JSON body.
 func (s *Server) handleCacheSync(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("manual membership status refresh triggered via API")
 	s.audit.Log("cache_sync", r.RemoteAddr, nil)
-	if err := s.syncer.RefreshAllStatuses(r.Context()); err != nil {
-		writeError(w, http.StatusBadGateway, "status refresh failed: "+err.Error())
-		return
-	}
-	var stats any
+
+	jobID := s.startSyncJob(r.Context(), jobTypeCacheSync)
+
+	started := time.Now()
+	refreshErr := s.syncer.RefreshAllStatuses(r.Context())
+
+	var stats *store.MemberStats
 	if s.store != nil {
 		stats, _ = s.store.MemberStats(r.Context())
 	}
-	writeJSON(w, map[string]any{
-		"success": true,
-		"cache":   stats,
-	})
+	duration := time.Since(started).Round(100 * time.Millisecond)
+
+	if refreshErr != nil {
+		s.finishSyncJob(r.Context(), jobID, nil, refreshErr)
+		if wantsHTMX(r) {
+			s.writeSyncResult(w, r, jobTypeCacheSync, http.StatusOK, false,
+				"Cache sync failed",
+				"Refresh against Redpoint returned an error. Leaving member cache as it was.",
+				[]ui.SyncStat{
+					{Label: "Error", Value: refreshErr.Error()},
+					{Label: "Duration", Value: duration.String()},
+				}, nil)
+			return
+		}
+		writeError(w, http.StatusBadGateway, "status refresh failed: "+refreshErr.Error())
+		return
+	}
+
+	s.finishSyncJob(r.Context(), jobID, map[string]any{
+		"cache":    stats,
+		"duration": duration.String(),
+	}, nil)
+
+	s.writeSyncResult(w, r, jobTypeCacheSync, http.StatusOK, true,
+		"Cache sync complete",
+		"Refreshed every cached member's status from Redpoint.",
+		syncStatsFromMemberStats(stats, duration),
+		map[string]any{
+			"success": true,
+			"cache":   stats,
+		})
+}
+
+// syncStatsFromMemberStats unpacks *store.MemberStats into the uniform
+// []ui.SyncStat rows the fragment renders. Nil stats (store absent or
+// read failure) degrades to just the duration row rather than blowing
+// up the response.
+func syncStatsFromMemberStats(stats *store.MemberStats, duration time.Duration) []ui.SyncStat {
+	rows := []ui.SyncStat{{Label: "Duration", Value: duration.String()}}
+	if stats == nil {
+		return rows
+	}
+	rows = append(rows,
+		ui.SyncStat{Label: "Members total", Value: fmt.Sprintf("%d", stats.Total)},
+		ui.SyncStat{Label: "Active", Value: fmt.Sprintf("%d", stats.Active)},
+	)
+	if stats.Frozen > 0 {
+		rows = append(rows, ui.SyncStat{Label: "Frozen", Value: fmt.Sprintf("%d", stats.Frozen)})
+	}
+	if stats.Expired > 0 {
+		rows = append(rows, ui.SyncStat{Label: "Expired", Value: fmt.Sprintf("%d", stats.Expired)})
+	}
+	return rows
 }
 
 // ─── Customer Directory (SQLite) ─────────────────────────────
@@ -744,6 +808,13 @@ func (s *Server) handleDirectorySync(w http.ResponseWriter, r *http.Request) {
 	}
 	state, _ := s.store.GetSyncState(r.Context())
 	if state != nil && state.Status == "running" {
+		if wantsHTMX(r) {
+			s.writeSyncResult(w, r, jobTypeDirectorySync, http.StatusOK, true,
+				"Directory sync already running",
+				"A bulk customer load kicked off earlier is still in progress. Wait for the Last-run pill to flip to ✓, or check /directory/status for a row count.",
+				nil, nil)
+			return
+		}
 		writeJSON(w, map[string]any{
 			"message": "sync already in progress",
 			"sync":    state,
@@ -753,11 +824,39 @@ func (s *Server) handleDirectorySync(w http.ResponseWriter, r *http.Request) {
 
 	s.logger.Info("Redpoint → SQLite directory sync triggered via API")
 
-	// Run in background via the supervised group
+	jobID := s.startSyncJob(r.Context(), jobTypeDirectorySync)
+
+	// Run in background via the supervised group. The jobID is captured
+	// by value so the goroutine can stamp the terminal status even after
+	// the request context has long returned.
 	s.bg.Go("directory-sync", func(ctx context.Context) error {
+		started := time.Now()
 		s.bulkLoadCustomers(ctx)
+		// bulkLoadCustomers writes its own sync_state row on success/
+		// failure; mirror that into the jobs-table job so the pill
+		// and Recent Jobs list reflect the same outcome.
+		finalState, _ := s.store.GetSyncState(ctx)
+		duration := time.Since(started).Round(time.Second)
+		if finalState != nil && finalState.Status == "error" {
+			s.finishSyncJob(ctx, jobID, nil, fmt.Errorf("%s", finalState.LastError))
+			return nil
+		}
+		result := map[string]any{"duration": duration.String()}
+		if finalState != nil {
+			result["totalFetched"] = finalState.TotalFetched
+			result["completedAt"] = finalState.CompletedAt
+		}
+		s.finishSyncJob(ctx, jobID, result, nil)
 		return nil
 	})
+
+	if wantsHTMX(r) {
+		s.writeSyncResult(w, r, jobTypeDirectorySync, http.StatusAccepted, true,
+			"Directory sync started",
+			"Bulk-loading every active Redpoint customer into the local mirror. This can take several minutes for large directories; the Last-run pill will flip to ✓ when done.",
+			nil, nil)
+		return
+	}
 
 	writeJSON(w, map[string]any{
 		"message": "sync started — poll GET /directory/status to monitor",
@@ -920,8 +1019,22 @@ func (s *Server) handleIngestUniFi(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("UniFi ingest triggered", "dryRun", dryRun)
 	s.audit.Log("ingest_start", r.RemoteAddr, map[string]any{"dryRun": dryRun})
 
+	jobID := s.startSyncJob(r.Context(), jobTypeUniFiIngest)
+	started := time.Now()
+
 	result, err := s.ingester.Run(r.Context(), dryRun)
 	if err != nil {
+		s.finishSyncJob(r.Context(), jobID, nil, err)
+		if wantsHTMX(r) {
+			s.writeSyncResult(w, r, jobTypeUniFiIngest, http.StatusOK, false,
+				"UniFi ingest failed",
+				"Couldn't complete the UniFi → Redpoint match pass. Members table unchanged.",
+				[]ui.SyncStat{
+					{Label: "Error", Value: err.Error()},
+					{Label: "Duration", Value: time.Since(started).Round(100 * time.Millisecond).String()},
+				}, nil)
+			return
+		}
 		writeError(w, http.StatusBadGateway, "ingest failed: "+err.Error())
 		return
 	}
@@ -929,6 +1042,38 @@ func (s *Server) handleIngestUniFi(w http.ResponseWriter, r *http.Request) {
 		"dryRun": dryRun, "matched": result.Matched,
 		"unmatched": result.Unmatched, "applied": result.Applied,
 	})
+	duration := time.Since(started).Round(100 * time.Millisecond)
+	s.finishSyncJob(r.Context(), jobID, map[string]any{
+		"dryRun":     dryRun,
+		"unifiUsers": result.UniFiUsers,
+		"withNfc":    result.WithNFC,
+		"matched":    result.Matched,
+		"unmatched":  result.Unmatched,
+		"applied":    result.Applied,
+		"duration":   duration.String(),
+	}, nil)
+
+	if wantsHTMX(r) {
+		title := "UniFi ingest complete"
+		body := fmt.Sprintf("Scanned %d UniFi users (%d with NFC tags) and resolved them against Redpoint. Wrote %d members to the cache.",
+			result.UniFiUsers, result.WithNFC, result.Applied)
+		if dryRun {
+			title = "UniFi ingest — dry run"
+			body = fmt.Sprintf("Previewed %d UniFi users (%d with NFC tags) against Redpoint. No writes to the members table. Click \"Run (writes)\" to apply.",
+				result.UniFiUsers, result.WithNFC)
+		}
+		s.writeSyncResult(w, r, jobTypeUniFiIngest, http.StatusOK, true,
+			title, body,
+			[]ui.SyncStat{
+				{Label: "UniFi users", Value: fmt.Sprintf("%d", result.UniFiUsers)},
+				{Label: "With NFC", Value: fmt.Sprintf("%d", result.WithNFC)},
+				{Label: "Matched", Value: fmt.Sprintf("%d", result.Matched)},
+				{Label: "Unmatched", Value: fmt.Sprintf("%d", result.Unmatched)},
+				{Label: "Applied", Value: fmt.Sprintf("%d", result.Applied)},
+				{Label: "Duration", Value: duration.String()},
+			}, nil)
+		return
+	}
 
 	// ?summary=true returns counts + unmatched/warning list only (no full mappings)
 	if r.URL.Query().Get("summary") == "true" {
@@ -1327,6 +1472,13 @@ func (s *Server) handleStatusSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.statusSyncer.IsRunning() {
+		if wantsHTMX(r) {
+			s.writeSyncResult(w, r, jobTypeStatusSync, http.StatusOK, true,
+				"Status sync already running",
+				"A status sync kicked off earlier hasn't finished yet — watch the Last-run pill or the Recent Jobs list; it'll flip to ✓ when done.",
+				nil, nil)
+			return
+		}
 		writeJSON(w, map[string]any{
 			"message": "sync already in progress — poll GET /status-sync to monitor",
 			"running": true,
@@ -1342,6 +1494,12 @@ func (s *Server) handleStatusSync(w http.ResponseWriter, r *http.Request) {
 	// its own context, so r.RemoteAddr is not safe to read there.
 	peer := r.RemoteAddr
 
+	// Create the jobs-table row before dispatching so the initial pill
+	// flips to "running" immediately on the next /ui/frag/sync-last-run
+	// poll. The bg goroutine owns the completion write since the sync
+	// outlives the HTTP request.
+	jobID := s.startSyncJob(r.Context(), jobTypeStatusSync)
+
 	// Run in background via the supervised group. ctx is the bridge
 	// shutdown context, not the request context — so a client disconnect
 	// mid-sync no longer cancels in-flight Redpoint or DB work.
@@ -1350,6 +1508,7 @@ func (s *Server) handleStatusSync(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			s.logger.Error("background status sync failed", "error", err)
 			s.audit.Log("status_sync_error", peer, map[string]any{"error": err.Error()})
+			s.finishSyncJob(ctx, jobID, nil, err)
 			return nil // swallow — bg.Go's error is logged but we've already handled it
 		}
 		s.audit.Log("status_sync_complete", peer, map[string]any{
@@ -1361,8 +1520,25 @@ func (s *Server) handleStatusSync(w http.ResponseWriter, r *http.Request) {
 			"newlyPending": result.NewlyPending,
 			"duration":     result.Duration,
 		})
+		s.finishSyncJob(ctx, jobID, map[string]any{
+			"activated":    result.Activated,
+			"deactivated":  result.Deactivated,
+			"unchanged":    result.Unchanged,
+			"errors":       result.Errors,
+			"newlyMatched": result.NewlyMatched,
+			"newlyPending": result.NewlyPending,
+			"duration":     result.Duration,
+		}, nil)
 		return nil
 	})
+
+	if wantsHTMX(r) {
+		s.writeSyncResult(w, r, jobTypeStatusSync, http.StatusAccepted, true,
+			"Status sync started",
+			"Running in the background. The Last-run pill will flip to ✓ when done; you can leave this page and come back.",
+			nil, nil)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -1827,7 +2003,7 @@ func (s *Server) handleFragUnmatchedTable(w http.ResponseWriter, r *http.Request
 // Backed by ua_user_mappings_pending (written by the statusync matching
 // phase). Mutating actions go:
 //
-//   match:  UA-Hub UpdateUser(email) + store.UpsertMapping + DeletePending +
+//   match:  store.UpsertMapping + DeletePending +
 //           AppendMatchAudit(field=mapping, source=staff)
 //   skip:   UA-Hub UpdateUserStatus(DEACTIVATED) + DeletePending +
 //           AppendMatchAudit(field=user_status, source=staff:skip)
@@ -1835,6 +2011,14 @@ func (s *Server) handleFragUnmatchedTable(w http.ResponseWriter, r *http.Request
 //
 // All three actions hx-swap the detail panel back into place with the
 // post-mutation state.
+//
+// Note (v0.5.1): the match action does NOT call UA-Hub UpdateUser(email).
+// The original design (docs/architecture-review.md C2 §Matching, pre-v0.5.1)
+// mirrored Redpoint email into UA-Hub on every match. We dropped that —
+// Redpoint is the source of truth, and the bridge reads UA-Hub email only
+// to drive matching. UA-Hub email stays whatever staff typed when creating
+// the user. TouchMappingEmailSynced + last_email_synced_at are dead
+// columns today; slated for migration-5 cleanup.
 
 // lookupUAUser tries to fetch a single UA-Hub user by ID. Uses ListUsers
 // and filters in-process — UA-Hub has no single-user GET in the current
@@ -2096,8 +2280,13 @@ func (s *Server) handleFragUnmatchedMatch(w http.ResponseWriter, r *http.Request
 	// Rebuild the detail fragment with a confirmation alert. Since the
 	// pending row is gone, GetPending returns nil — render a success
 	// alert in its place.
+	//
+	// Note: v0.5.1 dropped the "next sync will mirror the email" line.
+	// The bridge does NOT push Redpoint email into UA-Hub — it only
+	// reads UA-Hub emails to drive its own matching. See
+	// docs/architecture-review.md C2 §Matching for the decision.
 	ui.RenderFragment(w, ui.AlertFragment(true,
-		fmt.Sprintf("Matched UA-Hub user %s → Redpoint %s (%s). The next sync will mirror the email.",
+		fmt.Sprintf("Matched UA-Hub user %s → Redpoint %s (%s). Saved.",
 			uaUserID, customerID, strings.TrimSpace(cust.FirstName+" "+cust.LastName))))
 }
 

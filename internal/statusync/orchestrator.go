@@ -134,10 +134,13 @@ func (s *Syncer) persistDecision(ctx context.Context, ua unifi.UniFiUser, d matc
 			RedpointCustomer: d.Matched.ID,
 			MatchedAt:        nowStr,
 			MatchedBy:        d.Source,
-			// LastEmailSyncedAt intentionally left empty — UpsertMapping
-			// preserves the prior value when excluded is blank. Only a
-			// successful UA-Hub UpdateUser(email=...) call should ever
-			// advance this timestamp, via TouchMappingEmailSynced.
+			// LastEmailSyncedAt intentionally left empty. v0.5.1 decision
+			// (see docs/architecture-review.md C2 §Matching): the bridge
+			// does NOT push Redpoint email into UA-Hub. Redpoint is the
+			// source of truth; UA-Hub email is operator-curated and
+			// consumed only as a matching input. TouchMappingEmailSynced
+			// is retained for schema back-compat but has no production
+			// caller — slated for cleanup in migration 5.
 		}
 		if err := s.store.UpsertMapping(ctx, m); err != nil {
 			return fmt.Errorf("UpsertMapping: %w", err)
