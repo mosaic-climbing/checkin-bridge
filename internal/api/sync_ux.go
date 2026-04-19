@@ -42,6 +42,11 @@ const (
 	jobTypeStatusSync    = "status_sync"
 	jobTypeDirectorySync = "directory_sync"
 	jobTypeUniFiIngest   = "unifi_ingest"
+	// jobTypeUAHubSync is the nightly (and manually-triggered) UA-Hub
+	// directory mirror refresh. Parallels jobTypeDirectorySync for the
+	// Redpoint side: ListAllUsersWithStatus → ua_users upsert. Added
+	// in v0.5.2.
+	jobTypeUAHubSync = "ua_hub_sync"
 )
 
 // wantsHTMX returns true when the request is coming from the staff UI's
@@ -184,7 +189,8 @@ func (s *Server) handleFragSyncLastRun(w http.ResponseWriter, r *http.Request) {
 func isKnownSyncJobType(t string) bool {
 	switch t {
 	case jobTypeCacheSync, jobTypeStatusSync,
-		jobTypeDirectorySync, jobTypeUniFiIngest:
+		jobTypeDirectorySync, jobTypeUniFiIngest,
+		jobTypeUAHubSync:
 		return true
 	}
 	return false

@@ -230,7 +230,11 @@ COMMIT;
 // ─── audit.db migrations ────────────────────────────────────────
 
 // auditSchemaVersion is the current migration count for audit.db.
-const auditSchemaVersion = 4
+// Bumped to 5 in v0.5.2 for the ua_name + ua_email columns on
+// ua_user_mappings_pending (auditMigration5_pending_ua_identity),
+// then to 6 in the same release for the ua_users directory mirror
+// (auditMigration6_ua_users).
+const auditSchemaVersion = 6
 
 // auditSchemaVersionAtSplit pins the audit-side schema version that a
 // pre-A4 bridge.db already embodies at the moment of the legacy split
@@ -248,13 +252,19 @@ const auditSchemaVersionAtSplit = 3
 // Migration 2 is the unifi_result ALTER on checkins (was 4).
 // Migration 3 creates the UA-Hub mapping tables + match_audit
 // (was 5). Migration 4 adds unifi_log_id for tap-poller dedup
-// (v0.5.0). Migrations 1, 2, and 6 from the old combined sequence
-// are cache-side and not in this list.
+// (v0.5.0). Migration 5 caches UA-Hub name/email on the pending
+// row so the Needs Match page can render without a live UA-Hub
+// ListUsers walk (v0.5.2). Migration 6 creates ua_users, the
+// nightly UA-Hub directory mirror that parallels the Redpoint
+// customers mirror (v0.5.2). Migrations 1, 2, and 6 from the old
+// combined sequence are cache-side and not in this list.
 var auditMigrations = []string{
 	auditMigration1_checkins,
 	auditMigration2_unifi_result,
 	auditMigration3_mappings,
 	auditMigration4_unifi_log_id,
+	auditMigration5_pending_ua_identity,
+	auditMigration6_ua_users,
 }
 
 // Migration 1 (audit): Check-in event log, door policies, background jobs.
@@ -380,6 +390,85 @@ ALTER TABLE checkins ADD COLUMN unifi_log_id TEXT NOT NULL DEFAULT '';
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_checkins_unifi_log_id
     ON checkins(unifi_log_id) WHERE unifi_log_id != '';
+`
+
+// Migration 5 (audit): cache UA-Hub identity on the pending row (v0.5.2).
+//
+// Before this change, the /ui/frag/unmatched-list handler enriched each
+// pending row by calling s.unifi.ListUsers(ctx) live, which walks the
+// full UA-Hub user directory sequentially (17 pages × 100/page at LEF;
+// 10s per-page HTTP timeout). When UA-Hub was slow or wedged, the
+// Needs Match page hung on its HTMX load for minutes and never painted
+// the spinner away. We already hold a full unifi.UniFiUser record at
+// UpsertPending time (see statusync.Syncer.persistDecision), so the
+// cleanest fix is to persist ua_name + ua_email alongside the pending
+// row and stop talking to UA-Hub from the render path.
+//
+// Both columns default to '' so existing rows upgrade cleanly; the next
+// statusync pass re-observes the user and refreshes them via the
+// UpsertPending ON CONFLICT refresh clause.
+//
+// Same "ALTER is not idempotent — rely on schema_version" caveat as
+// migration 2. Replay safety on a pre-split bridge.db is not a concern
+// for this migration: v0.5.2 ships post-A4, so every install reaches
+// migration 5 through migrateWith with a proper audit.schema_version
+// check.
+const auditMigration5_pending_ua_identity = `
+ALTER TABLE ua_user_mappings_pending ADD COLUMN ua_name  TEXT NOT NULL DEFAULT '';
+ALTER TABLE ua_user_mappings_pending ADD COLUMN ua_email TEXT NOT NULL DEFAULT '';
+`
+
+// Migration 6 (audit): UA-Hub user directory mirror (v0.5.2).
+//
+// The ingest and recheck paths both call unifi.Client.ListUsers /
+// ListAllUsersWithStatus synchronously against UA-Hub — 17 pages ×
+// 100/page at LEF, 10s per-page HTTP timeout, no caching. When UA-Hub
+// is slow or wedged the cost lands on whichever code path happens to
+// ask next, most visibly as the Needs Match hang that motivated
+// migration 5. Redpoint already has a nightly directory-walker that
+// hydrates a local `customers` mirror so downstream queries never pay
+// the upstream round-trip; this table gives UA-Hub the same treatment.
+//
+// Columns track exactly the unifi.UniFiUser fields we consume. Status
+// is stored as-is (UA-Hub emits ACTIVE, DEACTIVATED, DELETED, etc.).
+// nfc_tokens is a JSON array literal so operators with `sqlite3` handy
+// can see the card list without an additional join; the matcher and
+// ingester read it back via json.Unmarshal.
+//
+// last_synced_at is advanced on every upsert so staff can see when a
+// row was last observed from UA-Hub — useful for the "has this user
+// been seen since the UA-Hub side was fixed?" diagnostic. first_seen
+// is anchored on the initial insert and preserved through conflicts
+// so the directory mirror doubles as a rough audit of when each
+// UA-Hub user first appeared to the bridge.
+//
+// Audit-side (not cache-side) because this is operator-observable
+// state we don't want to lose when cache.db is nuked for a resync.
+// A wipe of the UA-Hub directory mirror would just mean one
+// slow-path sync to repopulate — tolerable but noisy — whereas losing
+// the match_audit trail would be genuine forensic data loss. Keeping
+// the full UA-Hub directory next to the mappings it drives also
+// means both sides live under the same transactional locus, should
+// we ever want a cross-table constraint.
+const auditMigration6_ua_users = `
+CREATE TABLE IF NOT EXISTS ua_users (
+    id              TEXT PRIMARY KEY,
+    first_name      TEXT NOT NULL DEFAULT '',
+    last_name       TEXT NOT NULL DEFAULT '',
+    name            TEXT NOT NULL DEFAULT '',
+    email           TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT '',
+    nfc_tokens      TEXT NOT NULL DEFAULT '[]',
+    first_seen      TEXT NOT NULL DEFAULT (datetime('now')),
+    last_synced_at  TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_ua_users_email
+    ON ua_users(lower(email)) WHERE email != '';
+CREATE INDEX IF NOT EXISTS idx_ua_users_name
+    ON ua_users(lower(first_name), lower(last_name));
+CREATE INDEX IF NOT EXISTS idx_ua_users_status
+    ON ua_users(status) WHERE status != '';
 `
 
 // ─── Migration runners ──────────────────────────────────────────
