@@ -18,6 +18,73 @@ Context and conventions for AI assistants working on this repo. Read this first.
 
 ---
 
+## SSH + sudo — read this before writing any ssh command
+
+**The gym MacBook does NOT have passwordless sudo.** Every `sudo` invocation on the remote needs a password prompt. That constrains how you write remote commands from your laptop. I keep getting this wrong; this section exists to stop that.
+
+### The two modes that actually work
+
+**Mode A — one-shot sudo command** (the common case). Always use `-t`:
+
+```bash
+ssh -t $GYM 'sudo <command>'
+```
+
+`-t` allocates a TTY so `sudo` can prompt you for the Mac admin password. You type it once, the command runs, done. Without `-t`, `sudo` errors with `"sudo: a terminal is required to read the password"` and exits immediately. This applies to **every** diagnostic, not just `update.sh`:
+
+- `ssh -t $GYM 'sudo -u mosaic sqlite3 /usr/local/mosaic-bridge/data/cache.db "SELECT ..."'`
+- `ssh -t $GYM 'sudo awk -F= "/^ADMIN_API_KEY=/ {...}" /usr/local/mosaic-bridge/.env'`
+- `ssh -t $GYM 'sudo launchctl kickstart -k system/com.mosaic.bridge'`
+- `ssh -t $GYM 'sudo tail -50 /usr/local/mosaic-bridge/bridge.err'`
+
+**Mode B — several sudo commands in a row.** Use an interactive root shell so you type the password once, not once per command:
+
+```bash
+ssh -t $GYM 'sudo -i'
+# you're now root on the Mac; paste commands WITHOUT sudo prefixes
+```
+
+Use this for multi-step setup (installing files, editing sudoers, etc.).
+
+### The mode that DOES NOT work — `-t` + heredoc
+
+**NEVER write `ssh -t $GYM '...' <<'EOF'`**. The `-t` forces TTY mode and the heredoc goes to the same stdin. `sudo` reads the heredoc lines as password attempts, the command hangs or errors, and you lose time. This bites me repeatedly — hence this warning.
+
+If you need to write a file content to a remote path, do one of:
+
+1. **`scp` + `ssh -t sudo mv`** — separate the "what content" from the "where it lands":
+   ```bash
+   cat > /tmp/local-file <<'EOF'
+   <content>
+   EOF
+   scp /tmp/local-file $GYM:/tmp/remote-file
+   ssh -t $GYM 'sudo install -o root -g wheel -m 0644 /tmp/remote-file /etc/target/file && rm /tmp/remote-file'
+   ```
+2. **Interactive root shell** (Mode B), then `cat > /path <<EOF` inside the shell.
+
+The pattern to avoid: `ssh -tt $GYM 'sudo -v' <<EOF`, `ssh $GYM 'sudo -S ...' <<EOF` with the password piped in — both fragile, both have bitten us.
+
+### Why `make deploy` works without thinking
+
+The Makefile's `deploy` target uses `-t`:
+
+```make
+deploy:
+	ssh -t $(GYM) "sudo /usr/local/mosaic-bridge/update.sh $(TAG)"
+```
+
+If you write a new make target or script that runs sudo remotely, copy that pattern.
+
+### Quick self-check before running a remote sudo command
+
+Ask yourself:
+
+1. Does the command need sudo on the remote? → Use `ssh -t`, not plain `ssh`.
+2. Am I piping a heredoc into the ssh command? → Rewrite as `scp` + `ssh -t sudo install`.
+3. Is it multi-step sudo? → Use `ssh -t $GYM 'sudo -i'` and paste inside.
+
+---
+
 ## What this repo is
 
 A single Go binary (`cmd/bridge`) that bridges NFC taps on a UniFi Access reader to Redpoint HQ membership validation, unlocks the door on a match, and records the check-in. One deployment target (the MacBook at Mosaic), one environment, one developer.

@@ -77,4 +77,7 @@ release-tag: check-secrets test ## Tag, run gates, push
 GYM ?= mosaic-gym.local
 TAG ?= latest
 deploy: ## Tell the gym MacBook to pull + install the latest (or a specific) release
-	ssh $(GYM) "sudo /usr/local/mosaic-bridge/update.sh $(TAG)"
+	# -t allocates a TTY so sudo can prompt for the Mac admin password.
+	# Without it, sudo errors with "a terminal is required to read the password".
+	# Type the password once per deploy — the whole run finishes in that single sudo session.
+	ssh -t $(GYM) "sudo /usr/local/mosaic-bridge/update.sh $(TAG)"
