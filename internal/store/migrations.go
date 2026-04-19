@@ -35,18 +35,36 @@ import (
 
 // cacheSchemaVersion is the current migration count for cache.db.
 // Increment when appending to cacheMigrations.
-const cacheSchemaVersion = 3
+const cacheSchemaVersion = 4
+
+// cacheSchemaVersionAtSplit pins the cache-side schema version that a
+// pre-A4 bridge.db *already embodies* at the moment of the legacy split.
+// After splitLegacyDB copies bridge.db into cache.db and prunes the
+// audit-side tables, the cache.db contains tables at their pre-A4
+// shapes: customers (no badge columns), members, customers_fts. That
+// state corresponds to cache migrations 1..3 — i.e., 3.
+//
+// This constant must stay 3 FOREVER. Any new cache-side migration
+// (migration 4 onwards) adds columns or tables the legacy file does
+// not have; those migrations must run on the post-split cache.db to
+// bring it up to current shape. If we bumped the force-set to the
+// current head version, migration 4 would be skipped on the split
+// path and every subsequent query for badge_status would fail.
+const cacheSchemaVersionAtSplit = 3
 
 // cacheMigrations is the ordered DDL script applied to cache.db.
 // Migration 1 creates customers + sync_state (was migration 1 in the
 // pre-A4 monolithic sequence). Migration 2 creates members (was 2).
-// Migration 3 creates customers_fts + triggers (was 6). Migrations 3,
+// Migration 3 creates customers_fts + triggers (was 6). Migration 4
+// extends customers with badge state so the local mirror can answer
+// membership questions without a live Redpoint call. Migrations 3,
 // 4, and 5 from the old sequence belong to audit.db and are NOT in
 // this list.
 var cacheMigrations = []string{
 	cacheMigration1_customers,
 	cacheMigration2_members,
 	cacheMigration3_customers_fts,
+	cacheMigration4_customers_badge,
 }
 
 // Migration 1 (cache): Customer directory + sync state.
@@ -162,10 +180,65 @@ CREATE TRIGGER IF NOT EXISTS customers_fts_au AFTER UPDATE ON customers BEGIN
 END;
 `
 
+// Migration 4 (cache): Badge state on customers, for the local mirror.
+//
+// Why on customers and not members: the mirror answers membership
+// questions for anyone who might check in — not just the subset that's
+// already NFC-enrolled. A walk-in whose membership we want to verify
+// against Redpoint's answer has a customer row but no member row until
+// they enrol a wristband. Keeping badge state on customers means one
+// table owns "who holds what at Redpoint right now"; members remains
+// the NFC-enrolled cache-first lookup.
+//
+// Columns:
+//   - badge_status  — Customer.Badge.Status: ACTIVE | FROZEN | EXPIRED.
+//     Empty string on rows that pre-date the mirror or on customers
+//     without a badge (e.g., never-purchased guests).
+//   - badge_name    — Customer.Badge.CustomerBadge.Name: "Adult Member",
+//     "Day Pass", etc. Useful for reports; not used in the deny path.
+//   - past_due_balance — Customer.PastDueBalance in dollars. The
+//     validation policy refuses entry above a configured threshold.
+//     REAL because the API returns cents as fractional dollars.
+//   - home_facility_short_name — Customer.HomeFacility.ShortName.
+//     Preserved for the multi-facility future; single-facility today.
+//   - last_synced_at — when the mirror last refreshed this row.
+//     Used to detect staleness and to sort "most-recently-refreshed
+//     N customers" for diagnostics. Populated on every upsert from
+//     the walker.
+//
+// Atomicity: wrapped in BEGIN/COMMIT because ALTER TABLE ADD COLUMN
+// is NOT idempotent — a partial failure (one added, one not) would
+// leave schema_version un-advanced but the table half-modified, and
+// on retry the first ALTER would fail with "duplicate column name".
+// The operator's only recourse would be to drop cache.db. A
+// transaction makes the whole migration all-or-nothing.
+const cacheMigration4_customers_badge = `
+BEGIN;
+
+ALTER TABLE customers ADD COLUMN badge_status TEXT NOT NULL DEFAULT '';
+ALTER TABLE customers ADD COLUMN badge_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE customers ADD COLUMN past_due_balance REAL NOT NULL DEFAULT 0;
+ALTER TABLE customers ADD COLUMN home_facility_short_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE customers ADD COLUMN last_synced_at TEXT NOT NULL DEFAULT '';
+
+CREATE INDEX IF NOT EXISTS idx_customers_badge_status
+    ON customers(badge_status) WHERE badge_status != '';
+
+COMMIT;
+`
+
 // ─── audit.db migrations ────────────────────────────────────────
 
 // auditSchemaVersion is the current migration count for audit.db.
 const auditSchemaVersion = 3
+
+// auditSchemaVersionAtSplit pins the audit-side schema version that a
+// pre-A4 bridge.db already embodies at the moment of the legacy split
+// — i.e., the combined-sequence versions 3, 4, and 5 that are
+// audit-side. See cacheSchemaVersionAtSplit for the symmetric rationale;
+// any new audit migration after 3 must run on the split copy, so the
+// force-set must stay pinned.
+const auditSchemaVersionAtSplit = 3
 
 // auditMigrations is the ordered DDL script applied to audit.db.
 // Migration 1 creates checkins + door_policies + jobs (was 3).
