@@ -188,12 +188,17 @@ func (s *Syncer) persistDecision(ctx context.Context, ua unifi.UniFiUser, d matc
 		}
 		graceUntil = now.Add(time.Duration(days) * 24 * time.Hour).Format(time.RFC3339)
 	}
+	// Capture the UA-Hub display identity here so the Needs Match page
+	// can render without a live ListUsers walk. See migration 5
+	// (auditMigration5_pending_ua_identity) for the full rationale.
 	p := &store.Pending{
 		UAUserID:   ua.ID,
 		Reason:     d.PendingReason,
 		LastSeen:   nowStr,
 		GraceUntil: graceUntil,
 		Candidates: strings.Join(d.Candidates, "|"),
+		UAName:     ua.FullName(),
+		UAEmail:    ua.Email,
 	}
 	if err := s.store.UpsertPending(ctx, p); err != nil {
 		return fmt.Errorf("UpsertPending: %w", err)

@@ -35,6 +35,7 @@ import (
 	"github.com/mosaic-climbing/checkin-bridge/internal/store"
 	"github.com/mosaic-climbing/checkin-bridge/internal/ui"
 	"github.com/mosaic-climbing/checkin-bridge/internal/unifi"
+	"github.com/mosaic-climbing/checkin-bridge/internal/unifimirror"
 )
 
 // Build-time ldflags inject these. See .github/workflows/{ci,release}.yml.
@@ -495,6 +496,36 @@ func main() {
 	)
 	apiServer.SetMirrorWalker(mirrorWalker.Walk)
 
+	// v0.5.2: UA-Hub directory mirror. Parallels the Redpoint
+	// directory walker above — nightly pull of the full UA-Hub user
+	// list into audit.db/ua_users so the Needs Match page, ingest
+	// matcher, and recheck pre-filter can answer from SQLite instead
+	// of hitting UA-Hub live. See internal/unifimirror for rationale.
+	//
+	// The Syncer adapts to the api.Server's callback seam by wrapping
+	// RefreshWithStats in a closure that translates the local
+	// unifimirror.Stats to the package-agnostic api.UAHubRefreshStats.
+	// Keeping api → unifimirror implicit (via callback) avoids
+	// dragging unifimirror into the api test build graph.
+	uaHubMirror := unifimirror.New(
+		unifiClient,
+		db,
+		unifimirror.SyncConfig{Interval: cfg.Sync.Interval},
+		logger.With("component", "unifimirror"),
+	)
+	apiServer.SetUAHubMirrorRefresher(func(ctx context.Context) (api.UAHubRefreshStats, error) {
+		stats, err := uaHubMirror.RefreshWithStats(ctx)
+		if err != nil {
+			return api.UAHubRefreshStats{}, err
+		}
+		return api.UAHubRefreshStats{
+			Observed:    stats.Observed,
+			Upserted:    stats.Upserted,
+			MirrorTotal: stats.MirrorTotal,
+			Duration:    stats.Duration,
+		}, nil
+	})
+
 	// Build HTTP handler chain
 	var httpHandler http.Handler = apiServer
 	httpHandler = api.RecoveryMiddleware(logger.With("component", "api"), httpHandler)
@@ -567,6 +598,10 @@ func main() {
 	// Start background syncers via supervised group
 	bgGroup.Go("cache-syncer", syncer.Run)
 	bgGroup.Go("statusync", statusSyncer.Run)
+	// v0.5.2: UA-Hub directory mirror runs on the same interval as the
+	// Redpoint directory walker so both mirrors reflect the same
+	// wall-clock hour; see internal/unifimirror/sync.go.
+	bgGroup.Go("ua-hub-mirror", uaHubMirror.Run)
 
 	// v0.5.0: REST tap poller — on UA-Hub 4.11.19.0 / UniFi Access 4.2.16
 	// the WebSocket notifications feed no longer emits access.logs.add

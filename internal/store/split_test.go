@@ -229,13 +229,17 @@ func TestSplit_LegacyBridgeDB_Migrates(t *testing.T) {
 	// Verify the prune actually removed the wrong-side tables. The
 	// easiest way to assert this is to open each file raw and query
 	// sqlite_master.
+	// ua_users is created by audit migration 6 (v0.5.2 UA-Hub mirror).
+	// It must land on the audit side and never appear on the cache
+	// side; put it in both lists so a future table rename or accidental
+	// cache-side creation fails loudly here.
 	assertTablePresence(t, filepath.Join(dir, "audit.db"),
-		present{"checkins", "door_policies", "jobs", "ua_user_mappings", "ua_user_mappings_pending", "match_audit"},
+		present{"checkins", "door_policies", "jobs", "ua_user_mappings", "ua_user_mappings_pending", "match_audit", "ua_users"},
 		absent{"customers", "members", "sync_state", "customers_fts"},
 	)
 	assertTablePresence(t, filepath.Join(dir, "cache.db"),
 		present{"customers", "members", "sync_state", "customers_fts"},
-		absent{"checkins", "door_policies", "jobs", "ua_user_mappings", "ua_user_mappings_pending", "match_audit"},
+		absent{"checkins", "door_policies", "jobs", "ua_user_mappings", "ua_user_mappings_pending", "match_audit", "ua_users"},
 	)
 }
 

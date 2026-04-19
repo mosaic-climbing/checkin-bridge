@@ -112,6 +112,33 @@ type Server struct {
 	// doesn't need anything from the walker beyond "run once with
 	// this ctx" — that's exactly what a func captures.
 	mirrorWalk func(ctx context.Context) error
+
+	// uaHubMirrorRefresh, when non-nil, runs one pass of the UA-Hub
+	// directory mirror when POST /ua-hub/sync is invoked. Wired via
+	// SetUAHubMirrorRefresher from cmd/bridge after the unifimirror
+	// Syncer is constructed. The function returns a UAHubRefreshStats
+	// value so the handler can show the operator what the pass
+	// observed without the api package having to import the
+	// unifimirror package (and pull in the Syncer type into every
+	// test file transitively).
+	//
+	// Same setter-based rationale as breakerResetter and mirrorWalk:
+	// keep NewServer's constructor signature stable, and keep the
+	// api → unifimirror dependency implicit (via callback) rather
+	// than explicit (via struct field).
+	uaHubMirrorRefresh func(ctx context.Context) (UAHubRefreshStats, error)
+}
+
+// UAHubRefreshStats is the result payload the UA-Hub mirror refresh
+// callback returns. Mirrors unifimirror.Stats shape so the wiring in
+// cmd/bridge is a one-liner, but lives here so the api package
+// doesn't import unifimirror (keeping the dependency direction clean
+// and avoiding an import cycle when tests pass a fake refresher).
+type UAHubRefreshStats struct {
+	Observed    int
+	Upserted    int
+	MirrorTotal int
+	Duration    time.Duration
 }
 
 func NewServer(
@@ -200,6 +227,19 @@ func (s *Server) SetBreakerResetter(fn func() bool) {
 // needs the "run once" verb).
 func (s *Server) SetMirrorWalker(fn func(ctx context.Context) error) {
 	s.mirrorWalk = fn
+}
+
+// SetUAHubMirrorRefresher registers the callback used by POST /ua-hub/sync
+// to refresh the local UA-Hub user directory mirror. Pass nil to leave
+// the endpoint disabled (it will 503). cmd/bridge wires the unifimirror
+// Syncer's RefreshWithStats method here after constructing the Syncer.
+//
+// Setter-based to keep the NewServer constructor signature stable and
+// to avoid an api → unifimirror import (which would otherwise need to
+// be reversed because the api test suite builds fake Server values
+// without the mirror package loaded).
+func (s *Server) SetUAHubMirrorRefresher(fn func(ctx context.Context) (UAHubRefreshStats, error)) {
+	s.uaHubMirrorRefresh = fn
 }
 
 // ControlHandler returns the control-plane http.Handler: the mux that owns
@@ -340,6 +380,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /ingest/unmatched", withTimeout(longTimeout, s.handleUnmatched))
 	s.mux.HandleFunc("POST /status-sync", withTimeout(syncTimeout, s.handleStatusSync))
 	s.mux.HandleFunc("GET /status-sync", withTimeout(shortTimeout, s.handleStatusSyncStatus))
+	// POST /ua-hub/sync — refresh the UA-Hub user directory mirror (v0.5.2).
+	// longTimeout because ListAllUsersWithStatus walks the full UA-Hub
+	// directory (~17 pages × 10s at LEF) and we'd rather the HTTP
+	// request wait than fire-and-forget; matches /cache/sync's shape.
+	s.mux.HandleFunc("POST /ua-hub/sync", withTimeout(longTimeout, s.handleUAHubSync))
 
 	// Debug / incident-recovery routes. Gated by SecurityMiddleware's
 	// admin-key-OR-session path since /debug/* is neither public nor /ui/*.
@@ -758,6 +803,73 @@ func (s *Server) handleCacheSync(w http.ResponseWriter, r *http.Request) {
 		map[string]any{
 			"success": true,
 			"cache":   stats,
+		})
+}
+
+// handleUAHubSync refreshes the local UA-Hub directory mirror (ua_users)
+// synchronously. Added in v0.5.2 alongside the nightly unifimirror
+// Syncer — the Syncer owns the daily cadence; this handler lets staff
+// force an immediate refresh after a UA-Hub-side edit without waiting
+// for the next tick.
+//
+// Shape mirrors handleCacheSync on purpose: jobs-table lifecycle for
+// the /ui/sync page's "last run" pill, HTMX-aware response via
+// writeSyncResult, plain JSON fallback for API callers. The refresher
+// callback is wired via SetUAHubMirrorRefresher from cmd/bridge;
+// when unset, we 503 with a clear message rather than silently
+// succeed, so operators notice the wiring gap in dev builds.
+func (s *Server) handleUAHubSync(w http.ResponseWriter, r *http.Request) {
+	s.logger.Info("manual UA-Hub directory mirror refresh triggered via API")
+	s.audit.Log("ua_hub_sync", r.RemoteAddr, nil)
+
+	if s.uaHubMirrorRefresh == nil {
+		writeError(w, http.StatusServiceUnavailable, "UA-Hub mirror refresher not wired")
+		return
+	}
+
+	jobID := s.startSyncJob(r.Context(), jobTypeUAHubSync)
+	started := time.Now()
+
+	stats, refreshErr := s.uaHubMirrorRefresh(r.Context())
+	duration := time.Since(started).Round(100 * time.Millisecond)
+
+	if refreshErr != nil {
+		s.finishSyncJob(r.Context(), jobID, nil, refreshErr)
+		if wantsHTMX(r) {
+			s.writeSyncResult(w, r, jobTypeUAHubSync, http.StatusOK, false,
+				"UA-Hub sync failed",
+				"Couldn't complete the UA-Hub directory refresh. The local mirror is unchanged.",
+				[]ui.SyncStat{
+					{Label: "Error", Value: refreshErr.Error()},
+					{Label: "Duration", Value: duration.String()},
+				}, nil)
+			return
+		}
+		writeError(w, http.StatusBadGateway, "UA-Hub sync failed: "+refreshErr.Error())
+		return
+	}
+
+	s.finishSyncJob(r.Context(), jobID, map[string]any{
+		"observed":    stats.Observed,
+		"upserted":    stats.Upserted,
+		"mirrorTotal": stats.MirrorTotal,
+		"duration":    duration.String(),
+	}, nil)
+
+	s.writeSyncResult(w, r, jobTypeUAHubSync, http.StatusOK, true,
+		"UA-Hub sync complete",
+		"Refreshed the local UA-Hub user directory mirror. The Needs Match page and ingest matcher now read from this cache instead of hitting UA-Hub live.",
+		[]ui.SyncStat{
+			{Label: "Observed", Value: fmt.Sprintf("%d", stats.Observed)},
+			{Label: "Upserted", Value: fmt.Sprintf("%d", stats.Upserted)},
+			{Label: "Mirror total", Value: fmt.Sprintf("%d", stats.MirrorTotal)},
+			{Label: "Duration", Value: duration.String()},
+		},
+		map[string]any{
+			"success":     true,
+			"observed":    stats.Observed,
+			"upserted":    stats.Upserted,
+			"mirrorTotal": stats.MirrorTotal,
 		})
 }
 
@@ -2020,46 +2132,30 @@ func (s *Server) handleFragUnmatchedTable(w http.ResponseWriter, r *http.Request
 // the user. TouchMappingEmailSynced + last_email_synced_at are dead
 // columns today; slated for migration-5 cleanup.
 
-// lookupUAUser tries to fetch a single UA-Hub user by ID. Uses ListUsers
-// and filters in-process — UA-Hub has no single-user GET in the current
-// client, and the list is small enough (hundreds at most) that a per-
-// click scan is fine for staff UI latency budgets.
-func (s *Server) lookupUAUser(ctx context.Context, uaUserID string) (*unifi.UniFiUser, error) {
-	if s.unifi == nil {
-		return nil, fmt.Errorf("unifi client not configured")
-	}
-	users, err := s.unifi.ListUsers(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for i := range users {
-		if users[i].ID == uaUserID {
-			return &users[i], nil
-		}
-	}
-	return nil, nil // not found is not an error
-}
+// Note (v0.5.2): the lookupUAUser / lookupUAUsersByID helpers that used
+// to enrich the Needs Match views with a live UA-Hub ListUsers walk were
+// removed. Both call sites now read ua_name + ua_email off the pending
+// row (migration 5), so the Needs Match page no longer has any runtime
+// UA-Hub dependency. If a future view needs a UA-Hub user detail that
+// isn't cached on the pending row, add a dedicated single-user fetch
+// path rather than resurrecting the whole-directory walk.
 
-// lookupUAUsersByID returns all UA-Hub users keyed by ID. Used by the
-// list fragment for bulk enrichment so we make one UA-Hub call per
-// 30-second HTMX refresh rather than one call per row.
-func (s *Server) lookupUAUsersByID(ctx context.Context) (map[string]unifi.UniFiUser, error) {
-	if s.unifi == nil {
-		return nil, nil
-	}
-	users, err := s.unifi.ListUsers(ctx)
-	if err != nil {
-		return nil, err
-	}
-	m := make(map[string]unifi.UniFiUser, len(users))
-	for _, u := range users {
-		m[u.ID] = u
-	}
-	return m, nil
-}
-
-// handleFragUnmatchedList — table view of ua_user_mappings_pending. One
-// UA-Hub ListUsers call per render; acceptable given the 30s poll.
+// handleFragUnmatchedList — table view of ua_user_mappings_pending.
+//
+// Pre-v0.5.2 this handler made a live UA-Hub ListUsers call on every
+// render to enrich each row with a display name + email. That walk
+// (17 pages × 100/page at LEF, 10s per-page HTTP timeout) hung the
+// entire /ui/needs-match page whenever UA-Hub was slow, because the
+// fragment is loaded via hx-trigger="load" — a stuck XHR leaves the
+// "Loading unmatched users…" placeholder on screen indefinitely.
+//
+// The fix is to persist ua_name + ua_email onto the pending row at
+// UpsertPending time (see auditMigration5_pending_ua_identity and
+// statusync.Syncer.persistDecision). This handler now reads every
+// column straight off the local row with zero UA-Hub dependency —
+// rendering is dominated by the SQLite query, which is ~milliseconds
+// on the ~dozen-row pending table. UA-Hub can be completely offline
+// and the page still paints.
 func (s *Server) handleFragUnmatchedList(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
 		ui.RenderFragment(w, ui.AlertFragment(false, "Store not available"))
@@ -2071,28 +2167,18 @@ func (s *Server) handleFragUnmatchedList(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Best-effort UA-Hub name/email enrichment. A UA-Hub outage should
-	// not blank the whole list — degrade gracefully to "ID only" rows.
-	uaByID, uaErr := s.lookupUAUsersByID(r.Context())
-	if uaErr != nil {
-		s.logger.Warn("needs-match: UA-Hub lookup failed; rendering without name/email",
-			"error", uaErr)
-	}
-
 	rows := make([]ui.NeedsMatchRow, 0, len(pending))
 	for _, p := range pending {
 		row := ui.NeedsMatchRow{
 			UAUserID:   p.UAUserID,
+			UAName:     p.UAName,
+			UAEmail:    p.UAEmail,
 			Reason:     p.Reason,
 			FirstSeen:  p.FirstSeen,
 			GraceUntil: p.GraceUntil,
 		}
 		if p.Candidates != "" {
 			row.CandidateCount = len(strings.Split(p.Candidates, "|"))
-		}
-		if u, ok := uaByID[p.UAUserID]; ok {
-			row.UAName = strings.TrimSpace(u.FirstName + " " + u.LastName)
-			row.UAEmail = u.Email
 		}
 		rows = append(rows, row)
 	}
@@ -2144,16 +2230,13 @@ func (s *Server) renderNeedsMatchDetail(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	uaUser, uaErr := s.lookupUAUser(r.Context(), uaUserID)
-	if uaErr != nil {
-		s.logger.Warn("needs-match detail: UA-Hub lookup failed", "uaUserId", uaUserID, "error", uaErr)
-	}
-	uaName := ""
-	uaEmail := ""
-	if uaUser != nil {
-		uaName = strings.TrimSpace(uaUser.FirstName + " " + uaUser.LastName)
-		uaEmail = uaUser.Email
-	}
+	// Read the UA-Hub display identity straight off the pending row
+	// instead of talking to UA-Hub live. See handleFragUnmatchedList
+	// (v0.5.2 comment) and auditMigration5_pending_ua_identity for
+	// the rationale. statusync refreshes these fields on every
+	// observation, so they lag UA-Hub by at most one sync interval.
+	uaName := pending.UAName
+	uaEmail := pending.UAEmail
 
 	// Build candidate list. Order matters — matcher-suggested candidates
 	// first (they're the most likely hit; the pending row captured them

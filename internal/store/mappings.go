@@ -53,6 +53,14 @@ type Pending struct {
 	LastSeen   string `db:"last_seen"   json:"lastSeen"`
 	GraceUntil string `db:"grace_until" json:"graceUntil"`
 	Candidates string `db:"candidates"  json:"candidates"`
+	// UAName and UAEmail cache the UA-Hub user's display identity at
+	// the time of the last observation. They exist so the Needs Match
+	// page can render without a live UA-Hub ListUsers walk — see
+	// auditMigration5_pending_ua_identity for the rationale. Both are
+	// refreshed on every UpsertPending so a UA-Hub-side rename
+	// propagates on the next statusync pass.
+	UAName  string `db:"ua_name"  json:"uaName"`
+	UAEmail string `db:"ua_email" json:"uaEmail"`
 }
 
 // MatchAudit is an append-only forensic log of every mapping decision and
@@ -153,8 +161,10 @@ func (s *Store) AllMappings(ctx context.Context) ([]Mapping, error) {
 
 // UpsertPending creates or updates a pending row. The first_seen column is
 // preserved on conflict so the grace-window ticker has an accurate "when
-// did we start waiting" anchor; only last_seen, reason, grace_until, and
-// candidates are refreshed.
+// did we start waiting" anchor; last_seen, reason, grace_until, candidates,
+// ua_name, and ua_email are refreshed on every call so the cached display
+// identity stays in sync with UA-Hub if the operator renames the user or
+// adds an email.
 func (s *Store) UpsertPending(ctx context.Context, p *Pending) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -166,14 +176,17 @@ func (s *Store) UpsertPending(ctx context.Context, p *Pending) error {
 		p.LastSeen = now
 	}
 	_, err := s.db.ExecContext(ctx, `
-        INSERT INTO ua_user_mappings_pending (ua_user_id, reason, first_seen, last_seen, grace_until, candidates)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO ua_user_mappings_pending
+            (ua_user_id, reason, first_seen, last_seen, grace_until, candidates, ua_name, ua_email)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(ua_user_id) DO UPDATE SET
             reason      = excluded.reason,
             last_seen   = excluded.last_seen,
             grace_until = excluded.grace_until,
-            candidates  = excluded.candidates
-    `, p.UAUserID, p.Reason, p.FirstSeen, p.LastSeen, p.GraceUntil, p.Candidates)
+            candidates  = excluded.candidates,
+            ua_name     = excluded.ua_name,
+            ua_email    = excluded.ua_email
+    `, p.UAUserID, p.Reason, p.FirstSeen, p.LastSeen, p.GraceUntil, p.Candidates, p.UAName, p.UAEmail)
 	return err
 }
 
