@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/jmoiron/sqlx"
@@ -132,7 +133,33 @@ func Open(dataDir string, logger *slog.Logger) (*Store, error) {
 		return nil, fmt.Errorf("attach cache.db: %w", err)
 	}
 
-	// Step 5: run audit.db migrations on the primary connection. We
+	// Step 5: audit.db schema self-heal.
+	//
+	// v0.5.0: fixes a v0.4.0 regression where splitLegacyDBIfNeeded could
+	// pin audit.db's schema_version=3 on a freshly-created file without
+	// having actually executed audit migrations 1/2/3 against it — the
+	// `checkins` table (and its siblings) never materialized, and
+	// RecordCheckIn silently errored with "no such table: checkins"
+	// while the service otherwise looked healthy. See task #80 for the
+	// root-cause investigation.
+	//
+	// The self-heal is a parallel safety net to migrateWith: it runs the
+	// entire audit DDL as idempotent CREATE TABLE IF NOT EXISTS /
+	// CREATE INDEX IF NOT EXISTS statements before we consult
+	// schema_version. Every statement is safe to re-run on an
+	// already-migrated DB, so a correct install is a no-op. A missing
+	// table on a supposedly-at-version-3 install gets recreated before
+	// any RecordCheckIn call could fail. This is cheap: ~7 tables,
+	// <1ms on the production MacBook.
+	//
+	// ALTER TABLE (non-idempotent) is handled separately — see
+	// selfHealAuditSchema for the SAVEPOINT-wrapped ADD COLUMN pattern.
+	if err := selfHealAuditSchema(db, logger); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("audit self-heal: %w", err)
+	}
+
+	// Step 6: run audit.db migrations on the primary connection. We
 	// do this AFTER ATTACH so that cross-DB references (none today, but
 	// possibly in future migrations) resolve; the idempotent DDL on the
 	// audit side doesn't inadvertently touch cache tables because the
@@ -189,6 +216,125 @@ func escapeSQLString(s string) string {
 		out = append(out, s[i])
 	}
 	return string(out)
+}
+
+// selfHealAuditSchema re-applies the DDL for every migration that
+// schema_version claims is already done, using idempotent CREATE /
+// pragma-guarded ALTER statements. It exists to close the v0.4.0
+// regression where splitLegacyDBIfNeeded could pin a newly-created
+// audit.db to schema_version=3 without having actually executed the
+// migrations against it — the `checkins` table (and its siblings)
+// never materialized, and RecordCheckIn silently errored with "no
+// such table" while the service otherwise looked healthy.
+//
+// The self-heal intentionally does NOT run DDL for migrations past
+// schema_version — that's migrateWith's job, and running it here
+// would create a duplicate-column error when migrateWith's ALTER
+// runs next. The gate is: "only heal what the schema_version table
+// says should already exist".
+//
+// On a fresh install (schema_version=0) this is a no-op. On a
+// correctly-migrated install it re-issues `CREATE TABLE IF NOT
+// EXISTS` etc. — cheap and safe. On the v0.4.0-broken install it
+// recreates the missing tables.
+//
+// This function must be called AFTER schema_version is ensured to
+// exist but BEFORE migrateWith runs its own migrations.
+func selfHealAuditSchema(db *sqlx.DB, logger *slog.Logger) error {
+	// Make sure schema_version exists so the SELECT doesn't fail on
+	// a pristine DB. migrateWith creates it too; doing it here first
+	// makes the two call sites idempotent relative to each other.
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)`); err != nil {
+		return fmt.Errorf("self-heal create schema_version: %w", err)
+	}
+	var current int
+	if err := db.Get(&current, `SELECT COALESCE(MAX(version), 0) FROM schema_version`); err != nil {
+		return fmt.Errorf("self-heal read schema_version: %w", err)
+	}
+
+	// Fresh install: nothing to heal — let migrateWith run the full
+	// sequence from scratch. This is the common path; every CI test
+	// hits it.
+	if current == 0 {
+		return nil
+	}
+
+	hasColumn := func(table, column string) (bool, error) {
+		var n int
+		q := `SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`
+		if err := db.Get(&n, q, table, column); err != nil {
+			return false, err
+		}
+		return n > 0, nil
+	}
+
+	// Migration 1: checkins + door_policies + jobs.
+	if current >= 1 {
+		if _, err := db.Exec(auditMigration1_checkins); err != nil {
+			return fmt.Errorf("self-heal migration 1: %w", err)
+		}
+	}
+
+	// Migration 2: ALTER TABLE checkins ADD COLUMN unifi_result.
+	// Non-idempotent — guard with pragma_table_info. Also the
+	// partial index (CREATE INDEX IF NOT EXISTS) from the same
+	// migration is safe to re-run.
+	if current >= 2 {
+		ok, err := hasColumn("checkins", "unifi_result")
+		if err != nil {
+			return fmt.Errorf("self-heal pragma (unifi_result): %w", err)
+		}
+		if !ok {
+			if _, err := db.Exec(`ALTER TABLE checkins ADD COLUMN unifi_result TEXT NOT NULL DEFAULT ''`); err != nil {
+				return fmt.Errorf("self-heal add unifi_result: %w", err)
+			}
+			logger.Warn("audit self-heal: added missing checkins.unifi_result column",
+				"schema_version", current,
+			)
+		}
+		if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_checkins_unifi_result
+                ON checkins(unifi_result) WHERE unifi_result != ''`); err != nil {
+			return fmt.Errorf("self-heal unifi_result index: %w", err)
+		}
+	}
+
+	// Migration 3: UA-Hub mapping tables — all CREATE TABLE IF NOT
+	// EXISTS, safe to re-run verbatim.
+	if current >= 3 {
+		if _, err := db.Exec(auditMigration3_mappings); err != nil {
+			return fmt.Errorf("self-heal migration 3: %w", err)
+		}
+	}
+
+	// Migration 4 (v0.5.0): ALTER + unique partial index on
+	// unifi_log_id. Same pattern as migration 2.
+	if current >= 4 {
+		ok, err := hasColumn("checkins", "unifi_log_id")
+		if err != nil {
+			return fmt.Errorf("self-heal pragma (unifi_log_id): %w", err)
+		}
+		if !ok {
+			if _, err := db.Exec(`ALTER TABLE checkins ADD COLUMN unifi_log_id TEXT NOT NULL DEFAULT ''`); err != nil {
+				return fmt.Errorf("self-heal add unifi_log_id: %w", err)
+			}
+			logger.Warn("audit self-heal: added missing checkins.unifi_log_id column",
+				"schema_version", current,
+			)
+		}
+		if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_checkins_unifi_log_id
+                ON checkins(unifi_log_id) WHERE unifi_log_id != ''`); err != nil {
+			// Tolerate "no such column" for the transient moment
+			// between a corrupted v0.4.0 schema_version=3 install
+			// and migrateWith's migration 4 — on current >= 4 the
+			// ALTER just above created the column so this should
+			// not fire, but keep the guard for defense-in-depth.
+			if !strings.Contains(err.Error(), "no such column") {
+				return fmt.Errorf("self-heal unifi_log_id index: %w", err)
+			}
+		}
+	}
+
+	return nil
 }
 
 // runCacheMigrations opens cache.db as a standalone connection, runs

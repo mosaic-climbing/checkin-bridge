@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mosaic-climbing/checkin-bridge/internal/redpoint"
 	"github.com/mosaic-climbing/checkin-bridge/internal/store"
 	"github.com/mosaic-climbing/checkin-bridge/internal/unifi"
 )
@@ -62,9 +63,39 @@ func (s *Syncer) matchOne(ctx context.Context, ua unifi.UniFiUser) (matchDecisio
 		return d, s.persistDecision(ctx, ua, d)
 	}
 
-	rows, err := s.redpoint.SearchCustomersByName(ctx, ua.FirstName, ua.LastName)
+	// Name-fallback goes against the local customer mirror, not Redpoint.
+	// Rationale:
+	//   - Redpoint's CustomerFilter no longer exposes a "search" field
+	//     (schema change observed in production; the previous direct call
+	//     returns a GraphQL validation error and consumes the rate-limit
+	//     budget on every UA user). The mirror is populated nightly by
+	//     the walker and carries first_name/last_name columns that we
+	//     can LIKE-scan cheaply.
+	//   - The email branch above still queries Redpoint directly because
+	//     email is canonical and we want the freshest upstream view; the
+	//     name branch was always advisory (multi-hit → pending) so
+	//     serving it from the local mirror is a strict improvement on
+	//     both correctness and cost.
+	//
+	// The store returns []store.Customer; decideFromNameResults expects
+	// []*redpoint.Customer. We project only the four fields the matcher
+	// actually reads (ID, FirstName, LastName, Email via fullNamesMatch
+	// and customerIDs). Extra store-side fields like Active or
+	// BadgeStatus are intentionally dropped here — the matcher has no
+	// business making activation decisions, and the status writeback
+	// path fetches a fresh Redpoint view per matched customer.
+	storeRows, err := s.store.SearchCustomersByName(ctx, ua.FirstName, ua.LastName)
 	if err != nil {
-		return matchDecision{}, fmt.Errorf("SearchCustomersByName: %w", err)
+		return matchDecision{}, fmt.Errorf("store.SearchCustomersByName: %w", err)
+	}
+	rows := make([]*redpoint.Customer, len(storeRows))
+	for i := range storeRows {
+		rows[i] = &redpoint.Customer{
+			ID:        storeRows[i].RedpointID,
+			FirstName: storeRows[i].FirstName,
+			LastName:  storeRows[i].LastName,
+			Email:     storeRows[i].Email,
+		}
 	}
 	d := decideFromNameResults(ua, rows)
 	return d, s.persistDecision(ctx, ua, d)
