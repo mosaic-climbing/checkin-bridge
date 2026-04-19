@@ -10,6 +10,17 @@ import (
 )
 
 // Customer represents a Redpoint customer in the local directory.
+//
+// The first block of fields is the identity/contact data that's been
+// here since migration 1. The second block is the badge/mirror state
+// added by migration 4 — populated by the bulk walker in
+// internal/mirror so the bridge can answer "is this person currently
+// an active member?" without a per-check-in Redpoint roundtrip.
+//
+// Zero-value badge fields are valid: they mean "this row has not yet
+// been visited by the mirror walker, or the customer has no badge."
+// The validation policy treats an empty badge_status as "unknown" and
+// falls through to its existing live-API path.
 type Customer struct {
 	RedpointID string `db:"redpoint_id" json:"redpointId"`
 	FirstName  string `db:"first_name"  json:"firstName"`
@@ -20,6 +31,13 @@ type Customer struct {
 	Active     bool   `db:"active"      json:"active"`
 	CreatedAt  string `db:"created_at"  json:"createdAt"`
 	UpdatedAt  string `db:"updated_at"  json:"updatedAt"`
+
+	// Mirror-populated badge state (migration 4). See comment above.
+	BadgeStatus           string  `db:"badge_status"             json:"badgeStatus"`
+	BadgeName             string  `db:"badge_name"               json:"badgeName"`
+	PastDueBalance        float64 `db:"past_due_balance"         json:"pastDueBalance"`
+	HomeFacilityShortName string  `db:"home_facility_short_name" json:"homeFacilityShortName"`
+	LastSyncedAt          string  `db:"last_synced_at"           json:"lastSyncedAt"`
 }
 
 func (c *Customer) FullName() string {
@@ -252,6 +270,155 @@ func (s *Store) UpsertCustomerBatch(ctx context.Context, customers []Customer) e
 		}
 	}
 	return tx.Commit()
+}
+
+// UpsertCustomerWithBadgeBatch inserts or updates customer rows
+// including the badge-mirror columns. Used by internal/mirror's walker.
+//
+// Why a separate method from UpsertCustomerBatch: the legacy
+// /directory/sync endpoint (api/server.bulkLoadCustomers) does not
+// fetch badge fields. Routing it through a single method that always
+// writes every column would clobber the mirror's populated badge
+// values with empty strings on the next legacy-sync run. Splitting
+// the API by caller intent — "I'm the walker and I know badge state"
+// vs. "I'm the legacy sync and I only know identity" — keeps each
+// path narrowly honest about what it's claiming to know.
+//
+// Performance shape is identical to UpsertCustomerBatch: one BEGIN,
+// one PREPARE, reuse the statement across rows. Same s.mu.Lock() and
+// defer tx.Rollback() shape so the legacy caller and the walker
+// can't race — they queue.
+//
+// Every row's LastSyncedAt is stamped with the batch's wall-clock
+// time if the caller left it empty, so the walker doesn't have to
+// compute a per-row timestamp.
+func (s *Store) UpsertCustomerWithBadgeBatch(ctx context.Context, customers []Customer) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `
+        INSERT INTO customers (
+            redpoint_id, first_name, last_name, email, barcode, external_id,
+            active, updated_at,
+            badge_status, badge_name, past_due_balance,
+            home_facility_short_name, last_synced_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(redpoint_id) DO UPDATE SET
+            first_name               = excluded.first_name,
+            last_name                = excluded.last_name,
+            email                    = excluded.email,
+            barcode                  = excluded.barcode,
+            external_id              = excluded.external_id,
+            active                   = excluded.active,
+            updated_at               = excluded.updated_at,
+            badge_status             = excluded.badge_status,
+            badge_name               = excluded.badge_name,
+            past_due_balance         = excluded.past_due_balance,
+            home_facility_short_name = excluded.home_facility_short_name,
+            last_synced_at           = excluded.last_synced_at
+    `)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, c := range customers {
+		if c.UpdatedAt == "" {
+			c.UpdatedAt = now
+		}
+		if c.LastSyncedAt == "" {
+			c.LastSyncedAt = now
+		}
+		if _, err := stmt.ExecContext(ctx,
+			c.RedpointID, c.FirstName, c.LastName,
+			c.Email, c.Barcode, c.ExternalID,
+			c.Active, c.UpdatedAt,
+			c.BadgeStatus, c.BadgeName, c.PastDueBalance,
+			c.HomeFacilityShortName, c.LastSyncedAt,
+		); err != nil {
+			return fmt.Errorf("upsert customer %s: %w", c.RedpointID, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// CountByBadgeStatus returns a map of badge_status → row count over the
+// customers table. Used by the mirror stats endpoint to report health
+// in one call rather than making operators run N queries.
+//
+// The "" (empty) bucket counts rows that have not yet been touched by
+// the mirror — useful for gauging how far through an initial sync we
+// are. The non-empty buckets correspond to Redpoint's Customer.Badge.
+// Status enum (ACTIVE, FROZEN, EXPIRED) but we don't hard-code those
+// here; whatever the walker writes, we count.
+func (s *Store) CountByBadgeStatus(ctx context.Context) (map[string]int, error) {
+	rows, err := s.db.QueryxContext(ctx, `
+        SELECT badge_status, COUNT(*) AS n
+        FROM customers
+        GROUP BY badge_status
+    `)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var status string
+		var n int
+		if err := rows.Scan(&status, &n); err != nil {
+			return nil, err
+		}
+		out[status] = n
+	}
+	return out, rows.Err()
+}
+
+// StartSync transitions sync_state into a running state, stamping
+// started_at with the current wall-clock time and zeroing the error
+// field. Used by the mirror walker at the top of a run.
+//
+// Concurrent behaviour: this is NOT an atomic claim-then-run — the
+// caller is responsible for checking sync_state first (see
+// handleResyncRequest in api/server.go) and rejecting a new run if
+// another is already running. That check + this update happen under
+// s.mu via the store's single-writer guarantee, so there is no TOCTOU
+// race inside one process. Cross-process concurrency is not a concern
+// here — the bridge is a single-process binary.
+func (s *Store) StartSync(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `
+        UPDATE sync_state SET
+            status       = 'running',
+            total_fetched = 0,
+            last_cursor  = '',
+            last_error   = '',
+            started_at   = ?,
+            completed_at = ''
+        WHERE id = 1
+    `, time.Now().UTC().Format(time.RFC3339))
+	return err
+}
+
+// MarkSyncComplete transitions sync_state to a terminal state. status
+// should be "complete" on success or "error" on failure (with
+// lastError populated). Stamps completed_at regardless so operators
+// can see "the last run ended at T, outcome X" without ambiguity.
+func (s *Store) MarkSyncComplete(ctx context.Context, status, lastError string) error {
+	_, err := s.db.ExecContext(ctx, `
+        UPDATE sync_state SET
+            status       = ?,
+            last_error   = ?,
+            completed_at = ?
+        WHERE id = 1
+    `, status, lastError, time.Now().UTC().Format(time.RFC3339))
+	return err
 }
 
 // GetSyncState returns the current directory sync state.
