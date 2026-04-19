@@ -69,6 +69,17 @@ func (a bgMetricsAdapter) gauge(name string) *metrics.Gauge {
 func (a bgMetricsAdapter) Inc(name string) { a.gauge(name).Inc() }
 func (a bgMetricsAdapter) Dec(name string) { a.gauge(name).Dec() }
 
+// startOfTodayLocal returns 00:00:00 in the host's local timezone for
+// the current date. Used as the initial poller cursor so the v0.5.0 tap
+// ingestion backfills same-day taps on first boot. Local, not UTC, so
+// "today" matches what the operator sees in the UI and what the
+// dashboard's daily-aggregate queries use.
+func startOfTodayLocal() time.Time {
+	now := time.Now()
+	y, m, d := now.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, now.Location())
+}
+
 func main() {
 	// ── CLI flags ────────────────────────────────────────────
 	// -version exits before loading config so deploy/macbook/update.sh
@@ -556,6 +567,22 @@ func main() {
 	// Start background syncers via supervised group
 	bgGroup.Go("cache-syncer", syncer.Run)
 	bgGroup.Go("statusync", statusSyncer.Run)
+
+	// v0.5.0: REST tap poller — on UA-Hub 4.11.19.0 / UniFi Access 4.2.16
+	// the WebSocket notifications feed no longer emits access.logs.add
+	// events for door taps. The developer-API system log is now the
+	// authoritative tap source, polled every 5s via POST /system/logs
+	// with topic=door_openings.
+	//
+	// Initial cursor is today-midnight-local so on first boot after the
+	// v0.5.0 rollout we backfill all of today's taps into the checkins
+	// table. The dedup guard on checkins.unifi_log_id (idx below,
+	// migration 4) makes the rolling lookback window safe against
+	// restart-duplicates.
+	pollerStart := startOfTodayLocal()
+	bgGroup.Go("unifi-poller", func(bgCtx context.Context) error {
+		return unifiClient.StartEventPoller(bgCtx, pollerStart, 5*time.Second)
+	})
 
 	// ── HTTP server with graceful shutdown ────────────────────
 	// Default bind is 127.0.0.1 (loopback-only). Operators who need LAN

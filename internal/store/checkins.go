@@ -26,23 +26,55 @@ type CheckInEvent struct {
 	RedpointRecorded  bool   `db:"redpoint_recorded"   json:"redpointRecorded"`
 	RedpointCheckInID string `db:"redpoint_checkin_id" json:"redpointCheckInId"`
 	UnifiResult       string `db:"unifi_result"        json:"unifiResult"`  // "ACCESS", "BLOCKED", "" if unknown
+	// UnifiLogID is the stable UA-Hub system-log `_id` that produced
+	// this check-in (v0.5.0+, tap-poller path). Empty on historical
+	// rows and on rows that never had a UniFi side (e.g. devhooks
+	// test taps). A unique partial index prevents the poller from
+	// inserting the same log entry twice when its time window
+	// overlaps a prior poll.
+	UnifiLogID string `db:"unifi_log_id"        json:"unifiLogId,omitempty"`
 }
 
 // RecordCheckIn stores a check-in event. Returns the row ID.
+//
+// When UnifiLogID is non-empty, the insert is dedup'd via INSERT OR
+// IGNORE against idx_checkins_unifi_log_id. On conflict (same log id
+// already recorded), the return is (0, nil) — callers that need to
+// distinguish "inserted" from "deduped" should check whether the
+// returned ID is > 0.
 func (s *Store) RecordCheckIn(ctx context.Context, evt *CheckInEvent) (int64, error) {
 	if evt.Timestamp == "" {
 		evt.Timestamp = time.Now().UTC().Format(time.RFC3339)
 	}
 	result, err := s.db.ExecContext(ctx, `
-        INSERT INTO checkins (timestamp, nfc_uid, customer_id, customer_name, door_id, door_name,
-                             result, deny_reason, redpoint_recorded, redpoint_checkin_id, unifi_result)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO checkins (timestamp, nfc_uid, customer_id, customer_name, door_id, door_name,
+                             result, deny_reason, redpoint_recorded, redpoint_checkin_id, unifi_result, unifi_log_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, evt.Timestamp, evt.NfcUID, evt.CustomerID, evt.CustomerName, evt.DoorID, evt.DoorName,
-		evt.Result, evt.DenyReason, evt.RedpointRecorded, evt.RedpointCheckInID, evt.UnifiResult)
+		evt.Result, evt.DenyReason, evt.RedpointRecorded, evt.RedpointCheckInID, evt.UnifiResult, evt.UnifiLogID)
 	if err != nil {
 		return 0, err
 	}
-	return result.LastInsertId()
+
+	// IMPORTANT: modernc.org/sqlite's LastInsertId() returns the last
+	// successful insert's rowid for the connection, NOT zero on an
+	// IGNORE'd row. We check RowsAffected() to distinguish a real
+	// insert from a dedup — if 0 rows changed, the UnifiLogID
+	// already existed and we return id=0 so the caller can treat
+	// the event as "already recorded, skip".
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if affected == 0 {
+		return 0, nil
+	}
+
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 // MarkRedpointRecorded updates a check-in event after async Redpoint recording succeeds.

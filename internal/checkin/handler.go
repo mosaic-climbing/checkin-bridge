@@ -556,6 +556,7 @@ func (h *Handler) recordAllowedEvent(ctx context.Context, event unifi.AccessEven
 		Result:       "allowed",
 		DenyReason:   "",
 		UnifiResult:  strings.ToUpper(event.Result),
+		UnifiLogID:   event.LogID,
 	}
 
 	eventID, err := h.store.RecordCheckIn(ctx, evt)
@@ -593,6 +594,7 @@ func (h *Handler) recordDeniedEvent(ctx context.Context, event unifi.AccessEvent
 		Result:       result,
 		DenyReason:   denyReason,
 		UnifiResult:  strings.ToUpper(event.Result),
+		UnifiLogID:   event.LogID,
 	}
 
 	_, err := h.store.RecordCheckIn(ctx, evt)

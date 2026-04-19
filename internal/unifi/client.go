@@ -56,8 +56,16 @@ type StateChangeCallback func(newState ConnectionState, health *HealthStatus)
 // before the outage so the caller can backfill missed events.
 type ReconnectCallback func(lastEventBeforeOutage time.Time)
 
-// AccessEvent represents a parsed door access event from the UniFi WebSocket.
+// AccessEvent represents a parsed door access event from the UniFi WebSocket
+// or the REST /system/logs poller.
 type AccessEvent struct {
+	// LogID is the stable UniFi Access log identifier for this event.
+	// Populated from the `_id` field on REST results; empty on legacy WS
+	// messages that predate the envelope change. Used downstream as the
+	// primary dedup key so the poller can fetch an overlapping time
+	// window without creating duplicate checkins rows.
+	LogID string `json:"logId,omitempty"`
+
 	EventType    string `json:"eventType"`
 	Timestamp    string `json:"timestamp"`
 	DoorName     string `json:"doorName"`
@@ -68,10 +76,11 @@ type AccessEvent struct {
 	AuthType     string `json:"authType"` // NFC, PIN_CODE, MOBILE, etc.
 	Result       string `json:"result"`   // ACCESS, BLOCKED
 	// IsBackfill is true when the event was fetched from the REST access
-	// log during a reconnect-time replay rather than streamed live. The
-	// check-in handler still records it for audit purposes but must NOT
-	// unlock the door or create a new Redpoint record — the door already
-	// had its chance during the outage and the member is long gone.
+	// log during a reconnect-time replay OR by the steady-state poller
+	// rather than streamed live. The check-in handler still records it
+	// for audit purposes but must NOT unlock the door or create a new
+	// Redpoint record — the door already had its chance at tap time and
+	// the member is either inside or long gone.
 	IsBackfill bool `json:"isBackfill,omitempty"`
 }
 
@@ -924,63 +933,97 @@ func (c *Client) ListAllUsersWithStatus(ctx context.Context) ([]UniFiUser, error
 	return allUsers, nil
 }
 
-// ─── REST: Access log backfill ──────────────────────────────
+// ─── REST: Access log ingestion & backfill ──────────────────
 
-// FetchAccessLogsSince retrieves NFC access-log entries from the UA-Hub
-// REST API that occurred at or after `since`. Used to backfill the bridge's
-// audit trail after a WebSocket outage: the door obviously can't be
-// retroactively unlocked, but the checkins table, shadow-decisions panel,
-// and Redpoint records stay complete.
+// FetchAccessLogsSince retrieves door-opening log entries from the UA-Hub
+// REST API that occurred at or after `since`. Used in two paths:
 //
-// UniFi Access exposes access logs at GET /api/v1/developer/access_logs
-// with `since_ms`/`until_ms` query params on current firmware. The exact
-// schema varies between firmware builds, so this method is permissive:
-// it only extracts the fields we need and ignores the rest.
+//  1. Steady-state tap ingestion (StartEventPoller) — the WebSocket
+//     notifications channel on UA-Hub 4.11.19.0 / UniFi Access 4.2.16
+//     no longer emits `access.logs.add` or `access.data.device.update`
+//     events for door taps. The developer-API system log is now the
+//     authoritative source.
+//  2. Reconnect-time backfill after an outage — the caller points this
+//     at the moment the connection dropped and drains whatever taps
+//     happened in between. (The door obviously can't be retroactively
+//     unlocked, but the checkins table, shadow-decisions panel, and
+//     Redpoint records stay complete.)
+//
+// API reference (UniFi Access 4.2.16, March 2026) §9.2: the endpoint is
+//
+//	POST /api/v1/developer/system/logs
+//	Content-Type: application/json
+//	Body: {"topic":"door_openings","since":<unix_seconds>}
+//
+// NOT the earlier GET /access_logs?since_ms=… surface (removed). UniFi
+// returns a "no-man zone" 404 for method mismatches rather than 405,
+// which is how the regression originally escaped notice.
 //
 // Returns events ordered oldest-first, which is the order the caller needs
 // to replay them through the handler so disagreement counters stay in sync
 // with the original timeline.
 func (c *Client) FetchAccessLogsSince(ctx context.Context, since time.Time) ([]AccessEvent, error) {
-	sinceMs := since.UnixMilli()
-	url := fmt.Sprintf("%s/access_logs?since_ms=%d", c.baseURL, sinceMs)
+	reqBody, _ := json.Marshal(map[string]any{
+		"topic": "door_openings",
+		"since": since.Unix(),
+	})
+	url := c.baseURL + "/system/logs"
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
-		return nil, fmt.Errorf("create access_logs request: %w", err)
+		return nil, fmt.Errorf("create system/logs request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.apiToken)
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch access_logs: %w", err)
+		return nil, fmt.Errorf("fetch system/logs: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 50<<20))
 	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("access_logs HTTP %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("system/logs HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	// The body is { "data": [ ...event... ] } in current firmware, but the
-	// caller can't rely on the schema being stable across versions. We try
-	// the wrapped form first and fall back to a top-level array.
+	// Envelope per API reference §9.2:
+	//   { "code": "SUCCESS",
+	//     "data": { "hits": [ { "_id": "...", "_source": {...} }, ... ] },
+	//     "msg": "..." }
+	//
+	// Older firmware builds wrapped hits differently ({"data":[...]});
+	// we accept both to keep this method tolerant across a 4.1 → 4.2
+	// upgrade on the same install.
 	var wrapper struct {
-		Data []map[string]any `json:"data"`
+		Data json.RawMessage `json:"data"`
 	}
+	if err := json.Unmarshal(respBody, &wrapper); err != nil {
+		return nil, fmt.Errorf("unmarshal system/logs: %w", err)
+	}
+
 	var rawEvents []map[string]any
-	if err := json.Unmarshal(respBody, &wrapper); err == nil && len(wrapper.Data) > 0 {
-		rawEvents = wrapper.Data
+	// Try the 4.2.16 shape: data.hits[]
+	var hitsShape struct {
+		Hits []map[string]any `json:"hits"`
+	}
+	if err := json.Unmarshal(wrapper.Data, &hitsShape); err == nil && hitsShape.Hits != nil {
+		rawEvents = hitsShape.Hits
 	} else {
-		if err := json.Unmarshal(respBody, &rawEvents); err != nil {
-			return nil, fmt.Errorf("unmarshal access_logs: %w", err)
+		// Fallback: data is a bare array of hits.
+		if err := json.Unmarshal(wrapper.Data, &rawEvents); err != nil {
+			return nil, fmt.Errorf("unmarshal system/logs.data: %w", err)
 		}
 	}
 
 	events := make([]AccessEvent, 0, len(rawEvents))
 	for _, raw := range rawEvents {
 		event := parseAccessLogEntry(raw)
-		// Skip non-NFC; the rest of the pipeline ignores them anyway.
-		if strings.ToUpper(event.AuthType) != "NFC" {
+		// Only care about NFC and PIN taps for check-in auditing. Mobile
+		// keys and admin unlocks flow through the same topic but don't
+		// represent a member-facing check-in.
+		auth := strings.ToUpper(event.AuthType)
+		if auth != "NFC" && auth != "PIN_CODE" {
 			continue
 		}
 		event.IsBackfill = true
@@ -999,51 +1042,239 @@ func (c *Client) FetchAccessLogsSince(ctx context.Context, since time.Time) ([]A
 	return events, nil
 }
 
-// parseAccessLogEntry extracts an AccessEvent from a single REST access log
-// object, mirroring handleMessage's WebSocket parsing so downstream consumers
-// don't see schema divergence between live and backfilled events.
-func parseAccessLogEntry(eventData map[string]any) AccessEvent {
+// parseAccessLogEntry extracts an AccessEvent from a single system-log hit.
+//
+// Envelope (UniFi Access 4.2.16, verified against production on Apr 18 2026):
+//
+//	{ "_id": "73118",
+//	  "_source": {
+//	    "actor":          { "id":"...", "display_name":"Ash Smith" },
+//	    "authentication": { "credential_provider":"NFC" },
+//	    "event":          { "published":1744979...123, "result":"ACCESS",
+//	                        "type":"access.door.unlock", "log_key":"..." },
+//	    "target":         [ {"type":"door","id":"...","display_name":"Front"},
+//	                        {"type":"nfc_id","id":"04A1B2..."}, ... ]
+//	  }
+//	}
+//
+// The parser is permissive: anything missing is simply left empty so a
+// schema tweak in a future Access build can't crash the poller.
+func parseAccessLogEntry(hit map[string]any) AccessEvent {
 	event := AccessEvent{
-		EventType: "access.logs.add",
-		Timestamp: stringFromMap(eventData, "timestamp"),
+		LogID: stringFromMap(hit, "_id"),
 	}
-	if event.Timestamp == "" {
-		// Some firmware versions emit timestamp_ms instead of timestamp.
-		if ms, ok := eventData["timestamp_ms"].(float64); ok {
+
+	src, _ := hit["_source"].(map[string]any)
+	if src == nil {
+		// Ancient / unwrapped shape — fall back to treating the hit
+		// itself as _source. Harmless on the new shape (no keys match).
+		src = hit
+	}
+
+	// ── event.* — timestamp, result, type ──
+	if ev, ok := src["event"].(map[string]any); ok {
+		// `published` is unix milliseconds per the API reference.
+		if ms, ok := ev["published"].(float64); ok {
 			event.Timestamp = time.UnixMilli(int64(ms)).UTC().Format(time.RFC3339)
 		}
+		if event.Timestamp == "" {
+			// Some builds emit a string RFC3339 directly.
+			event.Timestamp = stringFromMap(ev, "published")
+		}
+		event.Result = strings.ToUpper(stringFromMap(ev, "result"))
+		event.EventType = stringFromMap(ev, "type")
 	}
 	if event.Timestamp == "" {
 		event.Timestamp = time.Now().UTC().Format(time.RFC3339)
 	}
-
-	if obj, ok := eventData["object"].(map[string]any); ok {
-		event.DoorName = stringFromMap(obj, "location")
-		event.DoorID = stringFromMap(obj, "id")
-		event.Result = stringFromMap(obj, "result")
-	}
-	if event.DoorName == "" {
-		event.DoorName = stringFromMap(eventData, "door_name")
-	}
-	if event.DoorID == "" {
-		event.DoorID = stringFromMap(eventData, "door_id")
+	if event.EventType == "" {
+		event.EventType = "access.logs.add" // keep downstream filters happy
 	}
 
-	if actor, ok := eventData["actor"].(map[string]any); ok {
-		event.ActorName = stringFromMap(actor, "name")
+	// ── actor.* — member identity ──
+	if actor, ok := src["actor"].(map[string]any); ok {
 		event.ActorID = stringFromMap(actor, "id")
-		event.CredentialID = stringFromMap(actor, "credential_id")
-	}
-	if event.CredentialID == "" {
-		event.CredentialID = stringFromMap(eventData, "credential_id")
+		event.ActorName = stringFromMap(actor, "display_name")
+		if event.ActorName == "" {
+			event.ActorName = stringFromMap(actor, "name")
+		}
 	}
 
-	event.AuthType = stringFromMap(eventData, "authentication_type")
-	if event.AuthType == "" {
-		event.AuthType = stringFromMap(eventData, "auth_type")
+	// ── authentication.* — how the member identified themselves ──
+	if auth, ok := src["authentication"].(map[string]any); ok {
+		event.AuthType = stringFromMap(auth, "credential_provider")
+	}
+
+	// ── target[] — door, nfc card, hub; each entry is typed ──
+	if targets, ok := src["target"].([]any); ok {
+		for _, raw := range targets {
+			t, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch stringFromMap(t, "type") {
+			case "door":
+				event.DoorID = stringFromMap(t, "id")
+				event.DoorName = stringFromMap(t, "display_name")
+				if event.DoorName == "" {
+					event.DoorName = stringFromMap(t, "name")
+				}
+			case "nfc_id", "nfc_token":
+				// The physical card UID. UA stores this as the hex
+				// NFC UID; we pass it through as CredentialID so the
+				// downstream matcher can look it up in the mirror.
+				event.CredentialID = stringFromMap(t, "id")
+			}
+		}
 	}
 
 	return event
+}
+
+// ─── REST: Steady-state tap poller ───────────────────────────
+
+// StartEventPoller drives tap ingestion by polling POST /system/logs
+// on a fixed cadence. Each poll fetches the window `[cursorTime, now]`
+// from UA-Hub, dedups against the highest LogID seen so far, and
+// dispatches new events to the registered OnEvent handler with
+// IsBackfill=true.
+//
+// Cadence is 5s in production (the taps arrive at ~9/day, so a tight
+// loop is fine and gives the door the perception of near-realtime
+// recording in the dashboard). Callers pass the initial `since` —
+// typically today-midnight-local on first boot, so same-day taps
+// are backfilled, or the tail of the previous checkins row on
+// restart.
+//
+// This method is a supervised blocking loop: it returns when ctx is
+// cancelled. Start it under bg.Group.Go so shutdown drains cleanly.
+//
+// Why IsBackfill for every poller event, not just the initial catch-up:
+// the physical door has already opened (or been denied) by the UA-Hub
+// at the moment the tap happened — otherwise the event wouldn't be in
+// the system log at all. Issuing a downstream UnlockDoor from the
+// bridge would at best be a no-op and at worst double-open the door
+// at a time the member has already left. Handlers use IsBackfill as
+// the "record-only, no side-effects" gate.
+func (c *Client) StartEventPoller(ctx context.Context, since time.Time, interval time.Duration) error {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	if c.handler == nil {
+		return fmt.Errorf("StartEventPoller: no event handler registered (call OnEvent first)")
+	}
+
+	cursorTime := since
+	var maxLogID int64 // monotonic; skip any hit whose _id <= this
+
+	c.logger.Info("tap poller starting",
+		"since", cursorTime.Format(time.RFC3339),
+		"interval", interval,
+	)
+
+	// Run an immediate poll on startup so operators see today's taps
+	// backfill in within one tick rather than waiting `interval`.
+	c.pollOnce(ctx, &cursorTime, &maxLogID)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			c.logger.Info("tap poller stopping", "reason", ctx.Err())
+			return nil
+		case <-ticker.C:
+			c.pollOnce(ctx, &cursorTime, &maxLogID)
+		}
+	}
+}
+
+// pollOnce runs one fetch cycle, updating the cursor + dedup mark in
+// place. Errors are logged and swallowed so a transient UA-Hub blip
+// doesn't terminate the poller goroutine; the next tick retries.
+func (c *Client) pollOnce(ctx context.Context, cursorTime *time.Time, maxLogID *int64) {
+	// Fetch with a small timeout so one stuck request can't wedge the
+	// poller. Use a slight lookback (30s) off the cursor so a tap that
+	// arrived at UA-Hub right at the boundary isn't missed due to
+	// clock skew between the bridge and the UDM Pro.
+	fetchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	lookback := 30 * time.Second
+	fetchSince := *cursorTime
+	if !fetchSince.IsZero() {
+		fetchSince = fetchSince.Add(-lookback)
+	}
+
+	events, err := c.FetchAccessLogsSince(fetchCtx, fetchSince)
+	if err != nil {
+		c.logger.Warn("tap poller fetch failed", "error", err, "since", fetchSince.Format(time.RFC3339))
+		return
+	}
+
+	if len(events) == 0 {
+		return
+	}
+
+	// Dispatch only events strictly newer than the last LogID we saw.
+	// FetchAccessLogsSince returns oldest-first, so we advance the
+	// cursor in time-order and update maxLogID as we go.
+	dispatched := 0
+	for _, ev := range events {
+		// LogID may be numeric-string; compare as int64 when possible.
+		// Fall back to a string-equality check against the last one
+		// seen (via timestamp) on the off chance UA-Hub switches to
+		// opaque ids in a future build.
+		idN, ok := parseLogIDInt(ev.LogID)
+		if ok {
+			if idN <= *maxLogID {
+				continue
+			}
+			*maxLogID = idN
+		}
+
+		// Track cursor in time as a secondary index in case LogID is
+		// absent. Parse the RFC3339 timestamp; tolerate parse failure.
+		if t, perr := time.Parse(time.RFC3339, ev.Timestamp); perr == nil && t.After(*cursorTime) {
+			*cursorTime = t
+		}
+
+		c.lastEventAt.Store(time.Now())
+		c.eventsProcessed.Add(1)
+		c.handler(ev)
+		dispatched++
+	}
+
+	if dispatched > 0 {
+		c.logger.Info("tap poller dispatched events",
+			"count", dispatched,
+			"maxLogID", *maxLogID,
+			"cursor", cursorTime.Format(time.RFC3339),
+		)
+	}
+}
+
+// parseLogIDInt extracts the numeric form of a system-log `_id` if it's
+// a plain monotonic integer (the 4.2.16 shape). Returns (0,false) when
+// the id is missing or non-numeric, in which case callers fall back to
+// timestamp-based cursoring.
+func parseLogIDInt(s string) (int64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	var n int64
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b < '0' || b > '9' {
+			return 0, false
+		}
+		n = n*10 + int64(b-'0')
+		if n < 0 { // overflow guard
+			return 0, false
+		}
+	}
+	return n, true
 }
 
 // ─── Helpers ─────────────────────────────────────────────────

@@ -230,26 +230,31 @@ COMMIT;
 // ─── audit.db migrations ────────────────────────────────────────
 
 // auditSchemaVersion is the current migration count for audit.db.
-const auditSchemaVersion = 3
+const auditSchemaVersion = 4
 
 // auditSchemaVersionAtSplit pins the audit-side schema version that a
 // pre-A4 bridge.db already embodies at the moment of the legacy split
 // — i.e., the combined-sequence versions 3, 4, and 5 that are
 // audit-side. See cacheSchemaVersionAtSplit for the symmetric rationale;
 // any new audit migration after 3 must run on the split copy, so the
-// force-set must stay pinned.
+// force-set must stay pinned. Migration 4 (unifi_log_id) was added in
+// v0.5.0 and runs on already-split installs via migrateWith — the
+// split pin does NOT need to move forward because the split predates
+// v0.5.0 on every real install.
 const auditSchemaVersionAtSplit = 3
 
 // auditMigrations is the ordered DDL script applied to audit.db.
 // Migration 1 creates checkins + door_policies + jobs (was 3).
 // Migration 2 is the unifi_result ALTER on checkins (was 4).
 // Migration 3 creates the UA-Hub mapping tables + match_audit
-// (was 5). Migrations 1, 2, and 6 from the old sequence are
-// cache-side and not in this list.
+// (was 5). Migration 4 adds unifi_log_id for tap-poller dedup
+// (v0.5.0). Migrations 1, 2, and 6 from the old combined sequence
+// are cache-side and not in this list.
 var auditMigrations = []string{
 	auditMigration1_checkins,
 	auditMigration2_unifi_result,
 	auditMigration3_mappings,
+	auditMigration4_unifi_log_id,
 }
 
 // Migration 1 (audit): Check-in event log, door policies, background jobs.
@@ -360,6 +365,21 @@ CREATE INDEX IF NOT EXISTS idx_match_audit_user
     ON match_audit(ua_user_id);
 CREATE INDEX IF NOT EXISTS idx_match_audit_time
     ON match_audit(timestamp);
+`
+
+// Migration 4 (audit): unifi_log_id column on checkins for tap-poller
+// dedup (v0.5.0). The poller overlaps its time window to tolerate clock
+// skew, so the same tap may be fetched across two polls; the unique
+// partial index on non-empty values lets RecordCheckIn use INSERT OR
+// IGNORE for a crash-safe dedup that survives process restarts too.
+//
+// Partial (WHERE != '') because historic checkins have empty log_id
+// and mustn't collide with each other.
+const auditMigration4_unifi_log_id = `
+ALTER TABLE checkins ADD COLUMN unifi_log_id TEXT NOT NULL DEFAULT '';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_checkins_unifi_log_id
+    ON checkins(unifi_log_id) WHERE unifi_log_id != '';
 `
 
 // ─── Migration runners ──────────────────────────────────────────
