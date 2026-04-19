@@ -99,6 +99,19 @@ type Server struct {
 	// return value propagates the "was it open?" flag up into the HTTP
 	// response so operators can tell a meaningful reset from a no-op.
 	breakerResetter func() (wasOpen bool)
+
+	// mirrorWalk, when non-nil, runs one pass of the local customer
+	// mirror when POST /admin/mirror/resync is invoked. Wired via
+	// SetMirrorWalker from cmd/bridge so the Server's constructor
+	// signature stays stable (same rationale as breakerResetter:
+	// NewServer already has 18 positional args; a 19th for a
+	// cross-package ref would be noisy).
+	//
+	// We store a bare func rather than a *mirror.Walker to keep this
+	// package free of a dependency on internal/mirror. The handler
+	// doesn't need anything from the walker beyond "run once with
+	// this ctx" — that's exactly what a func captures.
+	mirrorWalk func(ctx context.Context) error
 }
 
 func NewServer(
@@ -174,6 +187,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // debug-only wire-up.
 func (s *Server) SetBreakerResetter(fn func() bool) {
 	s.breakerResetter = fn
+}
+
+// SetMirrorWalker registers the callback used by POST /admin/mirror/resync
+// to kick off a mirror walk. Pass nil to leave the endpoint disabled (it
+// will 503). cmd/bridge wires mirror.Walker.Walk here after the Walker is
+// constructed.
+//
+// Setter-based for the same reason as SetBreakerResetter: keep NewServer's
+// signature stable, and avoid pulling internal/mirror into internal/api's
+// import graph (this package is already wide; the admin endpoint only
+// needs the "run once" verb).
+func (s *Server) SetMirrorWalker(fn func(ctx context.Context) error) {
+	s.mirrorWalk = fn
 }
 
 // ControlHandler returns the control-plane http.Handler: the mux that owns
@@ -340,6 +366,19 @@ func (s *Server) routes() {
 	// See S5 in docs/architecture-review.md and testhooks_{on,off}.go.
 	s.registerTestHooks(shortTimeout)
 	s.controlMux.HandleFunc("POST /unlock/{doorId}", withTimeout(shortTimeout, s.handleUnlock))
+
+	// Mirror control endpoints. Control-plane (not public mux) because:
+	//   - resync triggers a long-running network operation against
+	//     Redpoint; it's an operator/cron action, not a UI-from-browser
+	//     one. The Quick-sync UI button goes through /directory/sync on
+	//     the public mux for that exact reason.
+	//   - stats reports the shape of the mirror (badge_status counts);
+	//     operators use it via CLI alongside the rest of the control
+	//     surface. Keeping it on the control mux means one bearer token
+	//     handles both read and write for mirror operations, matching
+	//     the /unlock pattern.
+	s.controlMux.HandleFunc("POST /admin/mirror/resync", withTimeout(shortTimeout, s.handleMirrorResync))
+	s.controlMux.HandleFunc("GET /admin/mirror/stats", withTimeout(shortTimeout, s.handleMirrorStats))
 }
 
 // ─── Health & Stats ──────────────────────────────────────────

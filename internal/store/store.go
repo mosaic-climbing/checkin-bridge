@@ -351,7 +351,7 @@ func pruneAuditCopy(path string) error {
 	}
 	for i, q := range stmts {
 		if i == len(stmts)-1 {
-			if _, err := db.Exec(q, auditSchemaVersion); err != nil {
+			if _, err := db.Exec(q, auditSchemaVersionAtSplit); err != nil {
 				return fmt.Errorf("%s: %w", q, err)
 			}
 			continue
@@ -365,7 +365,12 @@ func pruneAuditCopy(path string) error {
 
 // pruneCacheCopy removes audit-side objects from the copy destined to
 // become cache.db, then force-sets schema_version to the cache-side
-// count. Mirrors pruneAuditCopy.
+// count at the moment of split. Mirrors pruneAuditCopy.
+//
+// Post-condition: cache.db contains pre-A4-shape customers + members +
+// customers_fts, with schema_version = cacheSchemaVersionAtSplit (3).
+// migrateWith on the next boot then applies migrations 4..N to bring
+// the file to current head — e.g., migration 4 adds the badge columns.
 func pruneCacheCopy(path string) error {
 	db, err := sqlx.Open("sqlite", dsnFor(path))
 	if err != nil {
@@ -387,7 +392,7 @@ func pruneCacheCopy(path string) error {
 	}
 	for i, q := range stmts {
 		if i == len(stmts)-1 {
-			if _, err := db.Exec(q, cacheSchemaVersion); err != nil {
+			if _, err := db.Exec(q, cacheSchemaVersionAtSplit); err != nil {
 				return fmt.Errorf("%s: %w", q, err)
 			}
 			continue

@@ -28,6 +28,7 @@ import (
 	"github.com/mosaic-climbing/checkin-bridge/internal/config"
 	"github.com/mosaic-climbing/checkin-bridge/internal/ingest"
 	"github.com/mosaic-climbing/checkin-bridge/internal/metrics"
+	"github.com/mosaic-climbing/checkin-bridge/internal/mirror"
 	"github.com/mosaic-climbing/checkin-bridge/internal/recheck"
 	"github.com/mosaic-climbing/checkin-bridge/internal/redpoint"
 	"github.com/mosaic-climbing/checkin-bridge/internal/statusync"
@@ -462,6 +463,26 @@ func main() {
 	// exported ResetBreaker method. The /debug/reset-breakers HTTP
 	// endpoint 503s until this is set; no other caller invokes the hook.
 	apiServer.SetBreakerResetter(rechecker.ResetBreaker)
+
+	// C3 S2: construct the customer mirror walker and expose its Walk()
+	// method via the /admin/mirror/resync endpoint. The walker pages
+	// through Redpoint customers.filter{active: ACTIVE} with badge +
+	// past-due + facility fields, writing each page to the local cache.
+	// Operators (or the nightly cron) invoke /admin/mirror/resync to
+	// refresh the local mirror.
+	//
+	// We pass the default mirror.Config{} — the zero values resolve to
+	// DefaultPageSize=100 and DefaultInterPageDelay=2s inside New().
+	// Non-default knobs would be config.Mirror.* but we haven't needed
+	// them yet; the 2s delay is what keeps us below Redpoint's
+	// observed 429 threshold, and 100/page is what the legacy sync uses.
+	mirrorWalker := mirror.New(
+		redpointClient,
+		mirror.NewStoreAdapter(db),
+		logger.With("component", "mirror"),
+		mirror.Config{},
+	)
+	apiServer.SetMirrorWalker(mirrorWalker.Walk)
 
 	// Build HTTP handler chain
 	var httpHandler http.Handler = apiServer
