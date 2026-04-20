@@ -928,7 +928,7 @@ func NeedsMatchListFragment(rows []NeedsMatchRow) string {
 				`<td><button class="btn btn-primary btn-sm"`+
 				` hx-get="/ui/frag/unmatched/%s/detail"`+
 				` hx-target="#needs-match-detail"`+
-				` hx-swap="innerHTML"`+
+				` hx-swap="innerHTML show:top"`+
 				` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>Open</button></td>`+
 				`</tr>`,
 			name, HTMLEscape(r.UAUserID),

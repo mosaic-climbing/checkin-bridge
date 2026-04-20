@@ -297,6 +297,204 @@ func TestPendingLifecycle(t *testing.T) {
 	}
 }
 
+// TestUpsertPendingSelfHealsIdentityFromUAUsers — if the caller passes
+// blank UAName/UAEmail (the v0.5.2/v0.5.3 production failure mode),
+// UpsertPending must fall back to the ua_users mirror row so the Needs
+// Match page still renders a real display identity. Also checks that a
+// non-blank value passed by the caller wins over the mirror (so a
+// UA-Hub-side rename propagates on the next sync).
+func TestUpsertPendingSelfHealsIdentityFromUAUsers(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	// Seed ua_users with a complete identity — this represents the
+	// state after a healthy unifimirror.Refresh pass.
+	if err := s.UpsertUAUser(ctx, &UAUser{
+		ID:        "ua-user-selfheal",
+		FirstName: "Chase",
+		LastName:  "", // Chase has no last name in UA-Hub
+		Name:      "",
+		Email:     "chase@mosaicclimbing.com",
+		Status:    "ACTIVE",
+	}, nil); err != nil {
+		t.Fatalf("seed ua_users: %v", err)
+	}
+
+	grace := time.Now().Add(7 * 24 * time.Hour).UTC().Format(time.RFC3339)
+
+	// Caller passes blanks — the failure mode observed on LEF prod.
+	if err := s.UpsertPending(ctx, &Pending{
+		UAUserID:   "ua-user-selfheal",
+		Reason:     PendingReasonAmbiguousEmail,
+		GraceUntil: grace,
+		Candidates: "rp-1|rp-2",
+		UAName:     "",
+		UAEmail:    "",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetPending(ctx, "ua-user-selfheal")
+	if err != nil || got == nil {
+		t.Fatalf("GetPending: (%v, %v)", got, err)
+	}
+	if got.UAName != "Chase" {
+		t.Errorf("self-heal UAName = %q, want %q", got.UAName, "Chase")
+	}
+	if got.UAEmail != "chase@mosaicclimbing.com" {
+		t.Errorf("self-heal UAEmail = %q, want %q", got.UAEmail, "chase@mosaicclimbing.com")
+	}
+
+	// Non-blank caller value wins over the mirror — a subsequent
+	// statusync pass that saw fresh UA-Hub data must be able to
+	// update the cached identity (e.g. after an operator rename).
+	if err := s.UpsertPending(ctx, &Pending{
+		UAUserID:   "ua-user-selfheal",
+		Reason:     PendingReasonAmbiguousEmail,
+		GraceUntil: grace,
+		Candidates: "rp-1|rp-2",
+		UAName:     "Chase Renamed",
+		UAEmail:    "chase.renamed@example.com",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetPending(ctx, "ua-user-selfheal")
+	if err != nil || got == nil {
+		t.Fatalf("GetPending after rename: (%v, %v)", got, err)
+	}
+	if got.UAName != "Chase Renamed" || got.UAEmail != "chase.renamed@example.com" {
+		t.Errorf("caller value must override mirror: got name=%q email=%q",
+			got.UAName, got.UAEmail)
+	}
+}
+
+// TestUpsertPendingSelfHealDerivesFullNameFromParts — ua_users rows
+// populated by the nightly mirror typically have first_name/last_name
+// set but name blank (UA-Hub returns the fields separately). Exercises
+// the CASE ladder that assembles "first last" when name alone is empty.
+func TestUpsertPendingSelfHealDerivesFullNameFromParts(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	if err := s.UpsertUAUser(ctx, &UAUser{
+		ID:        "ua-user-ainsley",
+		FirstName: "Ainsley Rae",
+		LastName:  "Lightcap",
+		Name:      "", // UA-Hub leaves this blank when first+last are used
+		Email:     "",
+	}, nil); err != nil {
+		t.Fatalf("seed ua_users: %v", err)
+	}
+	grace := time.Now().Add(7 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	if err := s.UpsertPending(ctx, &Pending{
+		UAUserID:   "ua-user-ainsley",
+		Reason:     PendingReasonAmbiguousName,
+		GraceUntil: grace,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetPending(ctx, "ua-user-ainsley")
+	if err != nil || got == nil {
+		t.Fatalf("GetPending: (%v, %v)", got, err)
+	}
+	if got.UAName != "Ainsley Rae Lightcap" {
+		t.Errorf("derived UAName = %q, want %q", got.UAName, "Ainsley Rae Lightcap")
+	}
+	if got.UAEmail != "" {
+		t.Errorf("UAEmail should stay blank when mirror row has no email; got %q", got.UAEmail)
+	}
+}
+
+// TestUpsertPendingSelfHealNoMirrorRow — if the ua_users mirror has no
+// row for this UA user (e.g. the matcher observed them before the
+// nightly mirror has ever run, or they were deleted upstream), the
+// pending row should persist with blank identity fields rather than
+// erroring. The next sync pass will either refresh from live UA-Hub
+// data or re-run the self-heal after the mirror populates.
+func TestUpsertPendingSelfHealNoMirrorRow(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	grace := time.Now().Add(7 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	if err := s.UpsertPending(ctx, &Pending{
+		UAUserID:   "ua-user-no-mirror",
+		Reason:     PendingReasonNoEmail,
+		GraceUntil: grace,
+	}); err != nil {
+		t.Fatalf("UpsertPending with no mirror row should not error: %v", err)
+	}
+	got, err := s.GetPending(ctx, "ua-user-no-mirror")
+	if err != nil || got == nil {
+		t.Fatalf("GetPending: (%v, %v)", got, err)
+	}
+	if got.UAName != "" || got.UAEmail != "" {
+		t.Errorf("no-mirror pending should have blank identity; got name=%q email=%q",
+			got.UAName, got.UAEmail)
+	}
+}
+
+// TestMigration7BackfillsExistingBlankPendingRows — represents the
+// v0.5.2/v0.5.3 production state: pending rows already on disk with
+// blank ua_name/ua_email and a fully-populated ua_users mirror. The
+// v0.5.4 migration must repair them in place so operators see real
+// identities on the Needs Match page without having to wait for the
+// next statusync pass.
+//
+// This test leans on the fact that testStore runs all migrations in
+// Open, including migration 7. We simulate the pre-fix state by
+// writing the pending row with blank identity (via a direct DB exec
+// that bypasses the new self-heal), seeding ua_users, and then
+// re-running migration 7 manually — the backfill is idempotent.
+func TestMigration7BackfillsExistingBlankPendingRows(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	// Seed ua_users with identities the backfill should copy.
+	for _, u := range []UAUser{
+		{ID: "ua-backfill-1", FirstName: "Abigail", LastName: "Smith"},
+		{ID: "ua-backfill-2", Name: "Chase", Email: "chase@example.com"},
+		{ID: "ua-backfill-3", FirstName: "Aaron", LastName: "Hart"},
+	} {
+		u := u
+		if err := s.UpsertUAUser(ctx, &u, nil); err != nil {
+			t.Fatalf("seed ua_users %s: %v", u.ID, err)
+		}
+	}
+
+	// Write pending rows with blank identity, bypassing UpsertPending's
+	// self-heal (reproducing the production state before v0.5.4). We
+	// do this via a direct exec rather than calling UpsertPending to
+	// guarantee the rows hit disk blank.
+	grace := time.Now().Add(7 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	for _, id := range []string{"ua-backfill-1", "ua-backfill-2", "ua-backfill-3"} {
+		if _, err := s.db.ExecContext(ctx, `
+            INSERT INTO ua_user_mappings_pending
+                (ua_user_id, reason, grace_until, candidates, ua_name, ua_email)
+            VALUES (?, ?, ?, '', '', '')
+        `, id, PendingReasonAmbiguousName, grace); err != nil {
+			t.Fatalf("seed blank pending %s: %v", id, err)
+		}
+	}
+
+	// Re-run migration 7 as a one-shot backfill. Idempotent: the WHERE
+	// clause only touches rows whose identity is still blank.
+	if _, err := s.db.ExecContext(ctx, auditMigration7_pending_identity_backfill); err != nil {
+		t.Fatalf("replay migration 7: %v", err)
+	}
+
+	got1, _ := s.GetPending(ctx, "ua-backfill-1")
+	if got1 == nil || got1.UAName != "Abigail Smith" {
+		t.Errorf("first_name+last_name backfill: %+v", got1)
+	}
+	got2, _ := s.GetPending(ctx, "ua-backfill-2")
+	if got2 == nil || got2.UAName != "Chase" || got2.UAEmail != "chase@example.com" {
+		t.Errorf("name+email backfill: %+v", got2)
+	}
+	got3, _ := s.GetPending(ctx, "ua-backfill-3")
+	if got3 == nil || got3.UAName != "Aaron Hart" {
+		t.Errorf("Aaron backfill: %+v", got3)
+	}
+}
+
 func TestPendingExpired(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
