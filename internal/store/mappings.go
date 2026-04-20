@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -203,6 +204,17 @@ func (s *Store) GetMemberByUAUserID(ctx context.Context, uaUserID string) (*Memb
 // ua_name, and ua_email are refreshed on every call so the cached display
 // identity stays in sync with UA-Hub if the operator renames the user or
 // adds an email.
+//
+// Self-heals empty identity fields from ua_users. Production observed a
+// failure mode in v0.5.2/v0.5.3 where the UA-Hub ListAllUsersWithStatus
+// paginated response returned records with blank first_name/last_name/
+// email for a subset of users, and the statusync matcher persisted those
+// blanks into the pending row. The Needs Match page then rendered
+// "(no name) (no email)" for 345 of 345 rows even though the ua_users
+// mirror held the real identities. When the caller passes empty strings
+// for UAName/UAEmail, we fall back to the mirror row before writing.
+// Missing mirror row is not an error — we keep the blanks and let the
+// next statusync pass refresh on conflict.
 func (s *Store) UpsertPending(ctx context.Context, p *Pending) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -212,6 +224,37 @@ func (s *Store) UpsertPending(ctx context.Context, p *Pending) error {
 	}
 	if p.LastSeen == "" {
 		p.LastSeen = now
+	}
+	if p.UAName == "" || p.UAEmail == "" {
+		var mirror struct {
+			DerivedName string `db:"derived_name"`
+			Email       string `db:"email"`
+		}
+		err := s.db.GetContext(ctx, &mirror, `
+            SELECT CASE WHEN name       != '' THEN name
+                        WHEN first_name != '' AND last_name != '' THEN first_name || ' ' || last_name
+                        WHEN first_name != '' THEN first_name
+                        WHEN last_name  != '' THEN last_name
+                        ELSE ''
+                   END AS derived_name,
+                   email
+              FROM ua_users
+             WHERE id = ?
+        `, p.UAUserID)
+		switch {
+		case err == nil:
+			if p.UAName == "" {
+				p.UAName = mirror.DerivedName
+			}
+			if p.UAEmail == "" {
+				p.UAEmail = mirror.Email
+			}
+		case errors.Is(err, sql.ErrNoRows):
+			// No mirror row yet for this UA user — fine, keep blanks.
+			// The next unifimirror refresh + statusync pass will heal.
+		default:
+			return fmt.Errorf("ua_users identity self-heal: %w", err)
+		}
 	}
 	_, err := s.db.ExecContext(ctx, `
         INSERT INTO ua_user_mappings_pending
