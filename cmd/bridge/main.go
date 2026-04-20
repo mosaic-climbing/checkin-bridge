@@ -521,6 +521,8 @@ func main() {
 		return api.UAHubRefreshStats{
 			Observed:    stats.Observed,
 			Upserted:    stats.Upserted,
+			Hydrated:    stats.Hydrated,
+			Rechecked:   stats.Rechecked,
 			MirrorTotal: stats.MirrorTotal,
 			Duration:    stats.Duration,
 		}, nil
