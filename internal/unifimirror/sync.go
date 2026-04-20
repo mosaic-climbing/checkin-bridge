@@ -263,17 +263,27 @@ func (s *Syncer) RefreshWithStats(ctx context.Context) (Stats, error) {
 
 	upserted, hydrated, listEmails := s.upsertAndHydrate(ctx, users)
 
-	rechecked := 0
-	if hydrated > 0 {
-		// Only run the recheck pass when hydration turned up new
-		// emails — if the list already had every email we had, no
-		// pending row would have new information to resolve.
-		n, err := s.recheckPending(ctx)
-		if err != nil {
-			s.logger.Warn("pending-mapping recheck failed (continuing)",
-				"error", err)
-		}
-		rechecked = n
+	// Run recheck unconditionally.
+	//
+	// v0.5.5 gated this on `hydrated > 0` under the assumption that
+	// new emails only ever arrive via the per-user FetchUser hydrate
+	// pass. That assumption broke after the v0.5.6 parser fix: once
+	// parseUniFiUser started reading `user_email`, the LIST endpoint
+	// began returning emails for some users directly (listEmails went
+	// from 5 → 52 at LEF on the first refresh after deploy), bypassing
+	// the hydrated counter and leaving those rows' pending records
+	// stuck even though they had become single-hit resolvable.
+	//
+	// recheckPending is cheap: one indexed SELECT joining ua_users +
+	// cache.customers on email, plus an UpsertMapping + DeletePending
+	// for each of at most a few hundred rows. It is idempotent — if
+	// there's nothing new to promote the query returns zero rows and
+	// the pass is a no-op. Running it every refresh is strictly safer
+	// than trying to predict which code path delivered an email.
+	rechecked, err := s.recheckPending(ctx)
+	if err != nil {
+		s.logger.Warn("pending-mapping recheck failed (continuing)",
+			"error", err)
 	}
 
 	total, _ := s.store.UAUserCount(ctx)
