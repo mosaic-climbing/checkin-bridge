@@ -145,6 +145,45 @@ func (s *Server) handleMirrorStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleUAHubFetchUser is the single-user UA-Hub probe wired at
+// GET /admin/ua-hub/fetch/{id} on the control plane.
+//
+// Why it exists: the paginated ListAllUsersWithStatus endpoint at LEF
+// returns a payload that omits email for the vast majority of users.
+// Before v0.5.5 there was no way to tell whether a missing field was a
+// parser bug, a per-user permissions quirk, or a shape-only artefact
+// of the list endpoint short of shelling into the bridge host and
+// curl-ing UA-Hub with the API token. This route surfaces the
+// underlying GET /users/{id} response directly (via the shared
+// unifi.Client.FetchUser path, so auth/retry/timeout match the rest of
+// the bridge) so staff can probe from a trusted workstation.
+//
+// Response shape: the decoded *unifi.UniFiUser (firstName, lastName,
+// email, status, nfcTokens). Not the raw UA-Hub JSON — we deliberately
+// pass it through the same parseUniFiUser codepath the mirror uses so
+// "what does the bridge see" and "what does UA-Hub return" match.
+func (s *Server) handleUAHubFetchUser(w http.ResponseWriter, r *http.Request) {
+	if s.unifi == nil {
+		writeError(w, http.StatusServiceUnavailable, "unifi client not configured")
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing user id")
+		return
+	}
+	u, err := s.unifi.FetchUser(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if u == nil {
+		writeError(w, http.StatusNotFound, "user not found")
+		return
+	}
+	writeJSON(w, u)
+}
+
 // startedWithin reports whether startedAt (RFC3339) is within d of now.
 // An empty startedAt returns (false, nil) — treat as stale.
 func startedWithin(startedAt string, d time.Duration) (bool, error) {

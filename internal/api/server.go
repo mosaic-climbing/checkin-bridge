@@ -431,6 +431,12 @@ func (s *Server) routes() {
 	//     the /unlock pattern.
 	s.controlMux.HandleFunc("POST /admin/mirror/resync", withTimeout(shortTimeout, s.handleMirrorResync))
 	s.controlMux.HandleFunc("GET /admin/mirror/stats", withTimeout(shortTimeout, s.handleMirrorStats))
+
+	// UA-Hub single-user probe. Operator-only; returns what UA-Hub
+	// actually sends for a given user ID so staff can diagnose shape
+	// issues (e.g. the "list omits email" discovery that motivated the
+	// v0.5.5 hydration pass) without shelling into the box.
+	s.controlMux.HandleFunc("GET /admin/ua-hub/fetch/{id}", withTimeout(shortTimeout, s.handleUAHubFetchUser))
 }
 
 // ─── Health & Stats ──────────────────────────────────────────

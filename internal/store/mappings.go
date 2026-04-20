@@ -317,6 +317,64 @@ func (s *Store) ExpiredPending(ctx context.Context, now time.Time) ([]Pending, e
 	return ps, err
 }
 
+// ResolvablePending is one output row of FindResolvablePending: a
+// pending mapping whose UA-Hub user now has an email that lands
+// exactly one Redpoint customer. These are the rows the recheck pass
+// can promote to `auto:email:recheck` without staff involvement.
+//
+// FirstName/LastName are carried so the caller can fold in a
+// household-disambiguation check before committing (optional; the
+// default single-hit path doesn't need it).
+type ResolvablePending struct {
+	UAUserID          string `db:"ua_user_id"`
+	UAEmail           string `db:"ua_email"`
+	UAFirstName       string `db:"ua_first_name"`
+	UALastName        string `db:"ua_last_name"`
+	RedpointCustomer  string `db:"redpoint_customer_id"`
+	CustomerFirstName string `db:"customer_first_name"`
+	CustomerLastName  string `db:"customer_last_name"`
+}
+
+// FindResolvablePending returns pending rows whose mirror ua_users
+// email now maps to exactly one cache.customers row — the candidates
+// the mirror-refresh recheck pass can promote into ua_user_mappings.
+//
+// The WHERE clause deliberately excludes UA-Hub users who already have
+// a confirmed mapping (belt-and-braces — pending rows should have been
+// deleted in that case, but a stale pending shouldn't crash recheck)
+// and customers already bound to some other UA-Hub user (the UNIQUE
+// constraint on ua_user_mappings.redpoint_customer_id would surface
+// there anyway; filtering early saves the failed insert).
+func (s *Store) FindResolvablePending(ctx context.Context) ([]ResolvablePending, error) {
+	const query = `
+        SELECT
+            p.ua_user_id                AS ua_user_id,
+            u.email                     AS ua_email,
+            u.first_name                AS ua_first_name,
+            u.last_name                 AS ua_last_name,
+            c.redpoint_id               AS redpoint_customer_id,
+            c.first_name                AS customer_first_name,
+            c.last_name                 AS customer_last_name
+        FROM ua_user_mappings_pending p
+        JOIN ua_users u ON u.id = p.ua_user_id
+        JOIN cache.customers c ON lower(c.email) = lower(u.email)
+        WHERE
+            u.email != ''
+            AND NOT EXISTS (SELECT 1 FROM ua_user_mappings m
+                            WHERE m.ua_user_id = p.ua_user_id)
+            AND NOT EXISTS (SELECT 1 FROM ua_user_mappings m
+                            WHERE m.redpoint_customer_id = c.redpoint_id)
+            AND (
+                SELECT COUNT(*) FROM cache.customers c2
+                WHERE lower(c2.email) = lower(u.email)
+            ) = 1
+        ORDER BY p.first_seen ASC
+    `
+	var rows []ResolvablePending
+	err := s.db.SelectContext(ctx, &rows, query)
+	return rows, err
+}
+
 // AppendMatchAudit appends a forensic log row. ID is assigned by SQLite on
 // insert; callers pass zero. Never errors on duplicate (there's no unique
 // constraint on the audit table; we deliberately want every write).

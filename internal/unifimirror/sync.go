@@ -46,9 +46,23 @@ type SyncConfig struct {
 // Defining it as an interface here (rather than reaching into the
 // concrete type) keeps the unit test able to inject a fake upstream
 // without bringing up a real UA-Hub server.
+//
+// FetchUser is a per-user hydration call. The paginated
+// ListAllUsersWithStatus endpoint at LEF returns a payload that omits
+// email for the vast majority of users (1613 of 1618 observed) — a
+// shape-only quirk of UA-Hub's list endpoint. The per-user GET
+// /users/{id} returns the full record including email, so the mirror
+// uses it to backfill blank-email rows after the initial walk.
 type unifiClient interface {
 	ListAllUsersWithStatus(ctx context.Context) ([]unifi.UniFiUser, error)
+	FetchUser(ctx context.Context, userID string) (*unifi.UniFiUser, error)
 }
+
+// hydrateInterval is the pause between per-user FetchUser calls during
+// the email backfill pass. Small enough to finish in minutes for ~1.6k
+// users, large enough not to hammer UA-Hub. Exposed as a package var
+// so tests can drop it to zero.
+var hydrateInterval = 75 * time.Millisecond
 
 // Syncer writes unifi.UniFiUser rows to store.ua_users on a daily
 // tick. Not safe for concurrent Refresh calls — the store itself
@@ -130,13 +144,21 @@ func (s *Syncer) Run(ctx context.Context) error {
 // We revisit this if staff ever ask for a "prune stale UA-Hub users"
 // button.
 func (s *Syncer) Refresh(ctx context.Context) error {
-	started := time.Now()
-	users, err := s.unifi.ListAllUsersWithStatus(ctx)
-	if err != nil {
-		return fmt.Errorf("ListAllUsersWithStatus: %w", err)
-	}
+	_, err := s.RefreshWithStats(ctx)
+	return err
+}
 
-	inserted := 0
+// upsertAndHydrate writes the initial mirror rows, then hydrates emails
+// per-user for rows that came back from ListAllUsersWithStatus with a
+// blank email. Returns (upserted, hydrated, listHadEmail).
+//
+// Two-phase structure keeps the common case fast: the first pass stores
+// everything we got, the second pass only hits UA-Hub for the subset
+// that the list endpoint shortchanged. Errors from FetchUser are logged
+// and the original row is left in place — a per-user network blip
+// should not abort the whole refresh, and the next sync will try again.
+func (s *Syncer) upsertAndHydrate(ctx context.Context, users []unifi.UniFiUser) (upserted, hydrated, listEmails int) {
+	var needHydrate []string
 	for _, u := range users {
 		row := &store.UAUser{
 			ID:        u.ID,
@@ -154,23 +176,77 @@ func (s *Syncer) Refresh(ctx context.Context) error {
 				"uaUserId", u.ID, "error", err)
 			continue
 		}
-		inserted++
+		upserted++
+		if u.Email != "" {
+			listEmails++
+			continue
+		}
+		if u.ID == "" {
+			continue
+		}
+		needHydrate = append(needHydrate, u.ID)
 	}
 
-	total, _ := s.store.UAUserCount(ctx)
-	s.logger.Info("UA-Hub directory mirror refresh complete",
-		"observed", len(users),
-		"upserted", inserted,
-		"mirrorTotal", total,
-		"duration", time.Since(started).Round(time.Millisecond))
-	return nil
+	if len(needHydrate) == 0 {
+		return upserted, 0, listEmails
+	}
+	s.logger.Info("UA-Hub mirror hydrating blank-email rows",
+		"toHydrate", len(needHydrate),
+		"listEmails", listEmails,
+		"observed", len(users))
+
+	for i, id := range needHydrate {
+		if err := ctx.Err(); err != nil {
+			s.logger.Info("UA-Hub mirror hydrate cancelled",
+				"done", i, "remaining", len(needHydrate)-i, "error", err)
+			return upserted, hydrated, listEmails
+		}
+		u, err := s.unifi.FetchUser(ctx, id)
+		if err != nil {
+			s.logger.Warn("UA-Hub FetchUser failed (leaving list row in place)",
+				"uaUserId", id, "error", err)
+		} else if u != nil && u.Email != "" {
+			row := &store.UAUser{
+				ID:        u.ID,
+				FirstName: u.FirstName,
+				LastName:  u.LastName,
+				Name:      u.Name,
+				Email:     u.Email,
+				Status:    u.Status,
+			}
+			if err := s.store.UpsertUAUser(ctx, row, u.NfcTokens); err != nil {
+				s.logger.Warn("UA-Hub mirror hydrate upsert failed",
+					"uaUserId", id, "error", err)
+			} else {
+				hydrated++
+			}
+		}
+		// Pause between calls so we don't pin UA-Hub's CPU.
+		if hydrateInterval > 0 && i+1 < len(needHydrate) {
+			select {
+			case <-ctx.Done():
+				return upserted, hydrated, listEmails
+			case <-time.After(hydrateInterval):
+			}
+		}
+	}
+	return upserted, hydrated, listEmails
 }
 
 // Stats is the summary a handler can show the operator after a manual
 // refresh. Kept flat so the SyncStat list renders cleanly.
+//
+// Hydrated and Rechecked track work that happens as side-effects of
+// the refresh: Hydrated is the number of mirror rows backfilled via
+// per-user FetchUser because the paginated list omitted their email,
+// Rechecked is the number of pending match rows promoted to a
+// confirmed mapping after a hydrated email landed a single Redpoint
+// customer.
 type Stats struct {
 	Observed    int
 	Upserted    int
+	Hydrated    int
+	Rechecked   int
 	MirrorTotal int
 	Duration    time.Duration
 }
@@ -184,27 +260,37 @@ func (s *Syncer) RefreshWithStats(ctx context.Context) (Stats, error) {
 	if err != nil {
 		return Stats{}, fmt.Errorf("ListAllUsersWithStatus: %w", err)
 	}
-	upserted := 0
-	for _, u := range users {
-		row := &store.UAUser{
-			ID:        u.ID,
-			FirstName: u.FirstName,
-			LastName:  u.LastName,
-			Name:      u.Name,
-			Email:     u.Email,
-			Status:    u.Status,
+
+	upserted, hydrated, listEmails := s.upsertAndHydrate(ctx, users)
+
+	rechecked := 0
+	if hydrated > 0 {
+		// Only run the recheck pass when hydration turned up new
+		// emails — if the list already had every email we had, no
+		// pending row would have new information to resolve.
+		n, err := s.recheckPending(ctx)
+		if err != nil {
+			s.logger.Warn("pending-mapping recheck failed (continuing)",
+				"error", err)
 		}
-		if err := s.store.UpsertUAUser(ctx, row, u.NfcTokens); err != nil {
-			s.logger.Warn("UA-Hub mirror upsert failed",
-				"uaUserId", u.ID, "error", err)
-			continue
-		}
-		upserted++
+		rechecked = n
 	}
+
 	total, _ := s.store.UAUserCount(ctx)
+	s.logger.Info("UA-Hub directory mirror refresh complete",
+		"observed", len(users),
+		"upserted", upserted,
+		"listEmails", listEmails,
+		"hydrated", hydrated,
+		"rechecked", rechecked,
+		"mirrorTotal", total,
+		"duration", time.Since(started).Round(time.Millisecond))
+
 	return Stats{
 		Observed:    len(users),
 		Upserted:    upserted,
+		Hydrated:    hydrated,
+		Rechecked:   rechecked,
 		MirrorTotal: total,
 		Duration:    time.Since(started).Round(100 * time.Millisecond),
 	}, nil
