@@ -136,6 +136,80 @@ func TestMappingDelete(t *testing.T) {
 	}
 }
 
+func TestGetMemberByUAUserID(t *testing.T) {
+	// Validates the v0.5.3 tap-resolution path:
+	//   event.ActorID → ua_user_mappings.ua_user_id
+	//                 → redpoint_customer_id
+	//                 → members.customer_id  → *Member
+	// Both tables live in different SQLite files (audit.db vs cache.db via
+	// ATTACH), so this doubles as coverage that the cross-DB join is wired
+	// correctly at Open().
+	s := testStore(t)
+	ctx := context.Background()
+
+	// Seed a mapping (audit.db).
+	if err := s.UpsertMapping(ctx, &Mapping{
+		UAUserID:         "ua-user-42",
+		RedpointCustomer: "rp-cust-42",
+		MatchedBy:        "auto:email",
+	}); err != nil {
+		t.Fatalf("UpsertMapping: %v", err)
+	}
+
+	// Seed the matching member (cache.db). The NFC UID is a 64-char
+	// hash-shaped string — deliberately *not* something the tap event
+	// could ever carry — so any accidental fallthrough to the nfc_uid
+	// lookup branch would leave member == nil.
+	if err := s.UpsertMember(ctx, &Member{
+		NfcUID:      strings.Repeat("A", 64),
+		CustomerID:  "rp-cust-42",
+		FirstName:   "Alice",
+		LastName:    "Mapping",
+		BadgeStatus: "ACTIVE",
+		Active:      true,
+	}); err != nil {
+		t.Fatalf("UpsertMember: %v", err)
+	}
+
+	// Happy path: resolves through the join.
+	got, err := s.GetMemberByUAUserID(ctx, "ua-user-42")
+	if err != nil {
+		t.Fatalf("GetMemberByUAUserID: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetMemberByUAUserID returned nil for mapped user")
+	}
+	if got.CustomerID != "rp-cust-42" {
+		t.Errorf("CustomerID = %q, want rp-cust-42", got.CustomerID)
+	}
+	if got.FullName() != "Alice Mapping" {
+		t.Errorf("FullName = %q, want Alice Mapping", got.FullName())
+	}
+
+	// No mapping for this UA user — must be (nil, nil).
+	nope, err := s.GetMemberByUAUserID(ctx, "ua-user-unknown")
+	if err != nil || nope != nil {
+		t.Errorf("missing UA user: (%v, %v), want (nil, nil)", nope, err)
+	}
+
+	// Mapping exists but member row hasn't landed yet (sync-lag corner).
+	if err := s.UpsertMapping(ctx, &Mapping{
+		UAUserID: "ua-user-orphan", RedpointCustomer: "rp-cust-missing", MatchedBy: "auto:email",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	orphan, err := s.GetMemberByUAUserID(ctx, "ua-user-orphan")
+	if err != nil || orphan != nil {
+		t.Errorf("orphan mapping: (%v, %v), want (nil, nil)", orphan, err)
+	}
+
+	// Empty input short-circuits — must not scan the table.
+	empty, err := s.GetMemberByUAUserID(ctx, "")
+	if err != nil || empty != nil {
+		t.Errorf("empty uaUserID: (%v, %v), want (nil, nil)", empty, err)
+	}
+}
+
 func TestPendingLifecycle(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()

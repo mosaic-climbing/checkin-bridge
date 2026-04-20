@@ -209,55 +209,107 @@ func (h *Handler) HandleEvent(ctx context.Context, event unifi.AccessEvent) {
 		return
 	}
 
-	h.logger.Info("── NFC tap ──", "credential", event.CredentialID, "door", event.DoorName)
+	h.logger.Info("── NFC tap ──",
+		"credential", event.CredentialID,
+		"actorId", event.ActorID,
+		"door", event.DoorName,
+	)
 
 	// ── FAST PATH: all local, no network ─────────────────────
 
-	// Step 1: Resolve card UID → nfcUID (via card mapper overrides or passthrough).
-	// If there's a manual override, Resolve returns the mapped customer ID.
-	// Otherwise it returns the tag UID itself (used as nfcUID in store).
+	// Step 1: Resolve the tap to a member row.
+	//
+	// Lookup order:
+	//
+	//   (1) event.ActorID → ua_user_mappings → members.customer_id
+	//       Primary path for firmware that hashes NFC tokens server-side
+	//       (UA-Hub 1.x): the WebSocket event carries the UA-Hub user_id
+	//       in actor.id, and we stored that id verbatim in ua_users /
+	//       ua_user_mappings during ingest. The card UID itself is
+	//       irrelevant for this branch.
+	//
+	//   (2) cardMapper.HasOverride(CredentialID) → explicit customer_id
+	//       Manual override table (data/card_overrides.json). Empty in
+	//       production today; kept so staff can still pin a loaner tag
+	//       to a specific customer without waiting on the daily sync.
+	//
+	//   (3) GetMemberByNFC(CredentialID)
+	//       Legacy / raw-UID path. Never matches on hashed-token firmware,
+	//       but the code path is kept so (a) older firmware that exposes
+	//       the raw UID in credentialId continues to work, and (b) the
+	//       checkin unit tests — which use plain-text nfc_uid values —
+	//       don't require a full mappings harness.
+	//
+	// Any branch that returns a real error (not sql.ErrNoRows) aborts the
+	// tap with "lookup_error". A miss in one branch falls through to the
+	// next; exhausting all branches records a "not_found" denial.
 	lookupKey := h.cardMapper.Resolve(event.CredentialID)
 	hasOverride := h.cardMapper.HasOverride(event.CredentialID)
 
-	// Step 2: Look up in store.
-	// If the card mapper returned an override (customer ID), try by customer ID.
-	// Otherwise, look up by NFC UID (the tag UID itself).
 	var member *store.Member
 	var err error
+	var matchedBy string
 
-	if hasOverride {
-		// Override maps tag → customer ID, so look up by customer ID
+	// (1) Actor-id primary path.
+	if event.ActorID != "" {
+		member, err = h.store.GetMemberByUAUserID(ctx, event.ActorID)
+		if err != nil {
+			h.logger.Error("store lookup by actor id failed",
+				"actorId", event.ActorID, "error", err)
+			h.recordDeniedEvent(ctx, event, "lookup_error", "Database lookup failed")
+			h.incErrors()
+			return
+		}
+		if member != nil {
+			matchedBy = "actor_id"
+		}
+	}
+
+	// (2) Card-override fallback.
+	if member == nil && hasOverride {
 		member, err = h.store.GetMemberByCustomerID(ctx, lookupKey)
 		if err != nil {
-			h.logger.Error("store lookup by customer ID failed", "lookupKey", lookupKey, "error", err)
+			h.logger.Error("store lookup by customer ID failed",
+				"lookupKey", lookupKey, "error", err)
 			h.recordDeniedEvent(ctx, event, "lookup_error", "Database lookup failed")
 			h.incErrors()
 			return
 		}
 		if member == nil {
-			// Also try as NFC UID in case the override value is an NFC UID
+			// Override value might itself be an NFC UID (legacy override shape).
 			member, err = h.store.GetMemberByNFC(ctx, lookupKey)
 			if err != nil {
-				h.logger.Error("store lookup by NFC failed", "lookupKey", lookupKey, "error", err)
+				h.logger.Error("store lookup by NFC (override) failed",
+					"lookupKey", lookupKey, "error", err)
 				h.recordDeniedEvent(ctx, event, "lookup_error", "Database lookup failed")
 				h.incErrors()
 				return
 			}
 		}
-	} else {
-		// No override: the tag UID is the lookup key (NFC UID)
+		if member != nil {
+			matchedBy = "override"
+		}
+	}
+
+	// (3) Raw nfc_uid fallback.
+	if member == nil && !hasOverride {
 		member, err = h.store.GetMemberByNFC(ctx, lookupKey)
 		if err != nil {
-			h.logger.Error("store lookup by NFC failed", "lookupKey", lookupKey, "error", err)
+			h.logger.Error("store lookup by NFC failed",
+				"lookupKey", lookupKey, "error", err)
 			h.recordDeniedEvent(ctx, event, "lookup_error", "Database lookup failed")
 			h.incErrors()
 			return
+		}
+		if member != nil {
+			matchedBy = "nfc_uid"
 		}
 	}
 
 	if member == nil {
 		h.logger.Warn("DENIED: not in store",
 			"credential", event.CredentialID,
+			"actorId", event.ActorID,
 			"lookupKey", lookupKey,
 			"hasOverride", hasOverride,
 		)
@@ -265,6 +317,12 @@ func (h *Handler) HandleEvent(ctx context.Context, event unifi.AccessEvent) {
 		h.incDenied()
 		return
 	}
+
+	h.logger.Debug("member resolved",
+		"matchedBy", matchedBy,
+		"customerId", member.CustomerID,
+		"actorId", event.ActorID,
+	)
 
 	// Step 3: Evaluate door policy for access control
 	var policy *store.DoorPolicy
