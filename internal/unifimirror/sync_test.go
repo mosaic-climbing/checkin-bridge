@@ -59,12 +59,19 @@ func openStore(t *testing.T) *store.Store {
 // test distinguish "Run didn't tick" from "Run ticked but upstream
 // was idempotent".
 //
-// calls is atomic because the Run-lifecycle tests read it from the
-// test goroutine while the Syncer goroutine writes to it.
+// fetchOverrides keys on UA user ID and returns a richer per-user
+// payload than the list endpoint produced — used by hydrate tests to
+// model UA-Hub's "list omits email but per-user GET returns it" shape.
+//
+// calls/fetchCalls are atomic because the Run-lifecycle tests read
+// them from the test goroutine while the Syncer goroutine writes.
 type fakeUnifi struct {
-	users []unifi.UniFiUser
-	err   error
-	calls atomic.Int32
+	users          []unifi.UniFiUser
+	err            error
+	calls          atomic.Int32
+	fetchOverrides map[string]unifi.UniFiUser
+	fetchErrs      map[string]error
+	fetchCalls     atomic.Int32
 }
 
 func (f *fakeUnifi) ListAllUsersWithStatus(ctx context.Context) ([]unifi.UniFiUser, error) {
@@ -77,6 +84,29 @@ func (f *fakeUnifi) ListAllUsersWithStatus(ctx context.Context) ([]unifi.UniFiUs
 	out := make([]unifi.UniFiUser, len(f.users))
 	copy(out, f.users)
 	return out, nil
+}
+
+// FetchUser models the per-user GET /users/{id} endpoint. The bridge
+// uses it to hydrate emails the paginated list endpoint omits — see
+// the package doc comment for the LEF shape that motivated this seam.
+func (f *fakeUnifi) FetchUser(ctx context.Context, userID string) (*unifi.UniFiUser, error) {
+	f.fetchCalls.Add(1)
+	if err, ok := f.fetchErrs[userID]; ok {
+		return nil, err
+	}
+	if u, ok := f.fetchOverrides[userID]; ok {
+		out := u
+		return &out, nil
+	}
+	// Fall back to the list payload (faithful: a per-user GET would
+	// at minimum return the same fields the list returned).
+	for _, u := range f.users {
+		if u.ID == userID {
+			out := u
+			return &out, nil
+		}
+	}
+	return nil, nil
 }
 
 // ─── Happy-path refresh ─────────────────────────────────────────
@@ -267,6 +297,274 @@ func TestRun_InitialRefreshFailure_StillStartsTicker(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not unblock on ctx cancel within 2s")
+	}
+}
+
+// ─── Hydrate + recheck (v0.5.5) ──────────────────────────────────
+
+// withZeroHydrateInterval temporarily drops the per-user hydrate pause
+// to zero so tests don't sleep. Restores the previous value via
+// t.Cleanup so a failing test can't leak the override to its siblings.
+func withZeroHydrateInterval(t *testing.T) {
+	t.Helper()
+	prev := hydrateInterval
+	hydrateInterval = 0
+	t.Cleanup(func() { hydrateInterval = prev })
+}
+
+// TestRefresh_HydratesBlankEmailUsers exercises the v0.5.5 fix for LEF:
+// the paginated list returns every user but omits email for the vast
+// majority. Refresh must notice blank-email rows and call FetchUser to
+// backfill them so the downstream email matcher has something to work
+// with.
+//
+// Happy path: two users come back from the list with blank emails, both
+// yield populated emails via FetchUser, and the mirror rows reflect the
+// hydrated values. Stats.Hydrated counts the backfills; Stats.Upserted
+// counts total writes (list + hydrate — both land on the same row, so
+// we check Hydrated separately).
+func TestRefresh_HydratesBlankEmailUsers(t *testing.T) {
+	withZeroHydrateInterval(t)
+	s := openStore(t)
+	up := &fakeUnifi{
+		users: []unifi.UniFiUser{
+			// No email: list-endpoint shape at LEF for most rows.
+			{ID: "ua-1", FirstName: "Alex", LastName: "Honnold", Status: "active"},
+			{ID: "ua-2", FirstName: "Lynn", LastName: "Hill", Status: "active"},
+		},
+		fetchOverrides: map[string]unifi.UniFiUser{
+			"ua-1": {ID: "ua-1", FirstName: "Alex", LastName: "Honnold",
+				Email: "alex@example.com", Status: "active"},
+			"ua-2": {ID: "ua-2", FirstName: "Lynn", LastName: "Hill",
+				Email: "lynn@example.com", Status: "active"},
+		},
+	}
+	syn := New(up, s, SyncConfig{Interval: time.Hour}, quietLogger())
+
+	stats, err := syn.RefreshWithStats(context.Background())
+	if err != nil {
+		t.Fatalf("RefreshWithStats: %v", err)
+	}
+	if stats.Hydrated != 2 {
+		t.Errorf("Stats.Hydrated = %d, want 2", stats.Hydrated)
+	}
+	if n := up.fetchCalls.Load(); n != 2 {
+		t.Errorf("FetchUser calls = %d, want 2", n)
+	}
+
+	ctx := context.Background()
+	for _, tc := range []struct {
+		id, wantEmail string
+	}{
+		{"ua-1", "alex@example.com"},
+		{"ua-2", "lynn@example.com"},
+	} {
+		got, err := s.GetUAUser(ctx, tc.id)
+		if err != nil || got == nil {
+			t.Fatalf("GetUAUser %s: %+v err=%v", tc.id, got, err)
+		}
+		if got.Email != tc.wantEmail {
+			t.Errorf("%s email = %q, want %q", tc.id, got.Email, tc.wantEmail)
+		}
+	}
+}
+
+// TestRefresh_SkipsHydrateWhenListHasEmails pins the optimization: if
+// the paginated list already returned email for every user, FetchUser
+// must NOT be called. UA-Hub shapes vary by deployment; a bridge
+// running at a site where the list is rich shouldn't pay 1600 extra
+// HTTP round-trips per nightly refresh for nothing.
+func TestRefresh_SkipsHydrateWhenListHasEmails(t *testing.T) {
+	withZeroHydrateInterval(t)
+	s := openStore(t)
+	up := &fakeUnifi{users: []unifi.UniFiUser{
+		{ID: "ua-1", FirstName: "Alex", LastName: "Honnold",
+			Email: "alex@example.com", Status: "active"},
+	}}
+	syn := New(up, s, SyncConfig{Interval: time.Hour}, quietLogger())
+
+	stats, err := syn.RefreshWithStats(context.Background())
+	if err != nil {
+		t.Fatalf("RefreshWithStats: %v", err)
+	}
+	if stats.Hydrated != 0 {
+		t.Errorf("Stats.Hydrated = %d, want 0 (list already had emails)", stats.Hydrated)
+	}
+	if n := up.fetchCalls.Load(); n != 0 {
+		t.Errorf("FetchUser calls = %d, want 0 (no blank rows to hydrate)", n)
+	}
+}
+
+// TestRefresh_HydrateErrorDoesNotAbort — a failing FetchUser for one
+// user must log-and-continue, not poison the whole refresh. The
+// successful FetchUser for the other user still lands.
+func TestRefresh_HydrateErrorDoesNotAbort(t *testing.T) {
+	withZeroHydrateInterval(t)
+	s := openStore(t)
+	up := &fakeUnifi{
+		users: []unifi.UniFiUser{
+			{ID: "ua-1", FirstName: "Bad", LastName: "Row", Status: "active"},
+			{ID: "ua-2", FirstName: "Good", LastName: "Row", Status: "active"},
+		},
+		fetchErrs: map[string]error{"ua-1": errors.New("5xx from ua-hub")},
+		fetchOverrides: map[string]unifi.UniFiUser{
+			"ua-2": {ID: "ua-2", FirstName: "Good", LastName: "Row",
+				Email: "good@example.com", Status: "active"},
+		},
+	}
+	syn := New(up, s, SyncConfig{Interval: time.Hour}, quietLogger())
+
+	stats, err := syn.RefreshWithStats(context.Background())
+	if err != nil {
+		t.Fatalf("RefreshWithStats: %v", err)
+	}
+	if stats.Hydrated != 1 {
+		t.Errorf("Stats.Hydrated = %d, want 1 (one error, one success)", stats.Hydrated)
+	}
+	got, _ := s.GetUAUser(context.Background(), "ua-2")
+	if got == nil || got.Email != "good@example.com" {
+		t.Errorf("ua-2 email after hydrate = %+v, want good@example.com", got)
+	}
+	bad, _ := s.GetUAUser(context.Background(), "ua-1")
+	if bad == nil {
+		t.Fatal("ua-1 should still have a row from the list pass")
+	}
+	if bad.Email != "" {
+		t.Errorf("ua-1 email = %q, want empty (hydrate failed)", bad.Email)
+	}
+}
+
+// TestRefresh_RecheckPromotesSinglePendingHit exercises the round-trip
+// that motivated the whole v0.5.5 release: a pending row whose UA user
+// had no email lands a hydrated email, which in turn matches exactly
+// one customer in cache.customers, which in turn promotes the pending
+// row to a confirmed mapping with matched_by='auto:email:recheck'.
+func TestRefresh_RecheckPromotesSinglePendingHit(t *testing.T) {
+	withZeroHydrateInterval(t)
+	s := openStore(t)
+	ctx := context.Background()
+
+	// Seed Redpoint customer that the hydrated email will match.
+	if err := s.UpsertCustomer(ctx, &store.Customer{
+		RedpointID: "rp-1",
+		FirstName:  "Alex",
+		LastName:   "Honnold",
+		Email:      "alex@example.com",
+		Active:     true,
+	}); err != nil {
+		t.Fatalf("UpsertCustomer: %v", err)
+	}
+
+	// Seed pending row with a blank-email UA identity — matches the
+	// real-world shape where the matcher had nothing to work with at
+	// first observation.
+	if err := s.UpsertPending(ctx, &store.Pending{
+		UAUserID:   "ua-1",
+		Reason:     store.PendingReasonNoEmail,
+		GraceUntil: time.Now().Add(48 * time.Hour).UTC().Format(time.RFC3339),
+		UAName:     "Alex Honnold",
+	}); err != nil {
+		t.Fatalf("UpsertPending: %v", err)
+	}
+
+	up := &fakeUnifi{
+		users: []unifi.UniFiUser{
+			{ID: "ua-1", FirstName: "Alex", LastName: "Honnold", Status: "active"},
+		},
+		fetchOverrides: map[string]unifi.UniFiUser{
+			"ua-1": {ID: "ua-1", FirstName: "Alex", LastName: "Honnold",
+				Email: "alex@example.com", Status: "active"},
+		},
+	}
+	syn := New(up, s, SyncConfig{Interval: time.Hour}, quietLogger())
+
+	stats, err := syn.RefreshWithStats(ctx)
+	if err != nil {
+		t.Fatalf("RefreshWithStats: %v", err)
+	}
+	if stats.Hydrated != 1 {
+		t.Errorf("Hydrated = %d, want 1", stats.Hydrated)
+	}
+	if stats.Rechecked != 1 {
+		t.Errorf("Rechecked = %d, want 1", stats.Rechecked)
+	}
+
+	// The pending row should be gone…
+	p, _ := s.GetPending(ctx, "ua-1")
+	if p != nil {
+		t.Errorf("pending row still present after recheck: %+v", p)
+	}
+	// …and the mapping should be installed with the recheck label.
+	m, err := s.GetMapping(ctx, "ua-1")
+	if err != nil || m == nil {
+		t.Fatalf("GetMapping ua-1 after recheck: %+v err=%v", m, err)
+	}
+	if m.RedpointCustomer != "rp-1" {
+		t.Errorf("mapping.redpoint_customer_id = %q, want rp-1", m.RedpointCustomer)
+	}
+	if m.MatchedBy != "auto:email:recheck" {
+		t.Errorf("mapping.matched_by = %q, want auto:email:recheck", m.MatchedBy)
+	}
+}
+
+// TestRefresh_RecheckLeavesAmbiguousPending is the safety counterpart:
+// if the hydrated email matches two customers (household collision),
+// the recheck path must NOT guess. The pending row stays, the mapping
+// stays missing, and Stats.Rechecked reports zero.
+func TestRefresh_RecheckLeavesAmbiguousPending(t *testing.T) {
+	withZeroHydrateInterval(t)
+	s := openStore(t)
+	ctx := context.Background()
+
+	// Two customers with the same email — the classic parent/child
+	// household-collision shape the statusync email+name path handles.
+	// The recheck pass is deliberately narrower and must leave this
+	// for staff.
+	for _, rp := range []store.Customer{
+		{RedpointID: "rp-1", FirstName: "Parent", LastName: "Smith", Email: "smith@example.com", Active: true},
+		{RedpointID: "rp-2", FirstName: "Child", LastName: "Smith", Email: "smith@example.com", Active: true},
+	} {
+		if err := s.UpsertCustomer(ctx, &rp); err != nil {
+			t.Fatalf("UpsertCustomer %s: %v", rp.RedpointID, err)
+		}
+	}
+	if err := s.UpsertPending(ctx, &store.Pending{
+		UAUserID:   "ua-smith",
+		Reason:     store.PendingReasonNoEmail,
+		GraceUntil: time.Now().Add(48 * time.Hour).UTC().Format(time.RFC3339),
+		UAName:     "Child Smith",
+	}); err != nil {
+		t.Fatalf("UpsertPending: %v", err)
+	}
+
+	up := &fakeUnifi{
+		users: []unifi.UniFiUser{
+			{ID: "ua-smith", FirstName: "Child", LastName: "Smith", Status: "active"},
+		},
+		fetchOverrides: map[string]unifi.UniFiUser{
+			"ua-smith": {ID: "ua-smith", FirstName: "Child", LastName: "Smith",
+				Email: "smith@example.com", Status: "active"},
+		},
+	}
+	syn := New(up, s, SyncConfig{Interval: time.Hour}, quietLogger())
+
+	stats, err := syn.RefreshWithStats(ctx)
+	if err != nil {
+		t.Fatalf("RefreshWithStats: %v", err)
+	}
+	if stats.Rechecked != 0 {
+		t.Errorf("Rechecked = %d, want 0 (ambiguous: 2 customers share email)", stats.Rechecked)
+	}
+
+	// Pending row intact…
+	p, err := s.GetPending(ctx, "ua-smith")
+	if err != nil || p == nil {
+		t.Fatalf("pending row missing: %+v err=%v", p, err)
+	}
+	// …no mapping installed.
+	m, _ := s.GetMapping(ctx, "ua-smith")
+	if m != nil {
+		t.Errorf("mapping should not exist for ambiguous case, got %+v", m)
 	}
 }
 

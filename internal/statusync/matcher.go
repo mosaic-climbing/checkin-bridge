@@ -23,6 +23,14 @@ const (
 	// MatchSourceName: UA user had no email (or zero email hits) and the
 	// name-only scan returned exactly one Redpoint customer.
 	MatchSourceName = "auto:name"
+	// MatchSourceEmailRecheck: email match resolved by the mirror-refresh
+	// recheck pass — the UA-Hub user's email was missing from the
+	// paginated list and only landed in ua_users after a per-user
+	// FetchUser hydration pass, which retroactively lets an
+	// already-pending row find its single Redpoint customer. Same
+	// confidence as MatchSourceEmail; the distinction exists so audits
+	// can count how much work the recheck path is saving staff.
+	MatchSourceEmailRecheck = "auto:email:recheck"
 	// MatchSourceBridgeSync: source label for status/email writebacks
 	// the bridge performs on an existing mapping (non-match audit rows).
 	MatchSourceBridgeSync = "bridge:sync"

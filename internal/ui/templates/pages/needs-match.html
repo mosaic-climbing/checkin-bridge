@@ -3,6 +3,20 @@
     <p>UA-Hub users the bridge couldn't auto-bind to a Redpoint customer. Each row is a pending ticket that will default-deactivate when its grace window closes. Pick a Redpoint customer to match, skip (deactivate now), or defer (extend grace).</p>
 </div>
 
+<!--
+  Detail-panel sink. Row clicks set this as hx-target and request
+  /ui/frag/unmatched/{uaUserID}/detail. The fragment handles its own
+  action buttons (match / skip / defer) and swaps itself back into
+  place on any mutation.
+
+  Placed ABOVE the 345-row list and made sticky so the detail panel
+  is visible without scrolling after an Open click — the earlier
+  show:top fix scrolled the bottom of the panel into view but left
+  the header and actions below the fold.
+-->
+<div id="needs-match-detail"
+     style="position: sticky; top: 0; z-index: 10; background: var(--card-bg, #fff); margin-bottom: 16px"></div>
+
 <div class="card">
     <div id="needs-match-list"
          hx-get="/ui/frag/unmatched-list"
@@ -12,11 +26,3 @@
         <p style="color: var(--text-muted)">Loading unmatched users…</p>
     </div>
 </div>
-
-<!--
-  Detail-panel sink. Row clicks set this as hx-target and request
-  /ui/frag/unmatched/{uaUserID}/detail. The fragment handles its own
-  action buttons (match / skip / defer) and swaps itself back into
-  place on any mutation.
--->
-<div id="needs-match-detail" style="margin-top: 16px"></div>
