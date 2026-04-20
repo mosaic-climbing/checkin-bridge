@@ -568,6 +568,113 @@ func TestRefresh_RecheckLeavesAmbiguousPending(t *testing.T) {
 	}
 }
 
+// TestRefresh_RecheckRunsWhenListDeliversEmail is the v0.5.7 regression
+// pin: emails arriving via the LIST endpoint (e.g. after the v0.5.6
+// `user_email` parser fix) must trigger a recheck pass and promote the
+// matching pending row, even though the per-user FetchUser hydrate
+// counter is zero.
+//
+// At LEF this is the Ainsley Rae Lightcap shape: parser fix moved her
+// email from the unread `user_email` field into ua_users.email via the
+// LIST response, but v0.5.5's `if hydrated > 0` gate suppressed the
+// recheck pass because no per-user FetchUser had landed an email. Her
+// pending row stayed stuck even though her email was now a single-hit
+// match against cache.customers.
+//
+// Asserting Hydrated=0 + Rechecked=1 in one test pins both the
+// upstream condition and the downstream behavior.
+func TestRefresh_RecheckRunsWhenListDeliversEmail(t *testing.T) {
+	withZeroHydrateInterval(t)
+	s := openStore(t)
+	ctx := context.Background()
+
+	// Single-hit Redpoint customer for the LIST-delivered email.
+	if err := s.UpsertCustomer(ctx, &store.Customer{
+		RedpointID: "rp-1",
+		FirstName:  "Ainsley Rae",
+		LastName:   "Lightcap",
+		Email:      "ainsley@example.com",
+		Active:     true,
+	}); err != nil {
+		t.Fatalf("UpsertCustomer: %v", err)
+	}
+	// Pending row: matcher gave up because the original observation had
+	// no email to work with.
+	if err := s.UpsertPending(ctx, &store.Pending{
+		UAUserID:   "ua-1",
+		Reason:     store.PendingReasonNoEmail,
+		GraceUntil: time.Now().Add(48 * time.Hour).UTC().Format(time.RFC3339),
+		UAName:     "Ainsley Rae Lightcap",
+	}); err != nil {
+		t.Fatalf("UpsertPending: %v", err)
+	}
+
+	// LIST returns the user with email already populated — no
+	// fetchOverrides, so FetchUser would be a no-op anyway.
+	up := &fakeUnifi{
+		users: []unifi.UniFiUser{
+			{ID: "ua-1", FirstName: "Ainsley Rae", LastName: "Lightcap",
+				Email: "ainsley@example.com", Status: "active"},
+		},
+	}
+	syn := New(up, s, SyncConfig{Interval: time.Hour}, quietLogger())
+
+	stats, err := syn.RefreshWithStats(ctx)
+	if err != nil {
+		t.Fatalf("RefreshWithStats: %v", err)
+	}
+	// Hydrated must be zero — the email came via LIST, not per-user
+	// FetchUser. This is the upstream condition that v0.5.5's gate got
+	// wrong; pin it so a future "optimization" doesn't re-introduce
+	// the gate by accident.
+	if stats.Hydrated != 0 {
+		t.Errorf("Hydrated = %d, want 0 (email arrived via LIST)", stats.Hydrated)
+	}
+	if n := up.fetchCalls.Load(); n != 0 {
+		t.Errorf("FetchUser calls = %d, want 0 (LIST already had email)", n)
+	}
+	// Recheck must still run and promote the row.
+	if stats.Rechecked != 1 {
+		t.Errorf("Rechecked = %d, want 1 (LIST email landed a single hit)", stats.Rechecked)
+	}
+	if p, _ := s.GetPending(ctx, "ua-1"); p != nil {
+		t.Errorf("pending row should be gone after recheck: %+v", p)
+	}
+	m, err := s.GetMapping(ctx, "ua-1")
+	if err != nil || m == nil {
+		t.Fatalf("GetMapping ua-1 after recheck: %+v err=%v", m, err)
+	}
+	if m.RedpointCustomer != "rp-1" {
+		t.Errorf("mapping.redpoint_customer_id = %q, want rp-1", m.RedpointCustomer)
+	}
+	if m.MatchedBy != "auto:email:recheck" {
+		t.Errorf("mapping.matched_by = %q, want auto:email:recheck", m.MatchedBy)
+	}
+}
+
+// TestRefresh_RecheckIsNoOpWithNoMatches verifies the always-on recheck
+// pass is safe when there's nothing to promote: zero Rechecked count,
+// no errors, no spurious mappings. This is the path most refreshes
+// will take in steady state — running `recheckPending` on every
+// refresh has to be cheap and side-effect-free when there's no work.
+func TestRefresh_RecheckIsNoOpWithNoMatches(t *testing.T) {
+	withZeroHydrateInterval(t)
+	s := openStore(t)
+
+	up := &fakeUnifi{users: []unifi.UniFiUser{
+		{ID: "ua-1", FirstName: "Solo", Email: "solo@example.com", Status: "active"},
+	}}
+	syn := New(up, s, SyncConfig{Interval: time.Hour}, quietLogger())
+
+	stats, err := syn.RefreshWithStats(context.Background())
+	if err != nil {
+		t.Fatalf("RefreshWithStats: %v", err)
+	}
+	if stats.Rechecked != 0 {
+		t.Errorf("Rechecked = %d, want 0 (no pending rows to promote)", stats.Rechecked)
+	}
+}
+
 // TestNew_ZeroIntervalDefaults pins the defensive default in New:
 // a caller that forgets to set SyncConfig.Interval must not get a
 // hot-looping ticker. We verify by constructing with the zero-value
