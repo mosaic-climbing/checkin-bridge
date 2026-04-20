@@ -122,6 +122,95 @@ func TestParseUniFiUser_CredentialCardId(t *testing.T) {
 	}
 }
 
+// UA-Hub returns the operator-entered address in `user_email`, not `email`.
+// Verified empirically against /users/{id}: 1613/1618 users at LEF have
+// email="" and user_email populated. parseUniFiUser must prefer user_email
+// and fall back to email so neither data shape regresses.
+func TestParseUniFiUser_EmailFieldPreference(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+		want string
+	}{
+		{
+			name: "user_email populated, email blank (UA-Hub default)",
+			json: `{"id":"u1","user_email":"real@example.com","email":""}`,
+			want: "real@example.com",
+		},
+		{
+			name: "email populated, user_email blank (legacy shape)",
+			json: `{"id":"u2","user_email":"","email":"legacy@example.com"}`,
+			want: "legacy@example.com",
+		},
+		{
+			name: "both populated — user_email wins",
+			json: `{"id":"u3","user_email":"real@example.com","email":"verify@example.com"}`,
+			want: "real@example.com",
+		},
+		{
+			name: "neither populated",
+			json: `{"id":"u4"}`,
+			want: "",
+		},
+		{
+			name: "user_email missing entirely, email populated",
+			json: `{"id":"u5","email":"fallback@example.com"}`,
+			want: "fallback@example.com",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseUniFiUser(json.RawMessage(tc.json)).Email
+			if got != tc.want {
+				t.Errorf("Email = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Regression test against the exact UA-Hub /users/{id} response shape observed
+// in production (v0.5.5 postmortem, Ainsley Rae Lightcap record). If this
+// shape changes, we want to know.
+func TestParseUniFiUser_UAHubSingleUserShape(t *testing.T) {
+	raw := json.RawMessage(`{
+		"alias": "",
+		"avatar_relative_path": "",
+		"email": "",
+		"email_status": "UNVERIFIED",
+		"employee_number": "",
+		"first_name": "Ainsley Rae",
+		"full_name": "Ainsley Rae Lightcap",
+		"id": "75538334-e4a4-4c0d-a32f-7eab2142fc23",
+		"last_name": "Lightcap",
+		"nfc_cards": [{"id": "101052", "token": "2b758eed54350ce4e0853456646d1385cf22a708df35387b31397201f9b01374", "type": "id_card"}],
+		"onboard_time": 0,
+		"phone": "",
+		"pin_code": null,
+		"status": "ACTIVE",
+		"touch_pass": null,
+		"user_email": "ainsleyraelightcap@gmail.com",
+		"username": ""
+	}`)
+
+	user := parseUniFiUser(raw)
+	if user.Email != "ainsleyraelightcap@gmail.com" {
+		t.Errorf("Email = %q, want ainsleyraelightcap@gmail.com", user.Email)
+	}
+	if user.ID != "75538334-e4a4-4c0d-a32f-7eab2142fc23" {
+		t.Errorf("ID = %q", user.ID)
+	}
+	if user.FirstName != "Ainsley Rae" || user.LastName != "Lightcap" {
+		t.Errorf("name = %q / %q", user.FirstName, user.LastName)
+	}
+	if user.Status != "ACTIVE" {
+		t.Errorf("Status = %q", user.Status)
+	}
+	if len(user.NfcTokens) != 1 {
+		t.Errorf("NfcTokens count = %d, want 1", len(user.NfcTokens))
+	}
+}
+
 func TestParseUniFiUser_InvalidJSON(t *testing.T) {
 	raw := json.RawMessage(`not json`)
 	user := parseUniFiUser(raw)

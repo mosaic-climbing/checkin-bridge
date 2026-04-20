@@ -735,12 +735,23 @@ func parseUniFiUser(raw json.RawMessage) UniFiUser {
 		return UniFiUser{}
 	}
 
+	// UA-Hub stores the operator-entered address in `user_email`; the top-level
+	// `email` field is a separate verification-workflow slot that is blank for
+	// the vast majority of users (see v0.5.5 postmortem: empirically 1613/1618
+	// users at LEF have `email=""` but `user_email` populated). Prefer
+	// `user_email`, fall back to `email` so we don't regress the handful of
+	// users where it was populated the other way.
+	email := stringFromAny(obj["user_email"])
+	if email == "" {
+		email = stringFromAny(obj["email"])
+	}
+
 	user := UniFiUser{
 		ID:        stringFromAny(obj["id"]),
 		FirstName: stringFromAny(obj["first_name"]),
 		LastName:  stringFromAny(obj["last_name"]),
 		Name:      stringFromAny(obj["name"]),
-		Email:     stringFromAny(obj["email"]),
+		Email:     email,
 		Status:    stringFromAny(obj["status"]),
 	}
 

@@ -134,9 +134,19 @@ type Server struct {
 // cmd/bridge is a one-liner, but lives here so the api package
 // doesn't import unifimirror (keeping the dependency direction clean
 // and avoiding an import cycle when tests pass a fake refresher).
+//
+// Hydrated and Rechecked track side-effects of the refresh introduced
+// in v0.5.5: Hydrated is the count of mirror rows whose email came back
+// blank from the paginated list and was backfilled via a per-user
+// FetchUser; Rechecked is the count of pending-match rows that were
+// promoted to a confirmed mapping after a hydrated email landed a
+// single Redpoint customer. Surfaced here (and in the handler JSON)
+// so staff can tell at a glance whether hydration and recheck ran.
 type UAHubRefreshStats struct {
 	Observed    int
 	Upserted    int
+	Hydrated    int
+	Rechecked   int
 	MirrorTotal int
 	Duration    time.Duration
 }
@@ -858,6 +868,8 @@ func (s *Server) handleUAHubSync(w http.ResponseWriter, r *http.Request) {
 	s.finishSyncJob(r.Context(), jobID, map[string]any{
 		"observed":    stats.Observed,
 		"upserted":    stats.Upserted,
+		"hydrated":    stats.Hydrated,
+		"rechecked":   stats.Rechecked,
 		"mirrorTotal": stats.MirrorTotal,
 		"duration":    duration.String(),
 	}, nil)
@@ -868,6 +880,8 @@ func (s *Server) handleUAHubSync(w http.ResponseWriter, r *http.Request) {
 		[]ui.SyncStat{
 			{Label: "Observed", Value: fmt.Sprintf("%d", stats.Observed)},
 			{Label: "Upserted", Value: fmt.Sprintf("%d", stats.Upserted)},
+			{Label: "Hydrated", Value: fmt.Sprintf("%d", stats.Hydrated)},
+			{Label: "Rechecked", Value: fmt.Sprintf("%d", stats.Rechecked)},
 			{Label: "Mirror total", Value: fmt.Sprintf("%d", stats.MirrorTotal)},
 			{Label: "Duration", Value: duration.String()},
 		},
@@ -875,6 +889,8 @@ func (s *Server) handleUAHubSync(w http.ResponseWriter, r *http.Request) {
 			"success":     true,
 			"observed":    stats.Observed,
 			"upserted":    stats.Upserted,
+			"hydrated":    stats.Hydrated,
+			"rechecked":   stats.Rechecked,
 			"mirrorTotal": stats.MirrorTotal,
 		})
 }
