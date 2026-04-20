@@ -159,6 +159,44 @@ func (s *Store) AllMappings(ctx context.Context) ([]Mapping, error) {
 	return ms, err
 }
 
+// GetMemberByUAUserID resolves a UA-Hub user ID to a cache.db member row by
+// joining through the ua_user_mappings bridge table.
+//
+// This is the hot path for NFC tap resolution on UniFi firmware that hashes
+// NFC tokens server-side: the WebSocket access event delivers the UA-Hub
+// user id in actor.id, the directory ingest wrote the hashed token into
+// members.nfc_uid, and those two values can never match directly. Going
+// through ua_user_mappings → redpoint_customer_id → members.customer_id
+// gives us an exact, opaque-ID-based lookup that doesn't depend on the
+// raw card UID at all.
+//
+// Returns nil, nil when either (a) no mapping row exists for the UA-Hub
+// user (they're still in the pending bucket), or (b) a mapping exists but
+// the member row hasn't landed in cache.db yet (sync-lag corner case).
+// Callers should treat both as "unknown tap" and fall through to the
+// nfc_uid / card-override branches.
+//
+// Both tables are reachable from the primary *sqlx.DB because cache.db is
+// ATTACHed as `cache` at Open(); the unqualified `members` resolves to
+// `cache.members` through SQLite's name-resolution rules (audit.db has no
+// conflicting table of the same name).
+func (s *Store) GetMemberByUAUserID(ctx context.Context, uaUserID string) (*Member, error) {
+	if uaUserID == "" {
+		return nil, nil
+	}
+	var m Member
+	err := s.db.GetContext(ctx, &m, `
+        SELECT mem.*
+          FROM ua_user_mappings map
+          JOIN members mem ON mem.customer_id = map.redpoint_customer_id
+         WHERE map.ua_user_id = ?
+    `, uaUserID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return &m, err
+}
+
 // UpsertPending creates or updates a pending row. The first_seen column is
 // preserved on conflict so the grace-window ticker has an accurate "when
 // did we start waiting" anchor; last_seen, reason, grace_until, candidates,
