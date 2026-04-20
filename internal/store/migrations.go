@@ -233,8 +233,10 @@ COMMIT;
 // Bumped to 5 in v0.5.2 for the ua_name + ua_email columns on
 // ua_user_mappings_pending (auditMigration5_pending_ua_identity),
 // then to 6 in the same release for the ua_users directory mirror
-// (auditMigration6_ua_users).
-const auditSchemaVersion = 6
+// (auditMigration6_ua_users), then to 7 in v0.5.4 for the one-shot
+// backfill that heals pending rows persisted with blank identity
+// by v0.5.2/v0.5.3 (auditMigration7_pending_identity_backfill).
+const auditSchemaVersion = 7
 
 // auditSchemaVersionAtSplit pins the audit-side schema version that a
 // pre-A4 bridge.db already embodies at the moment of the legacy split
@@ -256,8 +258,11 @@ const auditSchemaVersionAtSplit = 3
 // row so the Needs Match page can render without a live UA-Hub
 // ListUsers walk (v0.5.2). Migration 6 creates ua_users, the
 // nightly UA-Hub directory mirror that parallels the Redpoint
-// customers mirror (v0.5.2). Migrations 1, 2, and 6 from the old
-// combined sequence are cache-side and not in this list.
+// customers mirror (v0.5.2). Migration 7 backfills the pending
+// rows migration 5 left blank when the matcher persisted records
+// before the ua_users mirror had observed them (v0.5.4).
+// Migrations 1, 2, and 6 from the old combined sequence are
+// cache-side and not in this list.
 var auditMigrations = []string{
 	auditMigration1_checkins,
 	auditMigration2_unifi_result,
@@ -265,6 +270,7 @@ var auditMigrations = []string{
 	auditMigration4_unifi_log_id,
 	auditMigration5_pending_ua_identity,
 	auditMigration6_ua_users,
+	auditMigration7_pending_identity_backfill,
 }
 
 // Migration 1 (audit): Check-in event log, door policies, background jobs.
@@ -469,6 +475,52 @@ CREATE INDEX IF NOT EXISTS idx_ua_users_name
     ON ua_users(lower(first_name), lower(last_name));
 CREATE INDEX IF NOT EXISTS idx_ua_users_status
     ON ua_users(status) WHERE status != '';
+`
+
+// Migration 7 (audit): backfill pending-row identity cache (v0.5.4).
+//
+// Migration 5 added ua_name/ua_email to ua_user_mappings_pending with a
+// default of '' so existing rows could upgrade cleanly, on the assumption
+// that the next statusync pass would refresh them via the UpsertPending
+// ON CONFLICT clause. That worked for rows already in the table at the
+// time migration 5 applied. It did NOT work for rows newly written by
+// the v0.5.2 statusync matcher when the UA-Hub ListAllUsersWithStatus
+// paginated response returned incomplete records (first_name /
+// last_name / email blank). persistDecision passed those blanks through
+// to UpsertPending verbatim; the next statusync pass observed the same
+// blanks from upstream, so the ON CONFLICT refresh never healed the
+// row. Production LEF accumulated 345 of 345 blank rows that rendered
+// "(no name) (no email)" on the Needs Match page — the bug this
+// migration corrects.
+//
+// The v0.5.4 UpsertPending gains a self-heal step that reads from
+// ua_users when the caller passes blanks, closing the source of new
+// bad rows. This migration repairs the rows already on disk.
+//
+// Safe to run against any audit.db that has both tables (migrations 5
+// and 6) applied — which is every install from v0.5.2 forward. The
+// WHERE clause ensures we only overwrite blanks, so rows that already
+// have good identity data (or that the v0.5.4 UpsertPending self-heal
+// has since populated) are left alone.
+const auditMigration7_pending_identity_backfill = `
+UPDATE ua_user_mappings_pending
+   SET ua_name = COALESCE((
+           SELECT CASE WHEN u.name       != '' THEN u.name
+                       WHEN u.first_name != '' AND u.last_name != '' THEN u.first_name || ' ' || u.last_name
+                       WHEN u.first_name != '' THEN u.first_name
+                       WHEN u.last_name  != '' THEN u.last_name
+                       ELSE ''
+                  END
+             FROM ua_users u WHERE u.id = ua_user_mappings_pending.ua_user_id
+       ), ua_name)
+ WHERE ua_name = '';
+
+UPDATE ua_user_mappings_pending
+   SET ua_email = COALESCE((
+           SELECT u.email FROM ua_users u
+            WHERE u.id = ua_user_mappings_pending.ua_user_id
+       ), ua_email)
+ WHERE ua_email = '';
 `
 
 // ─── Migration runners ──────────────────────────────────────────
