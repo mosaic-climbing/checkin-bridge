@@ -351,4 +351,141 @@ func TestNeedsMatchSearch_EmptyQuery(t *testing.T) {
 	if !strings.Contains(body, "Skip (deactivate now)") {
 		t.Errorf("skip button missing from empty-query panel; body = %q", body)
 	}
+	// v0.5.7 — the placeholder tells staff they can search by email too.
+	if !strings.Contains(body, "Search Redpoint by name or email") {
+		t.Errorf("updated placeholder should advertise email search; body = %q", body)
+	}
+}
+
+// TestNeedsMatchSearch_ByEmail_HitsLocalCache — the v0.5.7 fix: search
+// should resolve a customer out of cache.customers via FTS5 using an
+// email query. Previously this called the live Redpoint name-only
+// search, which had two failure modes: (1) no email path at all, so
+// staff who knew a member's email had to translate it to a name
+// guess; (2) flaky during Redpoint 429 storms (we saw this with the
+// tap-poller overload on Apr 20).
+//
+// Seeds the cache directly (bypassing FakeRedpoint) because the test
+// concern is "the handler goes to the local mirror", not "the mirror
+// was populated correctly earlier" — the latter is covered by
+// customers_fts_test.go.
+func TestNeedsMatchSearch_ByEmail_HitsLocalCache(t *testing.T) {
+	srv, db, _ := buildNeedsMatchTestServer(t)
+	ctx := context.Background()
+
+	// Two customers in the local mirror; only one matches the email.
+	for _, c := range []store.Customer{
+		{RedpointID: "rp-target", FirstName: "Ainsley", LastName: "Lightcap",
+			Email: "ainsley@example.com", Active: true},
+		{RedpointID: "rp-other", FirstName: "Someone", LastName: "Else",
+			Email: "else@example.com", Active: true},
+	} {
+		if err := db.UpsertCustomer(ctx, &c); err != nil {
+			t.Fatalf("UpsertCustomer %s: %v", c.RedpointID, err)
+		}
+	}
+	seedPending(t, db, "ua-search", store.PendingReasonNoMatch, "", 24*time.Hour)
+
+	form := strings.NewReader("q=ainsley@example.com")
+	req := httptest.NewRequest("POST", "/ui/frag/unmatched/ua-search/search", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %q", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "rp-target") {
+		t.Errorf("email search should surface the matching customer; body = %q", body)
+	}
+	if strings.Contains(body, "rp-other") {
+		t.Errorf("email search should not surface the non-matching customer; body = %q", body)
+	}
+	// The search box echoes the last query so the staff member keeps
+	// context after the fragment swap — pin it.
+	if !strings.Contains(body, `value="ainsley@example.com"`) {
+		t.Errorf("search box should echo the query; body = %q", body)
+	}
+}
+
+// TestNeedsMatchSearch_ByName_HitsLocalCache — companion to the email
+// test: verify the name path still works after the swap. This is the
+// "it doesn't always work" failure mode Chris reported — under the
+// old code, live Redpoint search with "Last, First" format missed for
+// single-token queries, hyphenated names, and during any upstream
+// flakiness. FTS5 prefix-AND handles all of these.
+func TestNeedsMatchSearch_ByName_HitsLocalCache(t *testing.T) {
+	srv, db, _ := buildNeedsMatchTestServer(t)
+	ctx := context.Background()
+
+	if err := db.UpsertCustomer(ctx, &store.Customer{
+		RedpointID: "rp-dana",
+		FirstName:  "Dana",
+		LastName:   "Skoglund-Jones", // hyphenated last: trips the old splitName + "Last, First" path
+		Email:      "dana@example.com",
+		Active:     true,
+	}); err != nil {
+		t.Fatalf("UpsertCustomer: %v", err)
+	}
+	seedPending(t, db, "ua-search", store.PendingReasonNoMatch, "", 24*time.Hour)
+
+	// Single-token first-name query — the old path sent this as
+	// "Last: , First: Dana" which missed on Redpoint's filter. FTS5
+	// prefix-AND over all indexed columns finds it.
+	form := strings.NewReader("q=dana")
+	req := httptest.NewRequest("POST", "/ui/frag/unmatched/ua-search/search", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %q", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "rp-dana") {
+		t.Errorf("single-token name search should hit; body = %q", w.Body.String())
+	}
+}
+
+// TestNeedsMatchSearch_PrefixAND verifies the multi-word query shape:
+// "dana skog" should AND both tokens as prefixes and still find
+// "Dana Skoglund-Jones". Guards against a regression where someone
+// "simplifies" the FTS query builder to an OR.
+func TestNeedsMatchSearch_PrefixAND(t *testing.T) {
+	srv, db, _ := buildNeedsMatchTestServer(t)
+	ctx := context.Background()
+
+	for _, c := range []store.Customer{
+		{RedpointID: "rp-dana", FirstName: "Dana", LastName: "Skoglund-Jones",
+			Email: "dana@example.com", Active: true},
+		{RedpointID: "rp-other-dana", FirstName: "Dana", LastName: "Carter",
+			Email: "carter@example.com", Active: true},
+	} {
+		if err := db.UpsertCustomer(ctx, &c); err != nil {
+			t.Fatalf("UpsertCustomer: %v", err)
+		}
+	}
+	seedPending(t, db, "ua-search", store.PendingReasonNoMatch, "", 24*time.Hour)
+
+	form := strings.NewReader("q=dana+skog")
+	req := httptest.NewRequest("POST", "/ui/frag/unmatched/ua-search/search", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "rp-dana") {
+		t.Errorf("prefix-AND should find Dana Skoglund-Jones on 'dana skog'; body = %q", body)
+	}
+	// The other Dana shouldn't show — her last name doesn't have the
+	// 'skog' prefix, so the AND excludes her.
+	if strings.Contains(body, "rp-other-dana") {
+		t.Errorf("prefix-AND should exclude the other Dana; body = %q", body)
+	}
 }

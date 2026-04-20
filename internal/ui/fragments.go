@@ -999,7 +999,7 @@ func NeedsMatchDetailFragment(
 		`<form hx-post="/ui/frag/unmatched/%s/search"`+
 			` hx-target="#needs-match-detail" hx-swap="innerHTML"`+
 			` hx-headers='{"X-Requested-With":"XMLHttpRequest"}' style="margin: 12px 0">`+
-			`<input type="text" name="q" value="%s" placeholder="Search Redpoint by name…" style="width: 60%%; margin-right: 8px">`+
+			`<input type="text" name="q" value="%s" placeholder="Search Redpoint by name or email…" style="width: 60%%; margin-right: 8px">`+
 			`<button class="btn btn-primary btn-sm" type="submit">Search</button>`+
 			`</form>`,
 		HTMLEscape(uaUserID), HTMLEscape(searchQuery),
