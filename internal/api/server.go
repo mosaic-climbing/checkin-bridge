@@ -2288,26 +2288,42 @@ func (s *Server) renderNeedsMatchDetail(w http.ResponseWriter, r *http.Request, 
 		}
 
 		if searchQuery != "" {
-			// Split "Jane Smith" → firstName="Jane", lastName="Smith".
-			firstName, lastName := splitName(searchQuery)
-			hits, err := s.redpoint.SearchCustomersByName(r.Context(), firstName, lastName)
+			// Hit the local Redpoint mirror (cache.customers) via FTS5
+			// rather than the live Redpoint client. Rationale:
+			//
+			//  - The live `redpoint.SearchCustomersByName` uses Redpoint's
+			//    "Last, First" search filter, which is finicky: hyphenated
+			//    names, single-token queries, and typos all miss. Chris
+			//    reported "it doesn't always work" — that's why.
+			//  - The FTS5 index already covers name, email, external_id,
+			//    and barcode in one table with prefix-AND semantics, so
+			//    one search box can accept "alice", "alice smith",
+			//    "alice@example.com", or "12345" and DTRT for each.
+			//  - It's also resilient to Redpoint outages and the 429
+			//    storms we've been seeing — the pending-match workflow
+			//    should not go dark just because upstream is wobbly.
+			//  - The mirror is refreshed on every cache sync, so
+			//    "customer in Redpoint but not in cache" is a window of
+			//    at most one sync interval; if staff hits that, they
+			//    can run a cache sync and retry.
+			hits, err := s.store.SearchCustomersFTS(r.Context(), searchQuery, 50)
 			if err != nil {
 				s.logger.Warn("needs-match search failed", "q", searchQuery, "error", err)
 			}
 			for _, cust := range hits {
-				if cust == nil || seen[cust.ID] {
+				if seen[cust.RedpointID] {
 					continue
 				}
 				candidates = append(candidates, ui.NeedsMatchCandidate{
-					RedpointCustomerID: cust.ID,
+					RedpointCustomerID: cust.RedpointID,
 					Name:               strings.TrimSpace(cust.FirstName + " " + cust.LastName),
 					Email:              cust.Email,
 					Active:             cust.Active,
-					BadgeName:          badgeNameFor(cust),
-					BadgeStatus:        badgeStatusFor(cust),
+					BadgeName:          cust.BadgeName,
+					BadgeStatus:        cust.BadgeStatus,
 					Reason:             "search",
 				})
-				seen[cust.ID] = true
+				seen[cust.RedpointID] = true
 			}
 		}
 	}
@@ -2480,21 +2496,6 @@ func splitCandidates(raw string) []string {
 		return nil
 	}
 	return strings.Split(raw, "|")
-}
-
-// splitName turns a free-text query like "Jane Smith" into (first, last).
-// If the query is one token, it's used as the first name and last is
-// empty — the Redpoint name-search client will match on either side.
-func splitName(q string) (first, last string) {
-	parts := strings.Fields(q)
-	switch len(parts) {
-	case 0:
-		return "", ""
-	case 1:
-		return parts[0], ""
-	default:
-		return parts[0], strings.Join(parts[1:], " ")
-	}
 }
 
 // badgeNameFor / badgeStatusFor pull badge info off the Redpoint customer
