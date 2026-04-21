@@ -96,10 +96,29 @@ func (s *Server) startSyncJob(ctx context.Context, jobType string) string {
 // text). On error, the message lands in jobs.error and the row is
 // marked failed. Both calls swallow errors — same observability-only
 // rationale as startSyncJob.
+//
+// The incoming ctx is detached before the DB write. Rationale:
+// sync refreshes routinely take 3–5 minutes (UA-Hub mirror walks
+// 1600+ users), which is long enough for HTMX and/or the browser to
+// give up on the POST and for the request context to be canceled.
+// If we passed r.Context() straight through, FailJob/CompleteJob
+// would inherit the cancellation and the SQLite UPDATE would
+// silently no-op — leaving jobs.status pinned at "running" forever
+// and the staff-facing "Last run" pill stuck on a non-existent
+// in-flight job. Using context.WithoutCancel preserves any values
+// (trace ids, request-scoped loggers) while severing the lifetime
+// link, and a short fresh deadline bounds the detached write.
+//
+// Observed at LEF on v0.5.7: three stale "running" rows accumulated
+// across two deploys, all while the actual mirror refresh completed
+// cleanly in ~4–5 min. See ops/v0.5.7.1-pr-body.md for the log
+// trace.
 func (s *Server) finishSyncJob(ctx context.Context, id string, result any, fnErr error) {
 	if s.store == nil {
 		return
 	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
 	if fnErr != nil {
 		if err := s.store.FailJob(ctx, id, fnErr.Error()); err != nil {
 			s.logger.Warn("finishSyncJob: FailJob failed",
@@ -180,7 +199,12 @@ func (s *Server) handleFragSyncLastRun(w http.ResponseWriter, r *http.Request) {
 		ui.RenderFragment(w, ui.SyncLastRunPill(jobType, "", "", ""))
 		return
 	}
-	ui.RenderFragment(w, ui.SyncLastRunPill(jobType, job.Status, job.CreatedAt, job.Error))
+	// v0.5.7.1: pass job.Progress through so the running pill can
+	// render a phase segment ("hydrating 450/1500") while the sync
+	// is in flight. For completed/failed pills the progress field
+	// is ignored by SyncLastRunPillFull — cheap enough to always
+	// pass through rather than branching here.
+	ui.RenderFragment(w, ui.SyncLastRunPillFull(jobType, job.Status, job.CreatedAt, job.Error, job.Progress))
 }
 
 // isKnownSyncJobType is the allowlist for the /ui/frag/sync-last-run
@@ -194,6 +218,118 @@ func isKnownSyncJobType(t string) bool {
 		return true
 	}
 	return false
+}
+
+// makeJobProgressFn returns a closure that updates jobs.progress for
+// the in-flight sync job. The returned func is safe to call from any
+// goroutine — it detaches the parent context so progress writes
+// survive HTMX/browser request abandonment (same lifetime concern
+// that drove the finishSyncJob ctx detachment above), and bounds
+// the SQLite UPDATE to a 5s deadline so a wedged store can't pin
+// the refresh goroutine.
+//
+// Errors are logged at debug and dropped: progress is observability
+// only and a mid-refresh write failure should not influence the
+// success/failure of the underlying sync. If you need the progress
+// write to be authoritative, use Store.UpdateJobProgress directly.
+//
+// A nil store yields a no-op closure rather than a nil func, so
+// callers can always pass the result to a downstream consumer
+// without a nil-check.
+func (s *Server) makeJobProgressFn(jobID string) func(phase string) {
+	if s.store == nil || jobID == "" {
+		return func(string) {}
+	}
+	return func(phase string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.store.UpdateJobProgress(ctx, jobID, phase); err != nil {
+			s.logger.Debug("makeJobProgressFn: UpdateJobProgress failed",
+				"id", jobID, "phase", phase, "error", err)
+		}
+	}
+}
+
+// handleSyncUnstick fails the most-recent running row of a given job
+// type so the staff /ui/sync page's pill clears out without staff
+// having to ssh to the host and run sqlite. Defensive against the
+// ctx-cancel bug that v0.5.7.1 fixes upstream — even after that fix
+// ships, a daemon restart mid-refresh can still leave a row in
+// 'running' forever, and operators need a one-click escape hatch.
+//
+// Idempotent: if there's no running row of that type, returns 204
+// (or the equivalent fragment) without writing. Always responds
+// with a fresh "Last run" pill via the same OOB mechanism the sync
+// handlers use, so the click visibly clears the stuck state.
+//
+// Route: POST /ui/sync/unstick/{type}. Registered in server.go's
+// routes() alongside the rest of /ui/frag/*.
+func (s *Server) handleSyncUnstick(w http.ResponseWriter, r *http.Request) {
+	jobType := r.PathValue("type")
+	if jobType == "" || !isKnownSyncJobType(jobType) {
+		// Same defensive posture as handleFragSyncLastRun: never
+		// let an unknown type string reach the store layer. A
+		// caller hitting /ui/sync/unstick/garbage gets the
+		// "never run" pill and a 200, not a 400 — the staff page
+		// shouldn't surface a debug-style error for a route the
+		// user can't construct from the UI.
+		ui.RenderFragment(w, ui.SyncLastRunPill(jobType, "", "", ""))
+		return
+	}
+	if s.store == nil {
+		ui.RenderFragment(w, ui.SyncLastRunPill(jobType, "", "", ""))
+		return
+	}
+	job, err := s.store.ActiveJob(r.Context(), jobType)
+	if err != nil {
+		s.logger.Warn("handleSyncUnstick: ActiveJob failed",
+			"type", jobType, "error", err)
+		ui.RenderFragment(w, ui.SyncLastRunPill(jobType, "failed",
+			time.Now().UTC().Format(time.RFC3339), "lookup failed"))
+		return
+	}
+	if job == nil {
+		// No running row to clear — render whatever the latest
+		// row is so the pill doesn't lie about state.
+		last, lerr := s.store.LastJobByType(r.Context(), jobType)
+		if lerr != nil || last == nil {
+			ui.RenderFragment(w, ui.SyncLastRunPill(jobType, "", "", ""))
+			return
+		}
+		ui.RenderFragment(w, ui.SyncLastRunPillFull(jobType, last.Status,
+			last.CreatedAt, last.Error, last.Progress))
+		return
+	}
+	// Mark the running row failed with a clear human-readable
+	// reason. Audit log captures the operator action for after-the-
+	// fact attribution; the FailJob write itself is the substantive
+	// state change.
+	const reason = "manually cleared via /ui/sync (running row stuck)"
+	s.audit.Log("sync_unstick", r.RemoteAddr, map[string]any{
+		"jobType": jobType,
+		"jobId":   job.ID,
+	})
+	if err := s.store.FailJob(r.Context(), job.ID, reason); err != nil {
+		s.logger.Warn("handleSyncUnstick: FailJob failed",
+			"id", job.ID, "type", jobType, "error", err)
+		ui.RenderFragment(w, ui.SyncLastRunPill(jobType, "running",
+			job.CreatedAt, ""))
+		return
+	}
+	s.logger.Info("sync job manually unstuck",
+		"type", jobType, "id", job.ID,
+		"createdAt", job.CreatedAt, "remoteAddr", r.RemoteAddr)
+	// Re-render the pill — it should now show the failed badge
+	// with the unstick reason as the tooltip. Staff can click
+	// Run again immediately.
+	updated, err := s.store.LastJobByType(r.Context(), jobType)
+	if err != nil || updated == nil {
+		ui.RenderFragment(w, ui.SyncLastRunPill(jobType, "failed",
+			time.Now().UTC().Format(time.RFC3339), reason))
+		return
+	}
+	ui.RenderFragment(w, ui.SyncLastRunPillFull(jobType, updated.Status,
+		updated.CreatedAt, updated.Error, updated.Progress))
 }
 
 // Note on server-side pill pre-fetch:

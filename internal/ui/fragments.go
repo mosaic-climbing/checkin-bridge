@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -370,10 +371,41 @@ func SyncResultFragment(success bool, title, body string, stats []SyncStat, pill
 // SyncLastRunPill renders the "Last run: 12m ago · ✓" badge that sits
 // inside each sync card. jobType is used for the id so the OOB swap in
 // SyncResultFragment can target it. status is one of "completed",
-// "failed", "running", or empty. createdAt is the RFC3339 string the
-// jobs table stamps at CreateJob. A nil/empty job renders the "Never
-// run" pill.
+// "failed", "running", or empty. createdAt is the timestamp the jobs
+// table stamps at CreateJob (either RFC3339 from Go-side writes or
+// SQLite's `YYYY-MM-DD HH:MM:SS` from the CreateJob default; both
+// are accepted by FormatRelative). A nil/empty job renders the
+// "Never run" pill.
+//
+// Backwards-compatible signature delegates to SyncLastRunPillFull
+// with empty progress so older call sites keep compiling.
 func SyncLastRunPill(jobType, status, createdAt, errMsg string) string {
+	return SyncLastRunPillFull(jobType, status, createdAt, errMsg, "")
+}
+
+// unstickAgeThreshold is how long a job has to have been "running"
+// before SyncLastRunPillFull renders the "Clear stuck" affordance.
+// Picked to comfortably exceed the longest legitimate refresh
+// observed at LEF (UA-Hub mirror walk: ~4-5min for ~1.6k users +
+// 75ms hydrate spacing). A row that's still 'running' beyond this
+// is overwhelmingly likely to be wedged. The link is non-destructive
+// — staff click it, the row flips to 'failed' with a clear note,
+// and they can click Run again.
+const unstickAgeThreshold = 10 * time.Minute
+
+// SyncLastRunPillFull is the full-fat renderer; SyncLastRunPill
+// preserves the old four-arg signature for legacy callers. progress
+// is the latest jobs.progress payload — either a quoted JSON string
+// or a plain phrase ("hydrating 450/1500"); when present and status
+// is "running" it's shown inline so staff see the pill twitch
+// through phases instead of staring at a static "⟳ Running".
+//
+// v0.5.7.1: when status is "running" and the job has been alive for
+// at least unstickAgeThreshold, a "Clear stuck" link is appended
+// that POSTs to /ui/sync/unstick/{type}. The link is keyed on the
+// pill id so HTMX can swap the response in-place, identical
+// mechanism to the load/every-15s auto-refresh.
+func SyncLastRunPillFull(jobType, status, createdAt, errMsg, progress string) string {
 	id := fmt.Sprintf("sync-pill-%s", HTMLEscape(jobType))
 	if status == "" {
 		return fmt.Sprintf(
@@ -383,9 +415,43 @@ func SyncLastRunPill(jobType, status, createdAt, errMsg string) string {
 	rel := FormatRelative(createdAt)
 	switch status {
 	case "running":
-		return fmt.Sprintf(
-			`<span id="%s" class="badge badge-running" title="Started %s">⟳ Running · started %s</span>`,
-			id, HTMLEscape(createdAt), HTMLEscape(rel))
+		// Progress and unstick are independent: a fresh refresh
+		// shows "⟳ Running · hydrating 450/1500 · started just
+		// now"; a wedged refresh shows "⟳ Running · started 47m
+		// ago · Clear stuck" (with progress dropped because
+		// stale phase strings tend to mislead more than help).
+		// A fresh refresh with no progress yet just shows "⟳
+		// Running · started just now".
+		stuck := isStuckRunning(createdAt)
+		var phase string
+		if !stuck {
+			phase = trimPhase(progress)
+		}
+		var sb strings.Builder
+		fmt.Fprintf(&sb,
+			`<span id="%s" class="badge badge-running" title="Started %s">⟳ Running`,
+			id, HTMLEscape(createdAt))
+		if phase != "" {
+			fmt.Fprintf(&sb, ` · %s`, HTMLEscape(phase))
+		}
+		fmt.Fprintf(&sb, ` · started %s`, HTMLEscape(rel))
+		if stuck {
+			// Render the unstick link as part of the same pill
+			// so the OOB swap target stays unique. hx-target
+			// matches the pill's own id; hx-swap=outerHTML
+			// replaces the whole badge with whatever pill the
+			// unstick handler returns (typically a fresh ✗
+			// Failed badge).
+			fmt.Fprintf(&sb,
+				` · <a href="#" class="link-unstick" `+
+					`hx-post="/ui/sync/unstick/%s" `+
+					`hx-target="#%s" hx-swap="outerHTML" `+
+					`hx-headers='{"X-Requested-With":"XMLHttpRequest"}' `+
+					`hx-confirm="Mark this stuck job as failed? The next click will start a fresh run.">Clear stuck</a>`,
+				HTMLEscape(jobType), id)
+		}
+		sb.WriteString(`</span>`)
+		return sb.String()
 	case "failed":
 		tooltip := "Failed"
 		if errMsg != "" {
@@ -405,16 +471,58 @@ func SyncLastRunPill(jobType, status, createdAt, errMsg string) string {
 	}
 }
 
-// FormatRelative takes an RFC3339 timestamp and returns a compact
+// isStuckRunning returns true when the running job's created_at is
+// older than unstickAgeThreshold. Falls back to "not stuck" on
+// unparseable input so a fresh row with a malformed timestamp
+// doesn't immediately surface the unstick link.
+func isStuckRunning(createdAt string) bool {
+	t, ok := parseStoreTimestamp(createdAt)
+	if !ok {
+		return false
+	}
+	return time.Since(t) >= unstickAgeThreshold
+}
+
+// trimPhase strips the JSON quoting around a progress payload
+// written by Store.UpdateJobProgress. The store marshals the value
+// as JSON before storing, so a plain phase "hydrating 450/1500"
+// arrives as `"hydrating 450/1500"`. Render the bare phrase rather
+// than the leaky implementation detail. Empty / non-string payloads
+// fall through to "" so the running-case renderer just omits the
+// phase segment.
+func trimPhase(progress string) string {
+	if progress == "" {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal([]byte(progress), &s); err == nil {
+		return s
+	}
+	// Not a JSON-quoted string — show whatever's there, trimmed,
+	// so a future caller that writes plain text doesn't get
+	// silently dropped.
+	return strings.TrimSpace(progress)
+}
+
+// FormatRelative takes a jobs-table timestamp and returns a compact
 // human-readable relative-time string suitable for the sync pill:
 // "just now", "12m ago", "2h ago", "3d ago". Empty or unparseable
 // input returns "never".
+//
+// Accepts both RFC3339 (the format Go-side writes use:
+// CompleteJob/FailJob/UpdateJobProgress all stamp updated_at via
+// `time.Now().UTC().Format(time.RFC3339)`) AND SQLite's
+// `YYYY-MM-DD HH:MM:SS` (the format the CreateJob default-stamps
+// for created_at — the table column declares
+// `DEFAULT CURRENT_TIMESTAMP` and SQLite renders that in space-
+// separated form). Pre-v0.5.7.1 this only handled RFC3339, which
+// silently broke "Last run: ⟳ Running · started Xm ago" for
+// every running pill (created_at always failed to parse, and the
+// nil-zero-value cascade short-circuited to "never"). Caught when
+// staff reported the pill stuck on "running" with no timestamp.
 func FormatRelative(ts string) string {
-	if ts == "" {
-		return "never"
-	}
-	t, err := time.Parse(time.RFC3339, ts)
-	if err != nil {
+	t, ok := parseStoreTimestamp(ts)
+	if !ok {
 		return "never"
 	}
 	d := time.Since(t)
@@ -437,6 +545,32 @@ func FormatRelative(ts string) string {
 	default:
 		return t.Format("Jan 2")
 	}
+}
+
+// parseStoreTimestamp decodes a jobs-table timestamp into a
+// time.Time. Accepts RFC3339 (what CompleteJob/FailJob/
+// UpdateJobProgress write via time.Now().UTC().Format(time.RFC3339))
+// and SQLite's `YYYY-MM-DD HH:MM:SS` form (what the
+// `DEFAULT CURRENT_TIMESTAMP` on created_at renders). Returns
+// (t, true) on success, (zero, false) on unparseable input.
+//
+// The SQLite default is UTC — CURRENT_TIMESTAMP is documented as
+// "UTC DATETIME('now')", same semantics our Go-side writes use —
+// so parsing in UTC keeps the "started 3m ago" math honest.
+func parseStoreTimestamp(ts string) (time.Time, bool) {
+	if ts == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339, ts); err == nil {
+		return t, true
+	}
+	// SQLite default format. Note `2006-01-02 15:04:05` (space,
+	// no T, no Z). time.Parse interprets a format without a zone
+	// as UTC when the layout has no zone token.
+	if t, err := time.Parse("2006-01-02 15:04:05", ts); err == nil {
+		return t.UTC(), true
+	}
+	return time.Time{}, false
 }
 
 // ─── "New Member" provisioning UI (C2 Layer 4d) ───────────────────────
