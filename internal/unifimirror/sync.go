@@ -64,6 +64,66 @@ type unifiClient interface {
 // so tests can drop it to zero.
 var hydrateInterval = 75 * time.Millisecond
 
+// hydrateProgressEvery throttles how often the hydrate loop writes a
+// jobs.progress update. ~25 rows × 75ms ≈ a refresh every ~2s, which
+// is a reasonable upper bound on how fast staff want the pill to
+// twitch (they're glancing at it once every few seconds). Exposed
+// as a package var so unit tests can drop it to 1 and observe every
+// emit.
+var hydrateProgressEvery = 25
+
+// ProgressFunc is the optional phase reporter the Syncer calls during
+// a Refresh. Each call carries a short human-readable phase label
+// ("listing users", "hydrating 450/1568", "reconciling pending") that
+// the api package writes into jobs.progress so the staff /ui/sync page
+// can render mid-flight progress in the per-card "Last run" pill.
+//
+// The reporter is best-effort and runs synchronously on the refresh
+// goroutine; implementations MUST NOT block (the cmd/bridge wiring
+// just calls Store.UpdateJobProgress, which is a single indexed
+// SQLite UPDATE under the store mutex). A nil reporter is supported
+// — the package-internal helper short-circuits to a no-op so callers
+// that don't care about progress (the nightly ticker, the test
+// fixtures) need no setup.
+type ProgressFunc func(phase string)
+
+// progressKey is the unexported context key used by WithProgress and
+// the package-internal reportProgress helper. Defined at package
+// scope so tests in the same package can assert against it without
+// reflection.
+type progressKey struct{}
+
+// WithProgress returns a derived context that carries fn as the
+// progress reporter for any Syncer.Refresh / RefreshWithStats call
+// dispatched with it. Passing a nil fn is a no-op (returns ctx
+// unchanged), matching the rest of the Syncer surface where progress
+// reporting is strictly optional.
+//
+// The cmd/bridge wiring calls this in the api.UAHubRefresher closure
+// to inject a per-job progress writer that updates the jobs.progress
+// row keyed on the in-flight jobID. See cmd/bridge/main.go (search
+// for SetUAHubMirrorRefresher) and internal/api/sync_ux.go's
+// detached-ctx pattern for the lifetime story.
+func WithProgress(ctx context.Context, fn ProgressFunc) context.Context {
+	if fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, progressKey{}, fn)
+}
+
+// reportProgress is the package-internal accessor. Lives here (not at
+// the call sites) so a future refactor that wants to add structured
+// fields ("phase", "current", "total") to the reporter signature
+// only has to touch this one helper, not every emit site.
+func reportProgress(ctx context.Context, phase string) {
+	if ctx == nil {
+		return
+	}
+	if fn, ok := ctx.Value(progressKey{}).(ProgressFunc); ok && fn != nil {
+		fn(phase)
+	}
+}
+
 // Syncer writes unifi.UniFiUser rows to store.ua_users on a daily
 // tick. Not safe for concurrent Refresh calls — the store itself
 // serializes writes via Store.mu, but the sync loop is expected to
@@ -157,7 +217,16 @@ func (s *Syncer) Refresh(ctx context.Context) error {
 // that the list endpoint shortchanged. Errors from FetchUser are logged
 // and the original row is left in place — a per-user network blip
 // should not abort the whole refresh, and the next sync will try again.
+//
+// Progress reporting (v0.5.7.1): emits "upserting list rows" before
+// the first pass and "hydrating N/M" once per hydrateProgressEvery
+// users during the slow per-user pass so the staff /ui/sync pill
+// shows mid-flight progress instead of a static "Running ⟳". The
+// per-row cadence keeps the SQLite UPDATE for jobs.progress to a
+// few dozen writes per refresh — same order as the slog Info we
+// already emit per phase.
 func (s *Syncer) upsertAndHydrate(ctx context.Context, users []unifi.UniFiUser) (upserted, hydrated, listEmails int) {
+	reportProgress(ctx, fmt.Sprintf("upserting %d list rows", len(users)))
 	var needHydrate []string
 	for _, u := range users {
 		row := &store.UAUser{
@@ -200,6 +269,14 @@ func (s *Syncer) upsertAndHydrate(ctx context.Context, users []unifi.UniFiUser) 
 			s.logger.Info("UA-Hub mirror hydrate cancelled",
 				"done", i, "remaining", len(needHydrate)-i, "error", err)
 			return upserted, hydrated, listEmails
+		}
+		// Emit progress on the first iteration and then every
+		// hydrateProgressEvery rows. The modulo check keeps the
+		// jobs.progress write rate sane on large refreshes (at
+		// LEF: len(needHydrate)≈1500 / every=25 → ~60 writes
+		// spread across ~2 minutes).
+		if i == 0 || i%hydrateProgressEvery == 0 {
+			reportProgress(ctx, fmt.Sprintf("hydrating %d/%d", i+1, len(needHydrate)))
 		}
 		u, err := s.unifi.FetchUser(ctx, id)
 		if err != nil {
@@ -254,8 +331,16 @@ type Stats struct {
 // RefreshWithStats runs a Refresh and returns structured results for
 // the staff UI. Errors are propagated as-is; the Stats value is
 // populated on success.
+//
+// Phase progress is emitted via reportProgress (see ProgressFunc /
+// WithProgress in this package) at four boundaries: just before the
+// paginated UA-Hub list call, when the upsert+hydrate pass begins
+// and every 25 hydrates thereafter, just before the pending recheck,
+// and on completion. Consumers that don't install a progress
+// reporter see zero overhead.
 func (s *Syncer) RefreshWithStats(ctx context.Context) (Stats, error) {
 	started := time.Now()
+	reportProgress(ctx, "listing UA-Hub users")
 	users, err := s.unifi.ListAllUsersWithStatus(ctx)
 	if err != nil {
 		return Stats{}, fmt.Errorf("ListAllUsersWithStatus: %w", err)
@@ -280,6 +365,7 @@ func (s *Syncer) RefreshWithStats(ctx context.Context) (Stats, error) {
 	// there's nothing new to promote the query returns zero rows and
 	// the pass is a no-op. Running it every refresh is strictly safer
 	// than trying to predict which code path delivered an email.
+	reportProgress(ctx, "reconciling pending mappings")
 	rechecked, err := s.recheckPending(ctx)
 	if err != nil {
 		s.logger.Warn("pending-mapping recheck failed (continuing)",
