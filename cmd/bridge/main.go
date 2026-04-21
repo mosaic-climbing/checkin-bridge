@@ -513,7 +513,16 @@ func main() {
 		unifimirror.SyncConfig{Interval: cfg.Sync.Interval},
 		logger.With("component", "unifimirror"),
 	)
-	apiServer.SetUAHubMirrorRefresher(func(ctx context.Context) (api.UAHubRefreshStats, error) {
+	apiServer.SetUAHubMirrorRefresher(func(ctx context.Context, progress func(phase string)) (api.UAHubRefreshStats, error) {
+		// Attach the optional per-job progress reporter to ctx.
+		// WithProgress is a no-op when progress is nil (legacy /
+		// test callers), so the nightly ticker in unifimirror.Run
+		// continues to work unchanged. When non-nil (the
+		// /ua-hub/sync handler path), the Syncer emits phase
+		// strings and the handler's closure writes them into
+		// jobs.progress — surfacing mid-flight state in the
+		// staff /ui/sync pill.
+		ctx = unifimirror.WithProgress(ctx, unifimirror.ProgressFunc(progress))
 		stats, err := uaHubMirror.RefreshWithStats(ctx)
 		if err != nil {
 			return api.UAHubRefreshStats{}, err

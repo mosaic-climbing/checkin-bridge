@@ -126,7 +126,14 @@ type Server struct {
 	// keep NewServer's constructor signature stable, and keep the
 	// api → unifimirror dependency implicit (via callback) rather
 	// than explicit (via struct field).
-	uaHubMirrorRefresh func(ctx context.Context) (UAHubRefreshStats, error)
+	//
+	// progress is optional and may be nil — the wired unifimirror
+	// closure in cmd/bridge drops a nil straight through (no
+	// WithProgress attached), so the Syncer emits no phase updates.
+	// When non-nil, the handler passes a closure that writes to
+	// jobs.progress for the in-flight jobID so the staff /ui/sync
+	// pill can show mid-flight phase updates. Added in v0.5.7.1.
+	uaHubMirrorRefresh func(ctx context.Context, progress func(phase string)) (UAHubRefreshStats, error)
 }
 
 // UAHubRefreshStats is the result payload the UA-Hub mirror refresh
@@ -248,7 +255,15 @@ func (s *Server) SetMirrorWalker(fn func(ctx context.Context) error) {
 // to avoid an api → unifimirror import (which would otherwise need to
 // be reversed because the api test suite builds fake Server values
 // without the mirror package loaded).
-func (s *Server) SetUAHubMirrorRefresher(fn func(ctx context.Context) (UAHubRefreshStats, error)) {
+//
+// The progress argument is the optional phase reporter the handler
+// builds for the in-flight job. The cmd/bridge wiring forwards it
+// into unifimirror.WithProgress so the Syncer emits phase strings
+// ("listing UA-Hub users", "hydrating 450/1500", "reconciling
+// pending mappings"). Implementations that don't care about
+// progress (legacy callers, fake refreshers in tests) can simply
+// ignore the argument.
+func (s *Server) SetUAHubMirrorRefresher(fn func(ctx context.Context, progress func(phase string)) (UAHubRefreshStats, error)) {
 	s.uaHubMirrorRefresh = fn
 }
 
@@ -334,6 +349,20 @@ func (s *Server) routes() {
 	// internal/api/sync_ux.go:handleFragSyncLastRun for the type
 	// allowlist and "never run"/"running"/"failed" variants.
 	s.mux.HandleFunc("GET /ui/frag/sync-last-run/{type}", withTimeout(shortTimeout, s.handleFragSyncLastRun))
+
+	// v0.5.7.1 stale-running unstick. Backs the "Clear stuck" link
+	// rendered inside the running-pill when a job has been in
+	// 'running' for >= unstickAgeThreshold (see SyncLastRunPill in
+	// internal/ui/fragments.go). Marks the active row failed with a
+	// human-readable reason and re-renders the pill so the swap is
+	// visible to staff in one click — no ssh required. The original
+	// reason this is needed is the v0.5.7.0 ctx-cancel bug
+	// (finishSyncJob on a cancelled request silently no-op'd the
+	// terminal-state UPDATE), patched in v0.5.7.1's
+	// finishSyncJob; the unstick endpoint is the operator escape
+	// hatch for any residual cases (mid-refresh daemon crash,
+	// SQLite lock contention) where a job legitimately wedges.
+	s.mux.HandleFunc("POST /ui/sync/unstick/{type}", withTimeout(shortTimeout, s.handleSyncUnstick))
 
 	// Door policy management (from HTMX UI)
 	s.mux.HandleFunc("POST /ui/frag/door-policy", withTimeout(shortTimeout, s.handleAddDoorPolicy))
@@ -846,7 +875,13 @@ func (s *Server) handleUAHubSync(w http.ResponseWriter, r *http.Request) {
 	jobID := s.startSyncJob(r.Context(), jobTypeUAHubSync)
 	started := time.Now()
 
-	stats, refreshErr := s.uaHubMirrorRefresh(r.Context())
+	// progress writes survive request abandonment (HTMX/browser
+	// cancel after a few minutes) for the same reason finishSyncJob
+	// detaches its ctx — the request is gone but the refresh isn't,
+	// and the staff pill should still tick. See sync_ux.go's
+	// finishSyncJob comment for the full lifetime story.
+	progress := s.makeJobProgressFn(jobID)
+	stats, refreshErr := s.uaHubMirrorRefresh(r.Context(), progress)
 	duration := time.Since(started).Round(100 * time.Millisecond)
 
 	if refreshErr != nil {

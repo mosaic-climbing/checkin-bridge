@@ -37,6 +37,7 @@
                     hx-target="#sync-result"
                     hx-swap="innerHTML"
                     hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+                    hx-disabled-elt="this"
                     hx-indicator="#sync-spinner">
                 Recount Now <span id="sync-spinner" class="htmx-indicator"><span class="spinner"></span></span>
             </button>
@@ -63,6 +64,7 @@
                     hx-target="#sync-result"
                     hx-swap="innerHTML"
                     hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+                    hx-disabled-elt="this"
                     hx-indicator="#status-spinner">
                 Run Now <span id="status-spinner" class="htmx-indicator"><span class="spinner"></span></span>
             </button>
@@ -88,6 +90,7 @@
                     hx-target="#sync-result"
                     hx-swap="innerHTML"
                     hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+                    hx-disabled-elt="this"
                     hx-indicator="#dir-spinner">
                 Run Now <span id="dir-spinner" class="htmx-indicator"><span class="spinner"></span></span>
             </button>
@@ -115,6 +118,7 @@
                     hx-target="#sync-result"
                     hx-swap="innerHTML"
                     hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+                    hx-disabled-elt="this"
                     hx-indicator="#ua-hub-spinner">
                 Run Now <span id="ua-hub-spinner" class="htmx-indicator"><span class="spinner"></span></span>
             </button>
@@ -142,6 +146,7 @@
                     hx-target="#sync-result"
                     hx-swap="innerHTML"
                     hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+                    hx-disabled-elt="this"
                     hx-indicator="#ingest-spinner">
                 Dry Run <span id="ingest-spinner" class="htmx-indicator"><span class="spinner"></span></span>
             </button>
@@ -150,6 +155,7 @@
                     hx-target="#sync-result"
                     hx-swap="innerHTML"
                     hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
+                    hx-disabled-elt="this"
                     hx-confirm="Apply UniFi ingest? This writes NFC ↔ Redpoint mappings into the cache. (It does not push anything to UA-Hub.)"
                     hx-indicator="#ingest-apply-spinner">
                 Run (writes) <span id="ingest-apply-spinner" class="htmx-indicator"><span class="spinner"></span></span>
