@@ -201,7 +201,19 @@ func SearchResultsFragment(results []SearchResult) string {
 	sb.WriteString(`<table><thead><tr><th>Name</th><th>Email</th><th>Status</th><th></th></tr></thead><tbody>`)
 	for _, r := range results {
 		status := `<span class="badge badge-denied">Not enrolled</span>`
-		action := fmt.Sprintf(`<button class="btn btn-success btn-sm" onclick="document.querySelector('[name=redpointId]').value='%s'; document.querySelector('[name=firstName]').value='%s'">Select</button>`,
+		// v0.5.8 (#118): the Select button carries the Redpoint ID and
+		// full name as data-* attributes; a delegated click handler in
+		// members.html reads them and populates the Add Member form.
+		// The prior implementation used an inline onclick with the
+		// values embedded as JS string literals, which silently broke
+		// for any row whose name or ID contained an apostrophe (O'Brien,
+		// D'Angelo, etc.) because HTMLEscape turns ' into &#39; and the
+		// HTML attribute parser decodes it back to ' inside the JS,
+		// causing a SyntaxError. Data attributes are HTMLEscape-safe
+		// regardless of content — the DOM getAttribute call returns the
+		// raw string so the JS never has to quote it.
+		action := fmt.Sprintf(
+			`<button type="button" class="btn btn-success btn-sm" data-action="select-member" data-redpoint-id="%s" data-name="%s">Select</button>`,
 			HTMLEscape(r.RedpointID), HTMLEscape(r.Name))
 		if r.InCache {
 			status = fmt.Sprintf(`<span class="badge badge-active">Enrolled (%s)</span>`, HTMLEscape(r.NfcUID))

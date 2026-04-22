@@ -18,6 +18,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,22 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+// pingDoneGraceTimeout bounds how long readLoop will wait for its ping
+// sender goroutine to exit before abandoning the wait. The ping sender
+// takes connMu and calls conn.WriteControl; on a dead socket that
+// WriteControl can block indefinitely (observed #76 — readLoop sat in
+// its `<-pingDone` defer and connectLoop never advanced to reconnect).
+// Cancelling pingCtx causes a well-behaved ping goroutine to return on
+// the next ticker iteration at the latest, and this grace period
+// ensures a wedged one never prevents readLoop from returning.
+var pingDoneGraceTimeout = 2 * time.Second
+
+// wsPingInterval is the keepalive ping cadence. Declared as a package var
+// (rather than an inline const) so #76 regression tests can shorten it to
+// reproduce the wedge-under-connMu scenario deterministically. Production
+// value matches the original 30s spec.
+var wsPingInterval = 30 * time.Second
 
 // ConnectionState represents the health state of the WebSocket connection.
 type ConnectionState string
@@ -307,6 +324,22 @@ func (c *Client) Connect(ctx context.Context) {
 }
 
 func (c *Client) connectLoop(ctx context.Context) {
+	// Panic recovery (#76): without this, any panic in readLoop or dial
+	// would kill connectLoop's goroutine silently and the WebSocket
+	// would go dark until process restart. Re-spawning with the same
+	// ctx keeps the reconnect loop alive across unexpected panics; if
+	// ctx is already Done the fresh connectLoop exits immediately via
+	// the select below.
+	defer func() {
+		if r := recover(); r != nil {
+			c.logger.Error("connectLoop panicked — respawning",
+				"panic", r,
+				"stack", string(debug.Stack()),
+			)
+			go c.connectLoop(ctx)
+		}
+	}()
+
 	backoff := 5 * time.Second
 	maxBackoff := 60 * time.Second
 
@@ -392,7 +425,7 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn) {
 	// Send a ping every 30s. If no pong comes back within 10s, the read
 	// deadline fires and we reconnect. This catches silently-dead connections
 	// (e.g., upstream switch reboot, NIC reset).
-	const pingInterval = 30 * time.Second
+	pingInterval := wsPingInterval
 	const pongTimeout = 10 * time.Second
 
 	conn.SetPongHandler(func(string) error {
@@ -401,7 +434,16 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn) {
 	})
 	conn.SetReadDeadline(time.Now().Add(pingInterval + pongTimeout))
 
-	// Ping sender goroutine
+	// Ping sender goroutine (#76): use a local cancellable context so we
+	// can signal the ping goroutine to exit the moment readLoop returns,
+	// without having to wait for the next ticker tick on parent ctx.
+	// Previously the goroutine only watched parent ctx, so a ReadMessage
+	// error that was socket-local (not a shutdown) left the ping sender
+	// alive and it could block in conn.WriteControl on the dead socket
+	// under connMu — which in turn blocked the `<-pingDone` defer below
+	// forever, wedging connectLoop's reconnect step.
+	pingCtx, pingCancel := context.WithCancel(ctx)
+
 	pingDone := make(chan struct{})
 	go func() {
 		defer close(pingDone)
@@ -409,7 +451,7 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn) {
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-pingCtx.Done():
 				return
 			case <-ticker.C:
 				c.connMu.Lock()
@@ -425,7 +467,27 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn) {
 			}
 		}
 	}()
-	defer func() { <-pingDone }()
+	// Single combined defer (#76): on readLoop return, cancel pingCtx
+	// FIRST (so a well-behaved ping goroutine exits promptly on its
+	// select), THEN bound the wait on pingDone. Splitting these into
+	// two separate defers would mis-order under LIFO — the bounded wait
+	// would run before pingCancel, and the goroutine couldn't observe
+	// cancellation until the grace period had already fired.
+	//
+	// If the goroutine is stuck inside WriteControl-under-connMu, it
+	// won't see pingCtx.Done() at all; the grace timeout bounds the
+	// wait so readLoop returns regardless, letting connectLoop's
+	// reconnect step fire and restore the WebSocket.
+	defer func() {
+		pingCancel()
+		select {
+		case <-pingDone:
+		case <-time.After(pingDoneGraceTimeout):
+			c.logger.Warn("ping goroutine did not exit within grace period; abandoning wait so reconnect can proceed",
+				"grace", pingDoneGraceTimeout,
+			)
+		}
+	}()
 
 	for {
 		select {
