@@ -442,7 +442,11 @@ func TestSecurityMiddleware_AllowlistHonoursTrust(t *testing.T) {
 
 	// Attacker connects from 172.16.0.5 (outside the allowlist) and
 	// sets XFF to an allowlisted value. The middleware must block.
-	req := httptest.NewRequest("GET", "/health", nil)
+	//
+	// (Path: /metrics rather than /health — /health now bypasses the
+	// allowlist unconditionally for the deploy-probe use case (#93), so
+	// testing the allowlist itself needs a gated path.)
+	req := httptest.NewRequest("GET", "/metrics", nil)
 	req.RemoteAddr = "172.16.0.5:12345"
 	req.Header.Set("X-Forwarded-For", "10.0.1.50")
 	w := httptest.NewRecorder()
@@ -451,13 +455,16 @@ func TestSecurityMiddleware_AllowlistHonoursTrust(t *testing.T) {
 		t.Errorf("spoofed XFF allowlist bypass: got %d, want 403", w.Code)
 	}
 
-	// Legitimate caller from inside the allowlist, no XFF.
-	req = httptest.NewRequest("GET", "/health", nil)
+	// Legitimate caller from inside the allowlist, no XFF. 401 is fine
+	// here — we're not providing an API key, so the allowlist path lets
+	// us through and the auth layer returns Unauthorized. The point of
+	// this assertion is "not 403" (IP gate didn't block), not "200".
+	req = httptest.NewRequest("GET", "/metrics", nil)
 	req.RemoteAddr = "10.0.1.50:12345"
 	w = httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Errorf("legitimate allowlisted caller: got %d, want 200", w.Code)
+	if w.Code == http.StatusForbidden {
+		t.Errorf("legitimate allowlisted caller: got 403, want not-403 (the IP gate must not block)")
 	}
 }
 

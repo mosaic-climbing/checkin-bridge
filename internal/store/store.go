@@ -8,10 +8,66 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 	_ "modernc.org/sqlite"
 )
+
+// expectedLegacyAuditTables names the audit-side tables that a valid
+// pre-A4 bridge.db must contain. splitLegacyDBIfNeeded uses this list
+// to gate the schema_version pin in pruneAuditCopy — if any of these
+// tables are missing, the legacy file isn't a complete pre-A4 bridge
+// and pinning would hide the deficit from migrate() (the v0.4.0 deploy
+// bug; see #80).
+//
+// Derived from audit migrations 1..3:
+//   - migration 1: checkins, door_policies, jobs
+//   - migration 3: ua_user_mappings, ua_user_mappings_pending, match_audit
+//
+// Migration 2 is an ALTER on checkins and adds no new tables.
+var expectedLegacyAuditTables = []string{
+	"checkins",
+	"door_policies",
+	"jobs",
+	"ua_user_mappings",
+	"ua_user_mappings_pending",
+	"match_audit",
+}
+
+// legacyBridgeHasAuditTables returns (true, "", nil) iff the SQLite file
+// at path contains every table in expectedLegacyAuditTables. When a
+// table is missing it returns (false, missingTableName, nil); a real
+// error (file cannot be opened, query fails) surfaces as (false, "",
+// err).
+//
+// Used by splitLegacyDBIfNeeded to reject a malformed pre-A4 bridge.db
+// before pruneAuditCopy would otherwise pin schema_version and cause
+// migrate() to skip re-creating the missing tables.
+func legacyBridgeHasAuditTables(path string) (bool, string, error) {
+	db, err := sqlx.Open("sqlite", dsnFor(path))
+	if err != nil {
+		return false, "", fmt.Errorf("open: %w", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetConnMaxLifetime(0)
+
+	for _, table := range expectedLegacyAuditTables {
+		var count int
+		err := db.QueryRow(
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`,
+			table,
+		).Scan(&count)
+		if err != nil {
+			return false, "", fmt.Errorf("check table %q: %w", table, err)
+		}
+		if count == 0 {
+			return false, table, nil
+		}
+	}
+	return true, "", nil
+}
 
 // Store is the unified SQLite persistence layer, replacing both the JSON
 // member cache and the customer directory.
@@ -392,6 +448,41 @@ func splitLegacyDBIfNeeded(legacyPath, auditPath, cachePath string, logger *slog
 		return nil
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("stat audit.db: %w", err)
+	}
+
+	// Completeness guard (#80): verify the legacy file actually has
+	// the full pre-A4 schema before splitting it. pruneAuditCopy pins
+	// schema_version=auditSchemaVersionAtSplit unconditionally, on the
+	// assumption that the legacy DB had already applied audit migrations
+	// 1..N; a v0.4.0 deploy hit a MacBook whose bridge.db was missing
+	// migration 3's tables, and the pin silently caused migrate() to
+	// skip re-creating them. Check-ins then failed with "no such table"
+	// until v0.5.0's schema self-heal repaired it.
+	//
+	// If the file is malformed, rename it aside with a timestamp so the
+	// next boot hits the fresh-install path (legacyPath missing →
+	// early-return nil) and creates clean audit.db / cache.db from
+	// scratch. Continuing to split a malformed file would just propagate
+	// the same half-schema to the new files.
+	complete, missing, err := legacyBridgeHasAuditTables(legacyPath)
+	if err != nil {
+		return fmt.Errorf("verify legacy bridge completeness: %w", err)
+	}
+	if !complete {
+		moved := legacyPath + ".malformed." + time.Now().UTC().Format("20060102-150405") + ".bak"
+		if renameErr := os.Rename(legacyPath, moved); renameErr != nil {
+			return fmt.Errorf(
+				"legacy bridge.db is missing audit-side table %q and could not be renamed aside (%v); "+
+					"manually move %s out of the way and restart so a fresh audit.db/cache.db can be created",
+				missing, renameErr, legacyPath,
+			)
+		}
+		logger.Warn("split-db: legacy bridge.db is malformed (missing audit-side table); renamed aside so a fresh audit.db/cache.db can be created on this boot",
+			"missingTable", missing,
+			"original", legacyPath,
+			"movedTo", moved,
+		)
+		return nil
 	}
 
 	logger.Info("split-db: migrating pre-A4 bridge.db to split audit.db/cache.db",

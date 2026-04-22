@@ -72,4 +72,41 @@
     // Fire the same keyup htmx trigger the user would have typed manually.
     htmx.trigger(input, 'keyup');
 })();
+
+// v0.5.8 (#118): delegated click handler for Select buttons in search
+// results. Replaces a prior inline onclick that silently failed on any
+// row whose name or Redpoint ID contained an apostrophe/quote —
+// HTMLEscape turned those into entity references, the HTML attribute
+// parser decoded them back, and the embedded JS string literal broke
+// with a SyntaxError. Data attributes avoid that class of bug entirely.
+document.addEventListener('click', function (e) {
+    var btn = e.target.closest('[data-action="select-member"]');
+    if (!btn) return;
+    var rpId = btn.getAttribute('data-redpoint-id') || '';
+    var name = (btn.getAttribute('data-name') || '').trim();
+
+    // Split on the FIRST space so "Mary Jane Smith" → first="Mary",
+    // last="Jane Smith". Matches what a human would type into the form.
+    var first = name, last = '';
+    var sp = name.indexOf(' ');
+    if (sp > 0) {
+        first = name.substring(0, sp);
+        last = name.substring(sp + 1);
+    }
+
+    var rpInput = document.querySelector('[name=redpointId]');
+    var fnInput = document.querySelector('[name=firstName]');
+    var lnInput = document.querySelector('[name=lastName]');
+    var nfcInput = document.querySelector('[name=nfcUid]');
+    if (rpInput) rpInput.value = rpId;
+    if (fnInput) fnInput.value = first;
+    if (lnInput) lnInput.value = last;
+
+    // Scroll the Add Member form into view and focus the NFC UID — the
+    // one field the operator still has to fill in after Select.
+    if (nfcInput) {
+        nfcInput.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        nfcInput.focus();
+    }
+});
 </script>

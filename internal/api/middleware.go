@@ -30,6 +30,31 @@ type SecurityConfig struct {
 // SecurityMiddleware wraps the handler with auth, IP allowlist, and request body limits.
 func SecurityMiddleware(cfg SecurityConfig, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// ── /health bypass (runs BEFORE the IP allowlist) ────
+		//
+		// The updater script on the gym MacBook curls /health from
+		// 127.0.0.1 after a launchd restart to confirm the new binary
+		// came up before swapping the .prev. If ALLOWED_NETWORKS is
+		// set without loopback, the health probe 403s and the updater
+		// auto-rolls-back a perfectly good deploy (observed on the
+		// v0.5.2 deploy — ops#92). /health is a bare
+		// "is the process accepting requests?" check — it leaks no
+		// auth state and no customer data — so running it public-
+		// by-default matches industry convention for health probes
+		// and removes the 127.0.0.1/32-in-allowlist foot-gun.
+		//
+		// Everything else still goes through the allowlist below.
+		if r.URL.Path == "/health" {
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("X-Frame-Options", "DENY")
+			w.Header().Set("Cache-Control", "no-store")
+			if cfg.HTTPS {
+				w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// ── IP allowlist ─────────────────────────────────────
 		if len(cfg.AllowedNetworks) > 0 {
 			clientIP := extractClientIP(r, cfg.TrustedProxies)
@@ -61,12 +86,6 @@ func SecurityMiddleware(cfg SecurityConfig, next http.Handler) http.Handler {
 
 		// ── Auth: determine which routes are public ──────────
 		path := r.URL.Path
-
-		// Health check is always public (monitoring, load balancers)
-		if path == "/health" {
-			next.ServeHTTP(w, r)
-			return
-		}
 
 		// Login endpoint and the login page itself are public.
 		// The staff UI app (/ui, /ui/) redirects to login if no session — that redirect
