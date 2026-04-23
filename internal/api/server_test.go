@@ -62,7 +62,7 @@ func setupTestServer(t *testing.T) (*Server, *store.Store, *cardmap.Mapper) {
 		bgGroup.Shutdown(context.Background())
 	})
 
-	srv := NewServer(handler, unifiClient, rpClient, cm, syncer, statusSyncer, ingester, sessionMgr, nil, "gate-1", logger, db, nil, nil, nil, bgGroup, false /* enableTestHooks */, false /* allowNewMembers */, nil /* defaultAccessPolicyIDs */)
+	srv := NewServer(handler, unifiClient, rpClient, cm, syncer, statusSyncer, ingester, sessionMgr, nil, "gate-1", logger, db, nil, nil, nil, bgGroup, false /* enableTestHooks */)
 	return srv, db, cm
 }
 

@@ -83,13 +83,12 @@ const (
 	// S8: Cookie path scoping — DEFER narrowing to /ui
 	//
 	// The UI serves authenticated HTMX-triggered requests to both /ui/* and root-level
-	// paths. Six call sites from authenticated UI pages target root-level endpoints:
+	// paths. Five call sites from authenticated UI pages target root-level endpoints:
 	//   - hx-post="/cache/sync" (sync.html:10)
 	//   - hx-post="/status-sync" (sync.html:21)
 	//   - hx-post="/directory/sync" (sync.html:32)
 	//   - hx-post="/ingest/unifi?dry_run=true" (sync.html:43)
-	//   - hx-post="/members" (members.html:25)
-	//   - hx-delete="/members/%s" (fragments.go:94)
+	//   - hx-delete="/members/%s" (fragments.go — row-level Remove button)
 	//
 	// Narrowing Path from "/" to "/ui" would prevent these six calls from sending the
 	// session cookie, causing silent auth failures. The fix is not cookie-path scoping,

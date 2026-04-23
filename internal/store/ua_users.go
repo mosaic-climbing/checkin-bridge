@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -127,6 +128,47 @@ func (s *Store) AllUAUsers(ctx context.Context) ([]UAUser, error) {
 	var us []UAUser
 	err := s.db.SelectContext(ctx, &us,
 		`SELECT * FROM ua_users ORDER BY last_synced_at DESC, id ASC`)
+	return us, err
+}
+
+// SearchUAUsers runs a case-insensitive LIKE match across first_name,
+// last_name, name, and email for the reassign-target picker (v0.5.9 #10).
+// Each whitespace-separated token in q is AND-ed together so "alice s"
+// matches "Alice Smith" (as name tokens) or "alice@s.com" (as an email
+// substring). Limit caps the hit list; 50 is plenty for a picker.
+//
+// This is intentionally a LIKE walk rather than an FTS5 virtual table —
+// the ua_users mirror tops out in the low thousands at LEF's scale and
+// the reassign picker is cold-path; building an FTS index here would be
+// premature optimisation and an extra migration to maintain.
+func (s *Store) SearchUAUsers(ctx context.Context, q string, limit int) ([]UAUser, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	q = strings.TrimSpace(q)
+	if q == "" {
+		return nil, nil
+	}
+	tokens := strings.Fields(q)
+	if len(tokens) == 0 {
+		return nil, nil
+	}
+	var (
+		clauses []string
+		args    []any
+	)
+	for _, t := range tokens {
+		pat := "%" + strings.ToLower(t) + "%"
+		clauses = append(clauses,
+			`(LOWER(first_name) LIKE ? OR LOWER(last_name) LIKE ? OR LOWER(name) LIKE ? OR LOWER(email) LIKE ?)`)
+		args = append(args, pat, pat, pat, pat)
+	}
+	args = append(args, limit)
+	query := `SELECT * FROM ua_users WHERE ` +
+		strings.Join(clauses, " AND ") +
+		` ORDER BY last_name, first_name, id LIMIT ?`
+	var us []UAUser
+	err := s.db.SelectContext(ctx, &us, query, args...)
 	return us, err
 }
 

@@ -143,34 +143,12 @@ type BridgeConfig struct {
 	// went through; enable once you're confident about deduplication.
 	BackfillOnReconnect bool `json:"backfillOnReconnect"`
 
-	// AllowNewMembers enables the /ui/members/new provisioning flow. When
-	// false (the default), the endpoint returns 404 even for authenticated
-	// staff — intended for gyms that prefer to create UA-Hub users via
-	// UA-Hub's native admin and only use the bridge for sync. When true,
-	// DefaultAccessPolicyIDs must be non-empty (boot validation enforces).
-	AllowNewMembers bool `json:"allowNewMembers"`
-
-	// DefaultAccessPolicyIDs is the list of UA-Hub access-policy IDs
-	// attached to a user created via /ui/members/new. Configured once at
-	// install time to point at the "members" access group. Without a
-	// policy attached, a freshly-created UA-Hub user exists but every tap
-	// denies — the most confusing possible failure mode, so boot refuses
-	// to start with AllowNewMembers=true and an empty list.
-	DefaultAccessPolicyIDs []string `json:"defaultAccessPolicyIds"`
-
 	// UnmatchedGraceDays sets the window (in days) a UA-Hub user stays in
 	// ua_user_mappings_pending before the bridge default-deactivates them
 	// in UA-Hub. Default 7. Zero means "deactivate immediately" which is
 	// almost never what an operator wants; the only reason to set it is
 	// to exercise the expiry path in tests.
 	UnmatchedGraceDays int `json:"unmatchedGraceDays"`
-
-	// RequireMinimumUAHubVersion, when true, refuses to enable
-	// AllowNewMembers if the UA-Hub firmware does not support the
-	// user_email field at create time (requires 1.22.16+). When false,
-	// the bridge degrades gracefully to POST /users followed by a
-	// PUT /users/:id email write.
-	RequireMinimumUAHubVersion bool `json:"requireMinimumUAHubVersion"`
 
 	// EnableTestHooks is the runtime kill-switch for the /test-checkin
 	// simulation endpoint (S5 in the architecture review). The route is
@@ -323,10 +301,7 @@ func applyEnvOverrides(cfg *Config) {
 	envBool(&cfg.Bridge.LegacyNFCStatusLoop, "BRIDGE_LEGACY_NFC_STATUS_LOOP")
 	envDuration(&cfg.Bridge.RecheckMaxStaleness, "BRIDGE_RECHECK_MAX_STALENESS")
 	envBool(&cfg.Bridge.BackfillOnReconnect, "BRIDGE_BACKFILL_ON_RECONNECT")
-	envBool(&cfg.Bridge.AllowNewMembers, "BRIDGE_ALLOW_NEW_MEMBERS")
-	envStringSlice(&cfg.Bridge.DefaultAccessPolicyIDs, "BRIDGE_DEFAULT_ACCESS_POLICY_IDS")
 	envInt(&cfg.Bridge.UnmatchedGraceDays, "BRIDGE_UNMATCHED_GRACE_DAYS")
-	envBool(&cfg.Bridge.RequireMinimumUAHubVersion, "BRIDGE_REQUIRE_MINIMUM_UAHUB_VERSION")
 	envBool(&cfg.Bridge.EnableTestHooks, "BRIDGE_ENABLE_TEST_HOOKS")
 	envBool(&cfg.Bridge.HTTPS, "BRIDGE_HTTPS")
 
@@ -366,15 +341,6 @@ func validate(cfg *Config) error {
 	if cfg.Sync.TimeLocal != "" {
 		if _, _, err := ParseHHMM(cfg.Sync.TimeLocal); err != nil {
 			return fmt.Errorf("invalid Sync.TimeLocal %q: %w (expected HH:MM, e.g. \"03:00\")", cfg.Sync.TimeLocal, err)
-		}
-	}
-	// If new-member provisioning is on, DefaultAccessPolicyIDs must be
-	// non-empty. Creating a UA-Hub user with no access policies attached
-	// produces a user that looks normal in the admin UI but denies every
-	// tap, which is the most confusing possible failure — refuse to boot.
-	if cfg.Bridge.AllowNewMembers {
-		if len(cfg.Bridge.DefaultAccessPolicyIDs) == 0 {
-			return fmt.Errorf("Bridge.AllowNewMembers=true requires Bridge.DefaultAccessPolicyIDs to be non-empty (set BRIDGE_DEFAULT_ACCESS_POLICY_IDS or defaultAccessPolicyIds in bridge.json)")
 		}
 	}
 	// UnmatchedGraceDays cannot be negative; zero is allowed (but only

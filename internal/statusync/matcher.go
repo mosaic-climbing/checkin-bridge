@@ -54,6 +54,27 @@ const (
 	// /ui/needs-match/{id}/defer. Written as an audit-trail breadcrumb
 	// so the forensic log shows who pushed the ETA out and when.
 	MatchSourceStaffDefer = "staff:defer"
+	// MatchSourceStaffUnbind: staff-triggered mapping removal from the
+	// v0.5.9 member detail panel. The UA-Hub user survives; the mapping
+	// row is deleted and the user is re-queued in Needs Match with
+	// PendingReasonNoMatch so staff can re-bind them to the correct
+	// Redpoint customer. Differentiated from Staff so audit queries
+	// can count misassignment recoveries separately from first-time
+	// matches.
+	MatchSourceStaffUnbind = "staff:unbind"
+	// MatchSourceStaffReactivate: staff undid a prior Skip (or an
+	// external UA-Hub deactivation) from the v0.5.9 member detail panel,
+	// flipping the UA-Hub user status back to ACTIVE. Written as an
+	// audit breadcrumb so the forensic log shows who reactivated and
+	// when, distinguishing staff reactivation from a fresh auto-match.
+	MatchSourceStaffReactivate = "staff:reactivate"
+	// MatchSourceStaffReassign: staff reassigned an NFC card from one
+	// UA-Hub user to another via the v0.5.9 member detail panel. Two
+	// audit rows are written per reassign (one under the old owner's
+	// UAUserID with the token in before_val, one under the new owner's
+	// UAUserID with the token in after_val) so either user's forensic
+	// view surfaces the hand-off.
+	MatchSourceStaffReassign = "staff:reassign"
 )
 
 // matchDecision describes the result of running the matching tree on a

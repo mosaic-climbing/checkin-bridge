@@ -75,7 +75,7 @@ func buildNeedsMatchTestServer(t *testing.T) (*Server, *store.Store, *testutil.F
 	srv := NewServer(
 		handler, uaClient, rpClient, cm, syncer, statusSyncer, ingester,
 		sessionMgr, nil /* audit */, "gate-1", logger, db, nil /* ui */, nil, nil, /* trustedProxies */
-		bgGroup, false /* enableTestHooks */, false /* allowNewMembers */, nil, /* defaultAccessPolicyIDs */
+		bgGroup, false /* enableTestHooks */,
 	)
 	return srv, db, fakeUA
 }

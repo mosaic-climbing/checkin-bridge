@@ -3,8 +3,23 @@
     <p>Manage NFC-enrolled members</p>
 </div>
 
+<div class="alert" style="background: var(--info-bg, #1e293b); margin-bottom: 16px">
+    <strong>Adding a new member?</strong>
+    Create the user in <em>UniFi Access</em> first — UA-Hub is the source
+    of truth for identity. On the next sync the bridge will auto-bind
+    the new user to their Redpoint record (matched on email +&nbsp;name)
+    or queue them on the
+    <a href="/ui/page/needs-match">Needs Match</a> panel for
+    manual pairing.
+</div>
+
 <div class="card">
     <h3>Search Directory</h3>
+    <p style="color: var(--text-muted); margin-top: -4px">
+        Find a Redpoint customer by name or email. Enrolled members
+        expose a "View details" button that opens the recovery panel
+        below.
+    </p>
     <div class="form-row">
         <div class="form-group">
             <label>Search by name or email</label>
@@ -20,93 +35,24 @@
     <div id="search-results"></div>
 </div>
 
-<div class="card">
-    <h3>Add Member Manually</h3>
-    <form hx-post="/members"
-          hx-target="#add-result"
-          hx-swap="innerHTML"
-          hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
-          hx-on::after-request="if(event.detail.successful) this.reset()">
-        <div class="form-row">
-            <div class="form-group">
-                <label>Redpoint Customer ID</label>
-                <input type="text" name="redpointId" required placeholder="e.g. cust_abc123">
-            </div>
-            <div class="form-group">
-                <label>NFC Card UID</label>
-                <input type="text" name="nfcUid" required placeholder="e.g. 04AABB1122">
-            </div>
-        </div>
-        <div class="form-row">
-            <div class="form-group">
-                <label>First Name</label>
-                <input type="text" name="firstName" placeholder="Optional">
-            </div>
-            <div class="form-group">
-                <label>Last Name</label>
-                <input type="text" name="lastName" placeholder="Optional">
-            </div>
-            <button type="submit" class="btn btn-primary">Add Member</button>
-        </div>
-    </form>
-    <div id="add-result"></div>
-</div>
+<!--
+    v0.5.9: member detail panel (sticky sink above the member table).
+    Row-level "Details" buttons in the member table and "View details"
+    buttons in the search-results table both hx-get their fragment
+    into this slot. The fragment renders the recovery toolkit: Unbind
+    (re-queue in Needs Match), Reactivate (undo a Skip), Remove (drop
+    from bridge cache), Reassign NFC (swap the card to another UA-Hub
+    user). Every mutation emits HX-Trigger: member-updated which the
+    member-table container below subscribes to, so the list refreshes
+    automatically after any action.
+-->
+<div id="member-detail"></div>
 
 <div class="card">
     <h3>All Enrolled Members</h3>
-    <div hx-get="/ui/frag/member-table" hx-trigger="load" hx-swap="innerHTML">
+    <div hx-get="/ui/frag/member-table"
+         hx-trigger="load, member-updated from:body"
+         hx-swap="innerHTML">
         <p style="color: var(--text-muted)">Loading...</p>
     </div>
 </div>
-
-<script>
-// If the URL carries ?q=..., prefill the search box and trigger a lookup.
-// Used by deep-links from the Sync page's Unmatched UniFi Users panel.
-(function () {
-    var params = new URLSearchParams(window.location.search);
-    var q = params.get('q');
-    if (!q) return;
-    var input = document.querySelector('input[name="q"]');
-    if (!input) return;
-    input.value = q;
-    // Fire the same keyup htmx trigger the user would have typed manually.
-    htmx.trigger(input, 'keyup');
-})();
-
-// v0.5.8 (#118): delegated click handler for Select buttons in search
-// results. Replaces a prior inline onclick that silently failed on any
-// row whose name or Redpoint ID contained an apostrophe/quote —
-// HTMLEscape turned those into entity references, the HTML attribute
-// parser decoded them back, and the embedded JS string literal broke
-// with a SyntaxError. Data attributes avoid that class of bug entirely.
-document.addEventListener('click', function (e) {
-    var btn = e.target.closest('[data-action="select-member"]');
-    if (!btn) return;
-    var rpId = btn.getAttribute('data-redpoint-id') || '';
-    var name = (btn.getAttribute('data-name') || '').trim();
-
-    // Split on the FIRST space so "Mary Jane Smith" → first="Mary",
-    // last="Jane Smith". Matches what a human would type into the form.
-    var first = name, last = '';
-    var sp = name.indexOf(' ');
-    if (sp > 0) {
-        first = name.substring(0, sp);
-        last = name.substring(sp + 1);
-    }
-
-    var rpInput = document.querySelector('[name=redpointId]');
-    var fnInput = document.querySelector('[name=firstName]');
-    var lnInput = document.querySelector('[name=lastName]');
-    var nfcInput = document.querySelector('[name=nfcUid]');
-    if (rpInput) rpInput.value = rpId;
-    if (fnInput) fnInput.value = first;
-    if (lnInput) lnInput.value = last;
-
-    // Scroll the Add Member form into view and focus the NFC UID — the
-    // one field the operator still has to fill in after Select.
-    if (nfcInput) {
-        nfcInput.scrollIntoView({ block: 'center', behavior: 'smooth' });
-        nfcInput.focus();
-    }
-});
-</script>
