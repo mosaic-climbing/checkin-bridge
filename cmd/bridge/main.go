@@ -468,8 +468,6 @@ func main() {
 		trustedProxies,
 		bgGroup,
 		cfg.Bridge.EnableTestHooks,
-		cfg.Bridge.AllowNewMembers,
-		cfg.Bridge.DefaultAccessPolicyIDs,
 	)
 	// P3: wire the manual breaker-reset hook to the recheck.Service's
 	// exported ResetBreaker method. The /debug/reset-breakers HTTP

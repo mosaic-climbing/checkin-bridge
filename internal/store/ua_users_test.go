@@ -209,6 +209,84 @@ func TestAllUAUsers_Ordering(t *testing.T) {
 	}
 }
 
+// TestSearchUAUsers pins the v0.5.9 #10 contract used by the NFC
+// reassign picker: case-insensitive LIKE across first_name, last_name,
+// name, and email; whitespace-split tokens AND-ed together; empty query
+// returns nil (not a scan of every row).
+func TestSearchUAUsers(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	users := []*UAUser{
+		{ID: "ua-alice", FirstName: "Alice", LastName: "Alpha", Email: "alice@example.com"},
+		{ID: "ua-bob", FirstName: "Bob", LastName: "Brava", Email: "bob@example.com"},
+		{ID: "ua-alice2", FirstName: "Alice", LastName: "Zebra", Email: "alice2@example.com"},
+		{ID: "ua-c", FirstName: "Charlie", LastName: "Chaplin", Email: "c@chaplin.com"},
+	}
+	for _, u := range users {
+		if err := s.UpsertUAUser(ctx, u, nil); err != nil {
+			t.Fatalf("upsert %s: %v", u.ID, err)
+		}
+	}
+
+	t.Run("empty query returns nil", func(t *testing.T) {
+		got, err := s.SearchUAUsers(ctx, "", 10)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if got != nil {
+			t.Errorf("empty query should return nil slice, got %+v", got)
+		}
+	})
+
+	t.Run("case-insensitive substring on name", func(t *testing.T) {
+		got, err := s.SearchUAUsers(ctx, "ALICE", 10)
+		if err != nil {
+			t.Fatalf("SearchUAUsers: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("want 2 alices, got %d: %+v", len(got), got)
+		}
+		// Results ordered by last_name, first_name — Alice Alpha
+		// precedes Alice Zebra.
+		if got[0].ID != "ua-alice" || got[1].ID != "ua-alice2" {
+			t.Errorf("order wrong: got [%s, %s]", got[0].ID, got[1].ID)
+		}
+	})
+
+	t.Run("email substring match", func(t *testing.T) {
+		got, err := s.SearchUAUsers(ctx, "chaplin", 10)
+		if err != nil {
+			t.Fatalf("SearchUAUsers: %v", err)
+		}
+		if len(got) != 1 || got[0].ID != "ua-c" {
+			t.Fatalf("email search miss: %+v", got)
+		}
+	})
+
+	t.Run("AND semantics across tokens", func(t *testing.T) {
+		// Matches "Alice" AND "Zebra" — only Alice Zebra qualifies even
+		// though both words appear individually in the fixture.
+		got, err := s.SearchUAUsers(ctx, "alice zebra", 10)
+		if err != nil {
+			t.Fatalf("SearchUAUsers: %v", err)
+		}
+		if len(got) != 1 || got[0].ID != "ua-alice2" {
+			t.Fatalf("AND-across-tokens wrong: %+v", got)
+		}
+	})
+
+	t.Run("limit is respected", func(t *testing.T) {
+		got, err := s.SearchUAUsers(ctx, "a", 1)
+		if err != nil {
+			t.Fatalf("SearchUAUsers: %v", err)
+		}
+		if len(got) != 1 {
+			t.Errorf("limit=1 ignored, got %d rows", len(got))
+		}
+	})
+}
+
 // TestUAUser_FullName_Fallback pins the FullName() precedence the
 // Needs Match handler relies on: UA-Hub-provided display Name wins,
 // otherwise "First Last", with single-field fallbacks for each side.

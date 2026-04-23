@@ -69,22 +69,6 @@ type Server struct {
 	// to prod still won't expose the route unless EnableTestHooks=true.
 	// See S5 in docs/architecture-review.md.
 	enableTestHooks bool
-	// allowNewMembers gates the /ui/members/new provisioning routes (C2
-	// Layer 4d). Mirrors cfg.Bridge.AllowNewMembers. When false the routes
-	// are still registered but every handler short-circuits with a 403 +
-	// "feature disabled" alert fragment — same defence-in-depth shape as
-	// enableTestHooks. The boot-time config validator in internal/config
-	// already refuses to start with AllowNewMembers=true and an empty
-	// DefaultAccessPolicyIDs list, so by the time this field is true we
-	// know defaultAccessPolicyIDs is non-empty.
-	allowNewMembers bool
-	// defaultAccessPolicyIDs is the list of UA-Hub access-policy IDs the
-	// /ui/members/new flow attaches to every freshly-created user (§3.6
-	// of the UA-Hub API). UA-Hub creates users with no policies attached
-	// by default, so this is mandatory — without it the user exists but
-	// every tap denies. Boot validation enforces non-empty when
-	// AllowNewMembers=true, see config.validate().
-	defaultAccessPolicyIDs []string
 	// htmlCache caches rendered HTML fragments with TTL invalidation.
 	// See P1 in docs/architecture-review.md.
 	htmlCache *htmlCache
@@ -176,8 +160,6 @@ func NewServer(
 	trustedProxies []*net.IPNet,
 	bgGroup *bg.Group,
 	enableTestHooks bool,
-	allowNewMembers bool,
-	defaultAccessPolicyIDs []string,
 ) *Server {
 	s := &Server{
 		handler:                handler,
@@ -199,8 +181,6 @@ func NewServer(
 		trustedProxies:         trustedProxies,
 		bg:                     bgGroup,
 		enableTestHooks:        enableTestHooks,
-		allowNewMembers:        allowNewMembers,
-		defaultAccessPolicyIDs: defaultAccessPolicyIDs,
 		htmlCache:              newHTMLCache(),
 	}
 	s.routes()
@@ -317,8 +297,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /directory/status", withTimeout(shortTimeout, s.handleDirectoryStatus))
 	s.mux.HandleFunc("GET /directory/search", withTimeout(shortTimeout, s.handleDirectorySearch))
 
-	// Member management
-	s.mux.HandleFunc("POST /members", withTimeout(shortTimeout, s.handleAddMember))
+	// Member management. The bridge-side "create a UA-Hub user" flow
+	// (v0.4.x–v0.5.8 /ui/members/new + POST /members) was removed in
+	// v0.5.9: UA-Hub is the source of truth for user identity, so staff
+	// create users there and the bridge auto-binds on sync (or the row
+	// lands in Needs Match for manual pairing). DELETE /members stays
+	// as the "drop from bridge cache" action and is shared by the
+	// member-table row button and the member detail panel.
 	s.mux.HandleFunc("DELETE /members/{externalId}", withTimeout(shortTimeout, s.handleRemoveMember))
 
 	// Staff UI (auth handled by session cookies, not admin API key)
@@ -381,27 +366,20 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /ui/frag/unmatched/{uaUserId}/skip", withTimeout(shortTimeout, s.handleFragUnmatchedSkip))
 	s.mux.HandleFunc("POST /ui/frag/unmatched/{uaUserId}/defer", withTimeout(shortTimeout, s.handleFragUnmatchedDefer))
 
-	// "New Member" provisioning UI (C2 Layer 4d). All six routes are
-	// gated by the requireProvisioning() guard which 403s with a friendly
-	// fragment when AllowNewMembers=false. The page route serves the
-	// static form skeleton via the existing UI page renderer; the other
-	// five are HTMX fragment endpoints driving the orchestration:
-	//
-	//   GET    /ui/members/new                         — form page
-	//   GET    /ui/members/new/lookup?email=…          — live email validation
-	//   POST   /ui/members/new                         — §3.2 + §3.6 + map + audit
-	//   POST   /ui/members/new/{id}/enroll             — §6.2 start enrollment
-	//   GET    /ui/members/new/{id}/enroll/{sid}/poll  — §6.3 + §6.7 + §3.7
-	//   DELETE /ui/members/new/{id}/enroll/{sid}       — §6.4 cleanup
-	//
-	// See docs/architecture-review.md C2 §"New-user provisioning flow"
-	// for the call orchestration and guardrail rationale.
-	s.mux.HandleFunc("GET /ui/members/new", s.handleMembersNewPage)
-	s.mux.HandleFunc("GET /ui/members/new/lookup", withTimeout(shortTimeout, s.handleMembersNewLookup))
-	s.mux.HandleFunc("POST /ui/members/new", withTimeout(shortTimeout, s.handleMembersNewCreate))
-	s.mux.HandleFunc("POST /ui/members/new/{uaUserId}/enroll", withTimeout(shortTimeout, s.handleMembersNewEnrollStart))
-	s.mux.HandleFunc("GET /ui/members/new/{uaUserId}/enroll/{sessionId}/poll", withTimeout(shortTimeout, s.handleMembersNewEnrollPoll))
-	s.mux.HandleFunc("DELETE /ui/members/new/{uaUserId}/enroll/{sessionId}", withTimeout(shortTimeout, s.handleMembersNewEnrollCancel))
+	// Member detail + recovery actions (v0.5.9). Mirrors the Needs-Match
+	// detail panel pattern: the member table renders a "Details" button
+	// per row that hx-get's the detail fragment into a sticky panel
+	// above the table; the detail fragment exposes Unbind, Reactivate,
+	// Remove, and Reassign NFC card. Every mutation writes to
+	// match_audit, invalidates the member-table cache, and returns an
+	// HTML alert fragment (plus HX-Trigger: member-updated so the
+	// table auto-refreshes).
+	s.mux.HandleFunc("GET /ui/frag/member/{nfcUid}/detail", withTimeout(shortTimeout, s.handleFragMemberDetail))
+	s.mux.HandleFunc("POST /ui/frag/member/{nfcUid}/unbind", withTimeout(shortTimeout, s.handleFragMemberUnbind))
+	s.mux.HandleFunc("POST /ui/frag/member/{nfcUid}/reactivate", withTimeout(shortTimeout, s.handleFragMemberReactivate))
+	s.mux.HandleFunc("GET /ui/frag/member/{nfcUid}/reassign", withTimeout(shortTimeout, s.handleFragMemberReassign))
+	s.mux.HandleFunc("POST /ui/frag/member/{nfcUid}/reassign/search", withTimeout(shortTimeout, s.handleFragMemberReassignSearch))
+	s.mux.HandleFunc("POST /ui/frag/member/{nfcUid}/reassign/confirm", withTimeout(shortTimeout, s.handleFragMemberReassignConfirm))
 
 	// ── Long-running endpoints (15–45 min) ──────────────────
 	//
@@ -1478,96 +1456,45 @@ func (s *Server) handleDirectorySearch(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// POST /members — manually add a member to the cache.
-// Body: {"redpointId": "...", "nfcUid": "...", "firstName": "...", "lastName": "..."}
-func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		RedpointID string `json:"redpointId"`
-		NfcUID     string `json:"nfcUid"`
-		FirstName  string `json:"firstName"`
-		LastName   string `json:"lastName"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON")
-		return
-	}
-	if body.RedpointID == "" || body.NfcUID == "" {
-		writeError(w, http.StatusBadRequest, "redpointId and nfcUid are required")
-		return
-	}
-
-	nfcUID := strings.ToUpper(strings.TrimSpace(body.NfcUID))
-
-	// If name not provided, look it up from the directory
-	firstName := strings.TrimSpace(body.FirstName)
-	lastName := strings.TrimSpace(body.LastName)
-	if firstName == "" && lastName == "" && s.store != nil {
-		rec, err := s.store.GetCustomerByID(r.Context(), body.RedpointID)
-		if err == nil && rec != nil {
-			firstName = rec.FirstName
-			lastName = rec.LastName
-		}
-	}
-
-	member := &store.Member{
-		CustomerID:  body.RedpointID,
-		NfcUID:      nfcUID,
-		FirstName:   firstName,
-		LastName:    lastName,
-		BadgeStatus: "ACTIVE",
-		Active:      true,
-		CachedAt:    time.Now().UTC().Format(time.RFC3339),
-	}
-
-	if s.store != nil {
-		if err := s.store.UpsertMember(r.Context(), member); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to add member: "+err.Error())
-			return
-		}
-	}
-
-	s.logger.Info("member manually added via UI",
-		"redpointId", body.RedpointID,
-		"nfcUid", nfcUID,
-		"name", firstName+" "+lastName,
-	)
-	s.audit.Log("member_add", r.RemoteAddr, map[string]any{
-		"redpointId": body.RedpointID, "nfcUid": nfcUID,
-		"name": firstName + " " + lastName,
-	})
-
-	s.htmlCache.Invalidate()
-	writeJSON(w, map[string]any{
-		"success": true,
-		"member":  member,
-	})
-}
-
-// DELETE /members/{externalId} — remove a member from the store.
+// DELETE /members/{externalId} — remove a member from the bridge cache.
+//
+// v0.5.9: response is HTMX-friendly. On success we return an empty 200 body
+// plus `HX-Trigger: member-updated` so:
+//   - the row-level Remove button (hx-swap="outerHTML swap:0.3s" on closest tr)
+//     gets its row replaced with nothing, animating the row out
+//   - the detail-panel Remove button (hx-swap="innerHTML" on #member-detail)
+//     clears the panel
+//   - any element listening for `member-updated` (e.g. the member table
+//     container) re-fetches itself
+//
+// On error we render an AlertFragment so the operator sees what went wrong
+// without a raw 500 replacing a table row. The pre-v0.5.9 JSON shape is
+// gone: the UI was the only caller, and the v0.5.8 audit found the JSON
+// response was landing inside an HTMX swap target as raw text.
 func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 	extID := strings.ToUpper(r.PathValue("externalId"))
 	if extID == "" {
-		writeError(w, http.StatusBadRequest, "externalId required")
+		ui.RenderFragment(w, ui.AlertFragment(false, "externalId required"))
 		return
 	}
 
 	if s.store == nil {
-		writeError(w, http.StatusServiceUnavailable, "store not available")
+		ui.RenderFragment(w, ui.AlertFragment(false, "Store not available"))
 		return
 	}
 
 	existing, err := s.store.GetMemberByNFC(r.Context(), extID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		ui.RenderFragment(w, ui.AlertFragment(false, "Lookup failed: "+err.Error()))
 		return
 	}
 	if existing == nil {
-		writeError(w, http.StatusNotFound, "member not found")
+		ui.RenderFragment(w, ui.AlertFragment(false, "Member not found"))
 		return
 	}
 
 	if err := s.store.RemoveMember(r.Context(), extID); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		ui.RenderFragment(w, ui.AlertFragment(false, "Delete failed: "+err.Error()))
 		return
 	}
 
@@ -1576,7 +1503,11 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 		"externalId": extID, "name": existing.FullName(),
 	})
 	s.htmlCache.Invalidate()
-	writeJSON(w, map[string]any{"success": true})
+
+	// HX-Trigger lets the member table (and anything else subscribed)
+	// re-fetch without the detail panel needing to know about it.
+	w.Header().Set("HX-Trigger", "member-updated")
+	w.WriteHeader(http.StatusOK)
 }
 
 // GET /ingest/unmatched — get the list of unmatched/conflicted UniFi users from the last ingest.

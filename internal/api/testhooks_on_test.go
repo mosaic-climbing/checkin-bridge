@@ -61,7 +61,7 @@ func setupTestServerWithTestHooks(t *testing.T) (*Server, *store.Store, *cardmap
 	})
 
 	// Key difference: enableTestHooks=true
-	srv := NewServer(handler, unifiClient, rpClient, cm, syncer, statusSyncer, ingester, sessionMgr, nil, "gate-1", logger, db, nil, nil, nil, bgGroup, true /* enableTestHooks */, false /* allowNewMembers */, nil /* defaultAccessPolicyIDs */)
+	srv := NewServer(handler, unifiClient, rpClient, cm, syncer, statusSyncer, ingester, sessionMgr, nil, "gate-1", logger, db, nil, nil, nil, bgGroup, true /* enableTestHooks */)
 	return srv, db, cm
 }
 

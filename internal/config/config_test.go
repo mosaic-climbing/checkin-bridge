@@ -182,40 +182,6 @@ func TestValidation_SyncTimeLocal(t *testing.T) {
 	}
 }
 
-func TestValidation_AllowNewMembersRequiresPolicies(t *testing.T) {
-	// Every `cfg.Bridge.AllowNewMembers=true` bridge that boots must have
-	// at least one default access policy ID set. Without it, a freshly-
-	// created user has no access group attached and every tap denies —
-	// the single most confusing failure mode for staff ("I created the
-	// user, why can't they get in?").
-	cfg := defaults()
-	cfg.UniFi.APIToken = "tok"
-	cfg.Redpoint.APIKey = "key"
-	cfg.Redpoint.FacilityCode = "Mosaic"
-	cfg.Bridge.StaffPassword = "pass"
-	cfg.Bridge.AdminAPIKey = "adminkey"
-	cfg.Bridge.ControlPort = cfg.Bridge.Port + 1
-
-	cfg.Bridge.AllowNewMembers = true
-	// DefaultAccessPolicyIDs still empty — must refuse.
-	if err := validate(cfg); err == nil {
-		t.Fatal("expected validation error when AllowNewMembers=true and policy list empty")
-	}
-
-	cfg.Bridge.DefaultAccessPolicyIDs = []string{"pol-members"}
-	if err := validate(cfg); err != nil {
-		t.Errorf("validate(AllowNewMembers=true + policy) returned %v", err)
-	}
-
-	// With AllowNewMembers=false the policy list is unused and its emptiness
-	// must not block boot.
-	cfg.Bridge.AllowNewMembers = false
-	cfg.Bridge.DefaultAccessPolicyIDs = nil
-	if err := validate(cfg); err != nil {
-		t.Errorf("validate(AllowNewMembers=false) returned %v (should not care about policy list)", err)
-	}
-}
-
 func TestValidation_UnmatchedGraceDaysNegative(t *testing.T) {
 	cfg := defaults()
 	cfg.UniFi.APIToken = "tok"
