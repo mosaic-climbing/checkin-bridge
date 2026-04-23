@@ -69,43 +69,63 @@ type MemberRow struct {
 
 func MemberTableFragment(rows []MemberRow) string {
 	if len(rows) == 0 {
-		return `<p style="color: var(--text-muted); padding: 12px 0">No members enrolled. Run an ingest or add members manually.</p>`
+		return `<p style="color: var(--text-muted); padding: 12px 0">No members enrolled. Add users in UniFi Access and run an ingest.</p>`
 	}
 
 	var sb strings.Builder
 	sb.WriteString(`<table><thead><tr><th>Name</th><th>NFC UID</th><th>Status</th><th>Membership</th><th>Last Check-in</th><th></th></tr></thead><tbody>`)
 	for _, r := range rows {
-		badgeClass := "badge-active"
-		switch r.BadgeStatus {
-		case "FROZEN":
-			badgeClass = "badge-frozen"
-		case "EXPIRED":
-			badgeClass = "badge-expired"
-		case "PENDING_SYNC":
-			badgeClass = "badge-pending"
-		}
-		lastCI := r.LastCheckIn
-		if lastCI == "" {
-			lastCI = "Never"
-		}
-		sb.WriteString(fmt.Sprintf(`<tr>
-            <td>%s</td><td><code>%s</code></td>
-            <td><span class="badge %s">%s</span></td>
-            <td>%s</td><td>%s</td>
-            <td><button class="btn btn-danger btn-sm"
-                hx-delete="/members/%s"
-                hx-target="closest tr"
-                hx-swap="outerHTML swap:0.3s"
-                hx-confirm="Remove %s from enrolled members?"
-                hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>Remove</button></td>
-        </tr>`,
-			HTMLEscape(r.Name), HTMLEscape(r.NfcUID),
-			badgeClass, HTMLEscape(r.BadgeStatus),
-			HTMLEscape(r.BadgeName), HTMLEscape(lastCI),
-			HTMLEscape(r.NfcUID), HTMLEscape(r.Name)))
+		sb.WriteString(memberRow(r))
 	}
 	sb.WriteString(`</tbody></table>`)
 	return sb.String()
+}
+
+// memberRow renders one <tr> shared by MemberTableFragment and
+// MemberTableFragmentPaged. Extracted so the Details + Remove button
+// wiring stays consistent across the two render paths.
+func memberRow(r MemberRow) string {
+	badgeClass := "badge-active"
+	switch r.BadgeStatus {
+	case "FROZEN":
+		badgeClass = "badge-frozen"
+	case "EXPIRED":
+		badgeClass = "badge-expired"
+	case "PENDING_SYNC":
+		badgeClass = "badge-pending"
+	}
+	lastCI := r.LastCheckIn
+	if lastCI == "" {
+		lastCI = "Never"
+	}
+	// The Details button opens the v0.5.9 recovery panel (hx-target
+	// "#member-detail"). The Remove button stays on the row because
+	// the swap:0.3s row-removal animation is the cheapest UX for the
+	// common case; clicking Remove from inside the detail panel works
+	// too (that button targets "#member-detail" instead).
+	return fmt.Sprintf(`<tr>
+            <td>%s</td><td><code>%s</code></td>
+            <td><span class="badge %s">%s</span></td>
+            <td>%s</td><td>%s</td>
+            <td style="white-space: nowrap">
+                <button class="btn btn-primary btn-sm"
+                    hx-get="/ui/frag/member/%s/detail"
+                    hx-target="#member-detail"
+                    hx-swap="innerHTML"
+                    hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>Details</button>
+                <button class="btn btn-danger btn-sm"
+                    hx-delete="/members/%s"
+                    hx-target="closest tr"
+                    hx-swap="outerHTML swap:0.3s"
+                    hx-confirm="Remove %s from enrolled members?"
+                    hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>Remove</button>
+            </td>
+        </tr>`,
+		HTMLEscape(r.Name), HTMLEscape(r.NfcUID),
+		badgeClass, HTMLEscape(r.BadgeStatus),
+		HTMLEscape(r.BadgeName), HTMLEscape(lastCI),
+		HTMLEscape(r.NfcUID),
+		HTMLEscape(r.NfcUID), HTMLEscape(r.Name))
 }
 
 // MemberTableFragmentPaged renders either:
@@ -118,7 +138,7 @@ func MemberTableFragment(rows []MemberRow) string {
 // is emitted.
 func MemberTableFragmentPaged(rows []MemberRow, offset, total int) string {
 	if len(rows) == 0 && offset == 0 {
-		return `<p style="color: var(--text-muted); padding: 12px 0">No members enrolled. Run an ingest or add members manually.</p>`
+		return `<p style="color: var(--text-muted); padding: 12px 0">No members enrolled. Add users in UniFi Access and run an ingest.</p>`
 	}
 
 	var sb strings.Builder
@@ -130,34 +150,7 @@ func MemberTableFragmentPaged(rows []MemberRow, offset, total int) string {
 
 	// Render rows
 	for _, r := range rows {
-		badgeClass := "badge-active"
-		switch r.BadgeStatus {
-		case "FROZEN":
-			badgeClass = "badge-frozen"
-		case "EXPIRED":
-			badgeClass = "badge-expired"
-		case "PENDING_SYNC":
-			badgeClass = "badge-pending"
-		}
-		lastCI := r.LastCheckIn
-		if lastCI == "" {
-			lastCI = "Never"
-		}
-		sb.WriteString(fmt.Sprintf(`<tr>
-            <td>%s</td><td><code>%s</code></td>
-            <td><span class="badge %s">%s</span></td>
-            <td>%s</td><td>%s</td>
-            <td><button class="btn btn-danger btn-sm"
-                hx-delete="/members/%s"
-                hx-target="closest tr"
-                hx-swap="outerHTML swap:0.3s"
-                hx-confirm="Remove %s from enrolled members?"
-                hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>Remove</button></td>
-        </tr>`,
-			HTMLEscape(r.Name), HTMLEscape(r.NfcUID),
-			badgeClass, HTMLEscape(r.BadgeStatus),
-			HTMLEscape(r.BadgeName), HTMLEscape(lastCI),
-			HTMLEscape(r.NfcUID), HTMLEscape(r.Name)))
+		sb.WriteString(memberRow(r))
 	}
 
 	// Add load-more row if there are more pages
@@ -197,27 +190,30 @@ func SearchResultsFragment(results []SearchResult) string {
 		return `<p style="color: var(--text-muted); padding: 8px 0">No results found.</p>`
 	}
 
+	// v0.5.9: the search is now read-only. Before this release the
+	// trailing column held a "Select" button that populated the inline
+	// Add Member form. The form is gone (members are provisioned in
+	// UniFi Access, not the bridge), so the button went with it. For
+	// enrolled rows we render a "View details" action that hx-get's the
+	// member detail panel so staff can jump from a name/email search
+	// into the recovery toolkit. For non-enrolled rows we render a
+	// hint that tells the operator to add the user in UniFi Access
+	// first (which will then surface in Needs Match on next sync).
 	var sb strings.Builder
 	sb.WriteString(`<table><thead><tr><th>Name</th><th>Email</th><th>Status</th><th></th></tr></thead><tbody>`)
 	for _, r := range results {
 		status := `<span class="badge badge-denied">Not enrolled</span>`
-		// v0.5.8 (#118): the Select button carries the Redpoint ID and
-		// full name as data-* attributes; a delegated click handler in
-		// members.html reads them and populates the Add Member form.
-		// The prior implementation used an inline onclick with the
-		// values embedded as JS string literals, which silently broke
-		// for any row whose name or ID contained an apostrophe (O'Brien,
-		// D'Angelo, etc.) because HTMLEscape turns ' into &#39; and the
-		// HTML attribute parser decodes it back to ' inside the JS,
-		// causing a SyntaxError. Data attributes are HTMLEscape-safe
-		// regardless of content — the DOM getAttribute call returns the
-		// raw string so the JS never has to quote it.
-		action := fmt.Sprintf(
-			`<button type="button" class="btn btn-success btn-sm" data-action="select-member" data-redpoint-id="%s" data-name="%s">Select</button>`,
-			HTMLEscape(r.RedpointID), HTMLEscape(r.Name))
+		action := `<span style="color: var(--text-muted); font-size: 12px">Add in UniFi Access</span>`
 		if r.InCache {
 			status = fmt.Sprintf(`<span class="badge badge-active">Enrolled (%s)</span>`, HTMLEscape(r.NfcUID))
-			action = ""
+			// Jump into the detail panel; hx-target is the sticky
+			// #member-detail sink that lives above the member table.
+			action = fmt.Sprintf(
+				`<button type="button" class="btn btn-primary btn-sm"`+
+					` hx-get="/ui/frag/member/%s/detail"`+
+					` hx-target="#member-detail" hx-swap="innerHTML"`+
+					` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>View details</button>`,
+				HTMLEscape(r.NfcUID))
 		}
 		sb.WriteString(fmt.Sprintf(`<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`,
 			HTMLEscape(r.Name), HTMLEscape(r.Email), status, action))
@@ -583,203 +579,6 @@ func parseStoreTimestamp(ts string) (time.Time, bool) {
 		return t.UTC(), true
 	}
 	return time.Time{}, false
-}
-
-// ─── "New Member" provisioning UI (C2 Layer 4d) ───────────────────────
-// The five fragments below back the /ui/members/new orchestration in
-// internal/api/server.go. Each fragment is the response body for one
-// rung of the staff workflow:
-//
-//   1. EmailLookupOK / EmailLookupError       — live validation result
-//   2. PostCreateTapWidget                    — "user created, pick reader"
-//   3. EnrollmentPollingFragment              — running poll, waits for tap
-//   4. EnrollmentCompleteFragment             — card bound, done
-//   5. EnrollmentFailedFragment               — timeout / cancel / error
-//
-// All five are intentionally self-contained: each carries the `id` of
-// the swap target so the next mutation can re-render the same slot
-// without the calling page needing to thread state. This matches the
-// "Needs Match" panel pattern that the staff already know.
-
-// MemberLookupResult is the single Redpoint customer surfaced by the
-// live email validation step. Empty UserID means "no clean match" — the
-// fragment renders a blocking validation error instead.
-type MemberLookupResult struct {
-	RedpointCustomerID string
-	Name               string
-	Email              string
-	Active             bool
-	BadgeName          string
-	BadgeStatus        string
-	// AmbiguousCount > 0 means email matched multiple Redpoint customers
-	// and name disambiguation didn't land on one. Drives a different
-	// error message (so staff knows to pass first+last too) than a flat
-	// "no match found".
-	AmbiguousCount int
-}
-
-// EmailLookupFragment renders the live email-validation result that
-// /ui/members/new/lookup returns. ok==true → green "this is who I'd
-// create them as" hint; ok==false → red blocking validation message
-// the staff must resolve before submitting the form.
-func EmailLookupFragment(ok bool, msg string, hit *MemberLookupResult) string {
-	if !ok {
-		return fmt.Sprintf(`<div class="alert alert-error" data-lookup="error">%s</div>`,
-			HTMLEscape(msg))
-	}
-	if hit == nil {
-		// Defensive: ok==true must come with a non-nil hit. Render an
-		// alert so the operator sees the bug rather than a silent blank.
-		return `<div class="alert alert-error" data-lookup="error">internal: lookup ok=true but no result</div>`
-	}
-	activeBadge := `<span class="badge badge-denied">inactive</span>`
-	if hit.Active {
-		activeBadge = `<span class="badge badge-active">active</span>`
-	}
-	badgeChip := HTMLEscape(hit.BadgeName)
-	if hit.BadgeStatus != "" {
-		badgeChip = fmt.Sprintf(`%s <span style="color: var(--text-muted); font-size: 11px">(%s)</span>`,
-			HTMLEscape(hit.BadgeName), HTMLEscape(hit.BadgeStatus))
-	}
-	return fmt.Sprintf(
-		`<div class="alert alert-success" data-lookup="ok"`+
-			` data-redpoint-customer-id="%s">`+
-			`Will create UA-Hub user → Redpoint <strong>%s</strong> `+
-			`(%s) %s · %s`+
-			`</div>`,
-		HTMLEscape(hit.RedpointCustomerID),
-		HTMLEscape(hit.Name),
-		HTMLEscape(hit.Email),
-		badgeChip,
-		activeBadge,
-	)
-}
-
-// DoorOption is one entry in the reader picker for the post-create
-// fragment. Surfaces the human-friendly door name plus the device ID
-// the §6.2 enrollment call needs.
-type DoorOption struct {
-	DeviceID string
-	Name     string
-}
-
-// PostCreateFragment renders the "user created, pick a reader and tap"
-// widget that POST /ui/members/new returns. It's the bridge between
-// "user exists in UA-Hub" and "card is enrolled and bound" — staff
-// picks a reader and clicks "Start enrollment", which triggers the
-// §6.2 call.
-func PostCreateFragment(uaUserID, displayName, redpointCustomerID string, readers []DoorOption) string {
-	var sb strings.Builder
-	sb.WriteString(`<div class="card" id="members-new-result">`)
-	sb.WriteString(fmt.Sprintf(
-		`<div class="alert alert-success">`+
-			`Created UA-Hub user <strong>%s</strong> `+
-			`(<code>%s</code>) → Redpoint <code>%s</code>. `+
-			`Now bind their NFC card.`+
-			`</div>`,
-		HTMLEscape(displayName),
-		HTMLEscape(uaUserID),
-		HTMLEscape(redpointCustomerID),
-	))
-	sb.WriteString(`<form hx-post="/ui/members/new/`)
-	sb.WriteString(HTMLEscape(uaUserID))
-	sb.WriteString(`/enroll" hx-target="#members-new-result" hx-swap="outerHTML"`)
-	sb.WriteString(` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>`)
-	sb.WriteString(`<div class="form-row">`)
-	sb.WriteString(`<div class="form-group"><label>Reader</label>`)
-	sb.WriteString(`<select name="device_id" required>`)
-	if len(readers) == 0 {
-		sb.WriteString(`<option value="">(no readers found)</option>`)
-	}
-	for _, r := range readers {
-		sb.WriteString(fmt.Sprintf(`<option value="%s">%s</option>`,
-			HTMLEscape(r.DeviceID), HTMLEscape(r.Name)))
-	}
-	sb.WriteString(`</select></div>`)
-	sb.WriteString(`<button type="submit" class="btn btn-primary">Start enrollment</button>`)
-	sb.WriteString(`</div></form></div>`)
-	return sb.String()
-}
-
-// EnrollmentPollingFragment renders the "waiting for tap" panel that
-// POST /ui/members/new/{id}/enroll returns. It contains an HTMX
-// hx-trigger="every 500ms" pointing at the poll endpoint, so the same
-// slot will re-render itself with a new fragment as soon as the tap
-// is detected (or the timeout fires).
-func EnrollmentPollingFragment(uaUserID, displayName, sessionID string) string {
-	pollURL := fmt.Sprintf(`/ui/members/new/%s/enroll/%s/poll`,
-		HTMLEscape(uaUserID), HTMLEscape(sessionID))
-	cancelURL := fmt.Sprintf(`/ui/members/new/%s/enroll/%s`,
-		HTMLEscape(uaUserID), HTMLEscape(sessionID))
-	return fmt.Sprintf(`<div class="card" id="members-new-result">`+
-		`<div class="alert" style="background: var(--info-bg, #1e293b)">`+
-		`<strong>Tap a card on the reader now.</strong> `+
-		`Bridge is waiting for %s — UA-Hub session <code>%s</code>.`+
-		`</div>`+
-		`<div hx-get="%s" hx-trigger="load, every 500ms" hx-swap="outerHTML"`+
-		` hx-target="#members-new-result"`+
-		` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>`+
-		`<span class="spinner"></span> waiting for card tap…`+
-		`</div>`+
-		`<button class="btn btn-danger btn-sm" style="margin-top: 12px"`+
-		` hx-delete="%s" hx-target="#members-new-result" hx-swap="outerHTML"`+
-		` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'`+
-		` hx-confirm="Cancel enrollment? The UA-Hub user stays, but the card is not bound.">Cancel</button>`+
-		`</div>`,
-		HTMLEscape(displayName),
-		HTMLEscape(sessionID),
-		pollURL,
-		cancelURL,
-	)
-}
-
-// EnrollmentCompleteFragment renders the terminal "all done" panel
-// after AssignNFCCard succeeds. No more polling — staff can close the
-// page or click "Add another".
-func EnrollmentCompleteFragment(uaUserID, displayName, token string) string {
-	return fmt.Sprintf(`<div class="card" id="members-new-result">`+
-		`<div class="alert alert-success">`+
-		`<strong>%s</strong> is enrolled — UA-Hub user <code>%s</code>, `+
-		`card token <code>%s</code>. They can tap in now.`+
-		`</div>`+
-		`<a class="btn btn-primary" href="/ui/members/new">Add another</a>`+
-		`</div>`,
-		HTMLEscape(displayName),
-		HTMLEscape(uaUserID),
-		HTMLEscape(token),
-	)
-}
-
-// EnrollmentFailedFragment renders the terminal error/cancel panel.
-// Used by both the timeout path (poll exceeds the deadline) and the
-// "card already bound to someone else" guard (§6.7 result conflicts
-// with §3.7's intent). Staff can retry the enrollment without losing
-// the just-created UA-Hub user.
-func EnrollmentFailedFragment(uaUserID, displayName, message string, readers []DoorOption) string {
-	var sb strings.Builder
-	sb.WriteString(`<div class="card" id="members-new-result">`)
-	sb.WriteString(fmt.Sprintf(`<div class="alert alert-error">%s</div>`, HTMLEscape(message)))
-	sb.WriteString(fmt.Sprintf(
-		`<p style="margin: 8px 0">UA-Hub user <code>%s</code> (<strong>%s</strong>) was created. Pick a reader and try again, or close this page.</p>`,
-		HTMLEscape(uaUserID), HTMLEscape(displayName)))
-	sb.WriteString(`<form hx-post="/ui/members/new/`)
-	sb.WriteString(HTMLEscape(uaUserID))
-	sb.WriteString(`/enroll" hx-target="#members-new-result" hx-swap="outerHTML"`)
-	sb.WriteString(` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>`)
-	sb.WriteString(`<div class="form-row">`)
-	sb.WriteString(`<div class="form-group"><label>Reader</label>`)
-	sb.WriteString(`<select name="device_id" required>`)
-	if len(readers) == 0 {
-		sb.WriteString(`<option value="">(no readers found)</option>`)
-	}
-	for _, r := range readers {
-		sb.WriteString(fmt.Sprintf(`<option value="%s">%s</option>`,
-			HTMLEscape(r.DeviceID), HTMLEscape(r.Name)))
-	}
-	sb.WriteString(`</select></div>`)
-	sb.WriteString(`<button type="submit" class="btn btn-primary">Retry enrollment</button>`)
-	sb.WriteString(`</div></form></div>`)
-	return sb.String()
 }
 
 // UnmatchedRow is a single UniFi user that the ingest couldn't pair with a
@@ -1219,6 +1018,448 @@ func NeedsMatchDetailFragment(
 		HTMLEscape(uaUserID),
 	))
 	sb.WriteString(`</div></div>`)
+	return sb.String()
+}
+
+// ─── Member detail panel (v0.5.9) ─────────────────────────────────────
+//
+// MemberDetailData is the view-model for the per-member recovery panel
+// that opens above the member table on the Members page. It's populated
+// by handleFragMemberDetail and rendered by MemberDetailFragment.
+//
+// Nilability notes:
+//   - Mapping == nil means the member row exists in cache but no
+//     ua_user_mappings row points at its customer_id. Orphaned members
+//     are rare (usually a half-completed ingest) and the panel
+//     surfaces them for manual cleanup. Unbind and Reactivate are
+//     disabled in that state because both key on UAUserID.
+//   - UAUser == nil means the mapping points at a UA-Hub user we
+//     haven't mirrored yet (sync-lag). Reactivate and Reassign are
+//     disabled; the audit trail + mapping info still render.
+//   - Audit may be empty for freshly-bound members. The panel shows a
+//     neutral "no audit entries" placeholder rather than an error.
+type MemberDetailData struct {
+	Member  MemberDetailMember
+	Mapping *MemberDetailMapping
+	UAUser  *MemberDetailUAUser
+	Audit   []MemberAuditRow
+}
+
+type MemberDetailMember struct {
+	NfcUID      string
+	Name        string
+	CustomerID  string
+	BadgeStatus string
+	BadgeName   string
+	Active      bool
+	LastCheckIn string
+	CachedAt    string
+}
+
+type MemberDetailMapping struct {
+	UAUserID  string
+	MatchedAt string
+	MatchedBy string
+}
+
+type MemberDetailUAUser struct {
+	ID     string
+	Name   string
+	Email  string
+	Status string // "ACTIVE" | "DEACTIVATED" | ""
+}
+
+type MemberAuditRow struct {
+	Timestamp string
+	Field     string
+	BeforeVal string
+	AfterVal  string
+	Source    string
+}
+
+// MemberDetailFragment renders the sticky detail panel. Mirrors
+// NeedsMatchDetailFragment: one self-contained card that action
+// mutations hx-swap back into place. Every mutation emits
+// `HX-Trigger: member-updated` from the server so the member table
+// auto-refreshes after a successful action.
+//
+// Button enabling rules (documented on the struct above):
+//   - Unbind:     requires Mapping != nil
+//   - Reactivate: requires Mapping != nil && UAUser != nil && UAUser.Status == "DEACTIVATED"
+//   - Remove:     always available
+//   - Reassign:   requires Mapping != nil && UAUser != nil
+//
+// Disabled buttons still render — with a tooltip explaining why —
+// so staff don't wonder "where did the button go" on a sync-lag row.
+func MemberDetailFragment(d MemberDetailData) string {
+	var sb strings.Builder
+
+	sb.WriteString(`<div class="card" id="member-detail-panel">`)
+
+	// ── Header: member identity ─────────────────────────────────────
+	activeBadge := `<span class="badge badge-denied">inactive</span>`
+	if d.Member.Active {
+		activeBadge = `<span class="badge badge-active">active</span>`
+	}
+	badgeStatusChip := HTMLEscape(d.Member.BadgeStatus)
+	if d.Member.BadgeStatus == "" {
+		badgeStatusChip = `<span style="color: var(--text-muted)">—</span>`
+	}
+	lastCI := d.Member.LastCheckIn
+	if lastCI == "" {
+		lastCI = "Never"
+	}
+
+	sb.WriteString(fmt.Sprintf(
+		`<div style="display: flex; justify-content: space-between; align-items: flex-start">`+
+			`<div>`+
+			`<h3 style="margin: 0">%s</h3>`+
+			`<p style="color: var(--text-muted); margin: 4px 0 0">`+
+			`NFC <code>%s</code> · Redpoint <code>%s</code> · Badge %s · %s · Last tap: %s`+
+			`</p>`+
+			`</div>`+
+			`<button type="button" class="btn btn-sm"`+
+			` onclick="document.getElementById('member-detail').innerHTML = ''"`+
+			` title="Close panel">✕</button>`+
+			`</div>`,
+		HTMLEscape(d.Member.Name),
+		HTMLEscape(d.Member.NfcUID),
+		HTMLEscape(d.Member.CustomerID),
+		badgeStatusChip,
+		activeBadge,
+		HTMLEscape(lastCI),
+	))
+
+	// ── Mapping / UA-Hub identity ───────────────────────────────────
+	sb.WriteString(`<div style="margin-top: 12px; padding: 12px; background: var(--bg-muted, #1a1a1a); border-radius: 4px">`)
+	if d.Mapping == nil {
+		sb.WriteString(`<strong style="color: var(--warn, #d4a72c)">No UA-Hub mapping</strong>`)
+		sb.WriteString(`<p style="margin: 4px 0 0; color: var(--text-muted); font-size: 13px">`)
+		sb.WriteString(`This member is in the bridge cache but no ua_user_mappings row points at their Redpoint customer. Unbind and Reactivate are disabled; use Remove to drop the orphan, then re-ingest from UniFi Access to re-create the binding.`)
+		sb.WriteString(`</p>`)
+	} else {
+		uaName := `<span style="color: var(--text-muted)">(mirror row missing)</span>`
+		uaEmail := `<span style="color: var(--text-muted)">—</span>`
+		uaStatus := `<span style="color: var(--text-muted)">unknown</span>`
+		if d.UAUser != nil {
+			if d.UAUser.Name != "" {
+				uaName = HTMLEscape(d.UAUser.Name)
+			}
+			if d.UAUser.Email != "" {
+				uaEmail = HTMLEscape(d.UAUser.Email)
+			}
+			switch d.UAUser.Status {
+			case "ACTIVE":
+				uaStatus = `<span class="badge badge-active">ACTIVE</span>`
+			case "DEACTIVATED":
+				uaStatus = `<span class="badge badge-denied">DEACTIVATED</span>`
+			case "":
+				uaStatus = `<span style="color: var(--text-muted)">(no status)</span>`
+			default:
+				uaStatus = HTMLEscape(d.UAUser.Status)
+			}
+		}
+		sb.WriteString(fmt.Sprintf(
+			`<div style="display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; font-size: 13px">`+
+				`<div style="color: var(--text-muted)">UA-Hub user</div><div>%s <code style="font-size: 11px">(%s)</code></div>`+
+				`<div style="color: var(--text-muted)">Email</div><div>%s</div>`+
+				`<div style="color: var(--text-muted)">UA-Hub status</div><div>%s</div>`+
+				`<div style="color: var(--text-muted)">Matched at</div><div>%s</div>`+
+				`<div style="color: var(--text-muted)">Matched by</div><div><code>%s</code></div>`+
+				`</div>`,
+			uaName, HTMLEscape(d.Mapping.UAUserID),
+			uaEmail,
+			uaStatus,
+			HTMLEscape(d.Mapping.MatchedAt),
+			HTMLEscape(d.Mapping.MatchedBy),
+		))
+	}
+	sb.WriteString(`</div>`)
+
+	// ── Recovery actions ────────────────────────────────────────────
+	sb.WriteString(`<div style="margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px">`)
+
+	// Unbind: requires Mapping != nil
+	if d.Mapping != nil {
+		sb.WriteString(fmt.Sprintf(
+			`<button type="button" class="btn btn-warning btn-sm"`+
+				` hx-post="/ui/frag/member/%s/unbind"`+
+				` hx-target="#member-detail" hx-swap="innerHTML"`+
+				` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'`+
+				` hx-confirm="Unbind keeps the UA-Hub user and the bridge cache row, but clears the mapping and re-queues them in Needs Match so you can pick the correct Redpoint customer. Continue?">Unbind (re-queue)</button>`,
+			HTMLEscape(d.Member.NfcUID),
+		))
+	} else {
+		sb.WriteString(`<button type="button" class="btn btn-warning btn-sm" disabled` +
+			` title="No UA-Hub mapping to unbind">Unbind (re-queue)</button>`)
+	}
+
+	// Reactivate: only when the UA user is currently deactivated
+	if d.Mapping != nil && d.UAUser != nil && d.UAUser.Status == "DEACTIVATED" {
+		sb.WriteString(fmt.Sprintf(
+			`<button type="button" class="btn btn-primary btn-sm"`+
+				` hx-post="/ui/frag/member/%s/reactivate"`+
+				` hx-target="#member-detail" hx-swap="innerHTML"`+
+				` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'`+
+				` hx-confirm="Flip the UA-Hub user status from DEACTIVATED back to ACTIVE? This undoes a prior Skip.">Reactivate UA-Hub user</button>`,
+			HTMLEscape(d.Member.NfcUID),
+		))
+	} else {
+		reason := "User is not deactivated"
+		if d.Mapping == nil {
+			reason = "No UA-Hub mapping"
+		} else if d.UAUser == nil {
+			reason = "UA-Hub mirror row missing — run a sync first"
+		}
+		sb.WriteString(fmt.Sprintf(
+			`<button type="button" class="btn btn-primary btn-sm" disabled title="%s">Reactivate UA-Hub user</button>`,
+			HTMLEscape(reason),
+		))
+	}
+
+	// Reassign NFC: requires Mapping + UAUser (we need both sides for the audit trail)
+	if d.Mapping != nil && d.UAUser != nil {
+		sb.WriteString(fmt.Sprintf(
+			`<button type="button" class="btn btn-primary btn-sm"`+
+				` hx-get="/ui/frag/member/%s/reassign"`+
+				` hx-target="#member-detail" hx-swap="innerHTML"`+
+				` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>Reassign NFC card</button>`,
+			HTMLEscape(d.Member.NfcUID),
+		))
+	} else {
+		reason := "UA-Hub mirror row missing — run a sync first"
+		if d.Mapping == nil {
+			reason = "No UA-Hub mapping"
+		}
+		sb.WriteString(fmt.Sprintf(
+			`<button type="button" class="btn btn-primary btn-sm" disabled title="%s">Reassign NFC card</button>`,
+			HTMLEscape(reason),
+		))
+	}
+
+	// Remove is always available.
+	sb.WriteString(fmt.Sprintf(
+		`<button type="button" class="btn btn-danger btn-sm"`+
+			` hx-delete="/members/%s"`+
+			` hx-target="#member-detail" hx-swap="innerHTML"`+
+			` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'`+
+			` hx-confirm="Remove %s from the bridge cache? The UA-Hub user survives — next ingest will either re-bind or drop them in Needs Match.">Remove from cache</button>`,
+		HTMLEscape(d.Member.NfcUID),
+		HTMLEscape(d.Member.Name),
+	))
+
+	sb.WriteString(`</div>`)
+
+	// ── Audit trail ─────────────────────────────────────────────────
+	sb.WriteString(`<hr style="margin: 16px 0; border: none; border-top: 1px solid var(--border, #333)">`)
+	sb.WriteString(`<h4 style="margin: 0 0 8px">Audit trail</h4>`)
+	if d.Mapping == nil || len(d.Audit) == 0 {
+		sb.WriteString(`<p style="color: var(--text-muted); font-size: 13px; margin: 0">`)
+		if d.Mapping == nil {
+			sb.WriteString(`No audit rows — audit is keyed on UA-Hub user ID and this member has no mapping.`)
+		} else {
+			sb.WriteString(`No audit entries yet for this user.`)
+		}
+		sb.WriteString(`</p>`)
+	} else {
+		sb.WriteString(`<table style="font-size: 12px"><thead><tr>`)
+		sb.WriteString(`<th>When</th><th>Field</th><th>Before</th><th>After</th><th>Source</th>`)
+		sb.WriteString(`</tr></thead><tbody>`)
+		for _, a := range d.Audit {
+			beforeVal := HTMLEscape(a.BeforeVal)
+			if a.BeforeVal == "" {
+				beforeVal = `<span style="color: var(--text-muted)">—</span>`
+			}
+			afterVal := HTMLEscape(a.AfterVal)
+			if a.AfterVal == "" {
+				afterVal = `<span style="color: var(--text-muted)">—</span>`
+			}
+			sb.WriteString(fmt.Sprintf(
+				`<tr><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td><td><code>%s</code></td></tr>`,
+				HTMLEscape(a.Timestamp),
+				HTMLEscape(a.Field),
+				beforeVal,
+				afterVal,
+				HTMLEscape(a.Source),
+			))
+		}
+		sb.WriteString(`</tbody></table>`)
+	}
+
+	sb.WriteString(`</div>`)
+	return sb.String()
+}
+
+// ─── Member reassign panel (v0.5.9 #10) ───────────────────────────────
+//
+// MemberReassignData drives the NFC reassignment picker. Flow:
+//
+//   1. Operator clicks "Reassign NFC card" in the detail panel →
+//      handleFragMemberReassign renders this fragment with the NFC UID,
+//      the current owner's name/UA ID, an empty candidate list, and an
+//      empty search query.
+//
+//   2. Operator types in the search box + submits →
+//      handleFragMemberReassignSearch walks ua_users (via
+//      store.SearchUAUsers), filters out the current owner (no point
+//      reassigning to themselves), and re-renders this fragment with
+//      the candidate list populated.
+//
+//   3. Operator clicks "Reassign here" on a candidate row →
+//      handleFragMemberReassignConfirm calls unifi.AssignNFCCard with
+//      forceAdd=true, writes two audit rows (old+new UA user IDs), and
+//      swaps in an AlertFragment plus the HX-Trigger:member-updated
+//      header so the member table refreshes.
+//
+// Cancel button goes back to the detail panel via hx-get on
+// /ui/frag/member/{nfcUid}/detail. Nothing is committed until step 3,
+// so the operator can back out at any point.
+type MemberReassignData struct {
+	NfcUID         string
+	CurrentUserID  string // UA-Hub ID of the current card owner
+	CurrentName    string // display name of the current owner
+	CurrentMember  string // bridge-side member name (from the member row)
+	Query          string
+	Candidates     []MemberReassignCandidate
+	ErrorMessage   string // non-empty → rendered as an inline alert above the search box
+}
+
+// MemberReassignCandidate is one UA-Hub user in the reassign picker.
+// HasExistingCard is surfaced in the UI as a "will reassign from other
+// user too" hint — the UA-Hub API handles the atomic swap, but staff
+// benefit from seeing that it's a three-way move.
+type MemberReassignCandidate struct {
+	UAUserID        string
+	Name            string
+	Email           string
+	Status          string // "ACTIVE" | "DEACTIVATED" | ""
+	HasExistingCard bool
+}
+
+// MemberReassignFragment renders the reassign picker. Swapped into the
+// #member-detail sink, so Cancel rehydrates the detail panel.
+func MemberReassignFragment(d MemberReassignData) string {
+	var sb strings.Builder
+
+	sb.WriteString(`<div class="card" id="member-reassign-panel">`)
+	sb.WriteString(fmt.Sprintf(
+		`<div style="display: flex; justify-content: space-between; align-items: flex-start">`+
+			`<div>`+
+			`<h3 style="margin: 0">Reassign NFC card</h3>`+
+			`<p style="color: var(--text-muted); margin: 4px 0 0; font-size: 13px">`+
+			`Card <code>%s</code> is currently bound to <strong>%s</strong> `+
+			`<code>(%s)</code>. Pick a different UA-Hub user below to move the card.`+
+			`</p>`+
+			`</div>`+
+			`<button type="button" class="btn btn-sm"`+
+			` hx-get="/ui/frag/member/%s/detail"`+
+			` hx-target="#member-detail" hx-swap="innerHTML"`+
+			` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'`+
+			` title="Cancel reassignment and return to the detail panel">Cancel</button>`+
+			`</div>`,
+		HTMLEscape(d.NfcUID),
+		HTMLEscape(d.CurrentName),
+		HTMLEscape(d.CurrentUserID),
+		HTMLEscape(d.NfcUID),
+	))
+
+	if d.ErrorMessage != "" {
+		sb.WriteString(fmt.Sprintf(
+			`<div class="alert alert-error" style="margin-top: 12px">%s</div>`,
+			HTMLEscape(d.ErrorMessage),
+		))
+	}
+
+	// Inline search form — POSTs to the search endpoint; response
+	// replaces the whole fragment so the state reflects the most
+	// recent query. CSRF-protected via X-Requested-With + the double-
+	// submit token from layout.html.
+	sb.WriteString(fmt.Sprintf(
+		`<form hx-post="/ui/frag/member/%s/reassign/search"`+
+			` hx-target="#member-detail" hx-swap="innerHTML"`+
+			` hx-headers='{"X-Requested-With":"XMLHttpRequest"}' style="margin: 12px 0; display: flex; gap: 8px">`+
+			`<input type="text" name="q" value="%s" placeholder="Search UA-Hub by name or email…" style="flex: 1" autofocus>`+
+			`<button class="btn btn-primary btn-sm" type="submit">Search</button>`+
+			`</form>`,
+		HTMLEscape(d.NfcUID), HTMLEscape(d.Query),
+	))
+
+	if d.Query == "" {
+		sb.WriteString(`<p style="color: var(--text-muted); padding: 8px 0; font-size: 13px">` +
+			`Type a name or email above to find the intended card owner. The current owner is excluded automatically.` +
+			`</p>`)
+	} else if len(d.Candidates) == 0 {
+		sb.WriteString(fmt.Sprintf(
+			`<p style="color: var(--text-muted); padding: 8px 0; font-size: 13px">`+
+				`No UA-Hub users matched <code>%s</code>. Try a shorter query, or make sure the user has been synced from UA-Hub.`+
+				`</p>`,
+			HTMLEscape(d.Query),
+		))
+	} else {
+		sb.WriteString(`<table><thead><tr>`)
+		sb.WriteString(`<th>Name</th><th>Email</th><th>Status</th><th>UA-Hub ID</th><th></th>`)
+		sb.WriteString(`</tr></thead><tbody>`)
+		for _, c := range d.Candidates {
+			statusBadge := `<span style="color: var(--text-muted)">(no status)</span>`
+			switch c.Status {
+			case "ACTIVE":
+				statusBadge = `<span class="badge badge-active">ACTIVE</span>`
+			case "DEACTIVATED":
+				statusBadge = `<span class="badge badge-denied">DEACTIVATED</span>`
+			default:
+				if c.Status != "" {
+					statusBadge = HTMLEscape(c.Status)
+				}
+			}
+
+			// Swap hint — if the target already has a card, UA-Hub's
+			// force_add will atomically unbind it from the target's
+			// previous card too. Surfacing this up-front stops a "why
+			// did my own card stop working?" support ticket.
+			swapHint := ""
+			if c.HasExistingCard {
+				swapHint = ` <span title="This user already has an NFC card. Reassigning will unbind their existing card in UA-Hub." style="color: var(--warn, #d4a72c); font-size: 12px">⚠ has existing card</span>`
+			}
+
+			// Confirm prompt surfaces the two-sided effect so staff
+			// doesn't reassign by accident.
+			confirmMsg := fmt.Sprintf(
+				"Move card %s from %s to %s? This updates UA-Hub and writes two audit rows.",
+				d.NfcUID, d.CurrentName, c.Name,
+			)
+			if c.HasExistingCard {
+				confirmMsg += " The target's existing card will be unbound."
+			}
+
+			sb.WriteString(fmt.Sprintf(
+				`<tr>`+
+					`<td>%s%s</td>`+
+					`<td>%s</td>`+
+					`<td>%s</td>`+
+					`<td><code style="font-size: 11px">%s</code></td>`+
+					`<td>`+
+					`<form hx-post="/ui/frag/member/%s/reassign/confirm"`+
+					` hx-target="#member-detail" hx-swap="innerHTML"`+
+					` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'`+
+					` hx-confirm="%s" style="margin: 0">`+
+					`<input type="hidden" name="targetUaUserId" value="%s">`+
+					`<button type="submit" class="btn btn-primary btn-sm">Reassign here</button>`+
+					`</form>`+
+					`</td>`+
+					`</tr>`,
+				HTMLEscape(c.Name), swapHint,
+				HTMLEscape(c.Email),
+				statusBadge,
+				HTMLEscape(c.UAUserID),
+				HTMLEscape(d.NfcUID),
+				HTMLEscape(confirmMsg),
+				HTMLEscape(c.UAUserID),
+			))
+		}
+		sb.WriteString(`</tbody></table>`)
+	}
+
+	sb.WriteString(`</div>`)
 	return sb.String()
 }
 
