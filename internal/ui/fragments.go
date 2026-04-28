@@ -417,7 +417,7 @@ func SyncLastRunPillFull(jobType, status, createdAt, errMsg, progress string) st
 	id := fmt.Sprintf("sync-pill-%s", HTMLEscape(jobType))
 	if status == "" {
 		return fmt.Sprintf(
-			`<span id="%s" class="badge" style="background:#eceff1;color:var(--text-muted);font-weight:500">Never run</span>`,
+			`<span id="%s" class="badge badge-muted">Never run</span>`,
 			id)
 	}
 	rel := FormatRelative(createdAt)
@@ -474,7 +474,7 @@ func SyncLastRunPillFull(jobType, status, createdAt, errMsg, progress string) st
 			id, HTMLEscape(createdAt), HTMLEscape(rel))
 	default:
 		return fmt.Sprintf(
-			`<span id="%s" class="badge" style="background:#eceff1;color:var(--text-muted)">%s · %s</span>`,
+			`<span id="%s" class="badge badge-muted">%s · %s</span>`,
 			id, HTMLEscape(status), HTMLEscape(rel))
 	}
 }
@@ -1131,9 +1131,9 @@ func MemberDetailFragment(d MemberDetailData) string {
 	))
 
 	// ── Mapping / UA-Hub identity ───────────────────────────────────
-	sb.WriteString(`<div style="margin-top: 12px; padding: 12px; background: var(--bg-muted, #1a1a1a); border-radius: 4px">`)
+	sb.WriteString(`<div style="margin-top: 12px; padding: 12px; background: #fff; border: 1px solid var(--border); border-left: 3px solid var(--warning, #fdcb6e); border-radius: 4px">`)
 	if d.Mapping == nil {
-		sb.WriteString(`<strong style="color: var(--warn, #d4a72c)">No UA-Hub mapping</strong>`)
+		sb.WriteString(`<strong>No UA-Hub mapping</strong>`)
 		sb.WriteString(`<p style="margin: 4px 0 0; color: var(--text-muted); font-size: 13px">`)
 		sb.WriteString(`This member is in the bridge cache but no ua_user_mappings row points at their Redpoint customer. Unbind and Reactivate are disabled; use Remove to drop the orphan, then re-ingest from UniFi Access to re-create the binding.`)
 		sb.WriteString(`</p>`)
