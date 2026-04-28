@@ -188,10 +188,18 @@ Expect `HTTP/2 401` or `HTTP/2 200` — anything that completes the TLS handshak
 
 ## 5. Create the launch daemon
 
-Write `/Library/LaunchDaemons/com.mosaic.bridge.plist` on the MacBook:
+The plist is checked into the repo at `deploy/macbook/com.mosaic.bridge.plist`. Drop it into `/Library/LaunchDaemons/`:
 
 ```
-sudo tee /Library/LaunchDaemons/com.mosaic.bridge.plist > /dev/null <<'EOF'
+sudo curl -fsSL -o /Library/LaunchDaemons/com.mosaic.bridge.plist \
+  https://raw.githubusercontent.com/mosaic-climbing/checkin-bridge/main/deploy/macbook/com.mosaic.bridge.plist
+sudo chown root:wheel /Library/LaunchDaemons/com.mosaic.bridge.plist
+sudo chmod 644        /Library/LaunchDaemons/com.mosaic.bridge.plist
+```
+
+For reference, the file is:
+
+```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -216,10 +224,6 @@ sudo tee /Library/LaunchDaemons/com.mosaic.bridge.plist > /dev/null <<'EOF'
   </dict>
 </dict>
 </plist>
-EOF
-
-sudo chown root:wheel /Library/LaunchDaemons/com.mosaic.bridge.plist
-sudo chmod 644        /Library/LaunchDaemons/com.mosaic.bridge.plist
 ```
 
 Notes:
@@ -776,9 +780,11 @@ The bridge logs its build version and a hash of the non-secret config on startup
 | `/usr/local/mosaic-bridge/data/bridge.db`                  | SQLite store (members, checkins, policies, jobs) |
 | `/usr/local/mosaic-bridge/bridge.log`                      | stdout                         |
 | `/usr/local/mosaic-bridge/bridge.err`                      | stderr                         |
-| `/Library/LaunchDaemons/com.mosaic.bridge.plist`           | launchd service definition     |
+| `/Library/LaunchDaemons/com.mosaic.bridge.plist`           | launchd service definition (checked in: `deploy/macbook/com.mosaic.bridge.plist`) |
 | `/Library/LaunchDaemons/com.mosaic.bridge-backup.plist`    | nightly SQLite backup job      |
 | `/Library/LaunchDaemons/com.mosaic.bridge-health.plist`    | 5-minute healthcheck job       |
+| `/Library/LaunchDaemons/com.mosaic.bridge-updater.plist`   | 5-minute auto-updater job (checked in: `deploy/macbook/com.mosaic.bridge-updater.plist`) |
+| `/usr/local/mosaic-bridge/auto-update.sh`                  | auto-updater poller (checked in: `deploy/macbook/auto-update.sh`) |
 | `/etc/newsyslog.d/com.mosaic.bridge.conf`                  | log rotation rule              |
 | `/usr/local/mosaic-bridge/backups/`                        | daily SQLite snapshots (30d)   |
 | `/usr/local/mosaic-bridge/backup.sh`                       | backup script                  |

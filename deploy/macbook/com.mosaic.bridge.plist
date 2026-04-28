@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.mosaic.bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/mosaic-bridge/mosaic-bridge</string>
+  </array>
+  <key>UserName</key><string>mosaic</string>
+  <key>GroupName</key><string>staff</string>
+  <key>WorkingDirectory</key><string>/usr/local/mosaic-bridge</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/usr/local/mosaic-bridge/bridge.log</string>
+  <key>StandardErrorPath</key><string>/usr/local/mosaic-bridge/bridge.err</string>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key><integer>4096</integer>
+  </dict>
+</dict>
+</plist>

@@ -195,31 +195,12 @@ Why it matters: `DEPLOY.md` §2 + §3 + §4.
 
 The plist doesn't need the binary to exist yet — `update.sh` will fetch and install the binary on its first run, then the plist will be ready to load.
 
-```bash
-ssh $GYM 'sudo tee /Library/LaunchDaemons/com.mosaic.bridge.plist > /dev/null' <<'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.mosaic.bridge</string>
-  <key>ProgramArguments</key>
-  <array><string>/usr/local/mosaic-bridge/mosaic-bridge</string></array>
-  <key>UserName</key><string>mosaic</string>
-  <key>GroupName</key><string>staff</string>
-  <key>WorkingDirectory</key><string>/usr/local/mosaic-bridge</string>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/usr/local/mosaic-bridge/bridge.log</string>
-  <key>StandardErrorPath</key><string>/usr/local/mosaic-bridge/bridge.err</string>
-  <key>ThrottleInterval</key><integer>5</integer>
-  <key>ProcessType</key><string>Interactive</string>
-  <key>SoftResourceLimits</key>
-  <dict><key>NumberOfFiles</key><integer>4096</integer></dict>
-</dict>
-</plist>
-EOF
+The plist is checked into the repo (`deploy/macbook/com.mosaic.bridge.plist`). Pull it onto the Mac via `curl`:
 
-ssh $GYM '
+```bash
+ssh -t $GYM '
+  sudo curl -fsSL -o /Library/LaunchDaemons/com.mosaic.bridge.plist \
+    https://raw.githubusercontent.com/mosaic-climbing/checkin-bridge/main/deploy/macbook/com.mosaic.bridge.plist
   sudo chown root:wheel /Library/LaunchDaemons/com.mosaic.bridge.plist
   sudo chmod 644        /Library/LaunchDaemons/com.mosaic.bridge.plist
 '
