@@ -124,10 +124,10 @@ type Syncer struct {
 
 	// shadowMode and metrics are set once at construction and read on
 	// the sync hot path. Pre-PR3 they were settable post-construction
-	// (SetShadowMode, SetMetrics), which made the writes racy with the
-	// in-flight loop's reads — operator toggles could tear the
-	// shadow-mode safety flag. Construction-only assignment closes
-	// that race without needing atomics.
+	// (SetShadowMode, SetMetrics), which #1 hardened with atomic.Bool /
+	// atomic.Pointer to close the race. PR3's elimination of setters
+	// makes the atomics unnecessary — no concurrent writer can exist
+	// after construction — so we revert to plain types.
 	shadowMode bool
 	metrics    *metrics.Registry
 
@@ -480,8 +480,9 @@ func (s *Syncer) RunSync(ctx context.Context) (*SyncResult, error) {
 
 			if memberAllowed && !unifiActive {
 				// Member is valid in Redpoint but locked out in UniFi → reactivate
+				shadow := s.shadowMode
 				action := "REACTIVATING user in UniFi"
-				if s.shadowMode {
+				if shadow {
 					action = "SHADOW: would REACTIVATE user in UniFi"
 				}
 				s.logger.Info(action,
@@ -490,7 +491,7 @@ func (s *Syncer) RunSync(ctx context.Context) (*SyncResult, error) {
 					"unifiStatus", user.Status,
 					"badgeStatus", cached.BadgeStatus,
 				)
-				if s.shadowMode {
+				if shadow {
 					result.Activated++
 					continue
 				}
@@ -508,8 +509,9 @@ func (s *Syncer) RunSync(ctx context.Context) (*SyncResult, error) {
 
 			} else if !memberAllowed && unifiActive {
 				// Member is expired/frozen in Redpoint but still active in UniFi → deactivate
+				shadow := s.shadowMode
 				action := "DEACTIVATING user in UniFi"
-				if s.shadowMode {
+				if shadow {
 					action = "SHADOW: would DEACTIVATE user in UniFi"
 				}
 				s.logger.Info(action,
@@ -519,7 +521,7 @@ func (s *Syncer) RunSync(ctx context.Context) (*SyncResult, error) {
 					"active", cached.Active,
 					"reason", cached.DenyReason(),
 				)
-				if s.shadowMode {
+				if shadow {
 					result.Deactivated++
 					continue
 				}
@@ -662,8 +664,9 @@ func (s *Syncer) runExpiryPhase(ctx context.Context, result *SyncResult) {
 		if err := ctx.Err(); err != nil {
 			return
 		}
+		shadow := s.shadowMode
 		action := "DEACTIVATING unmatched UA user (grace window expired)"
-		if s.shadowMode {
+		if shadow {
 			action = "SHADOW: would DEACTIVATE unmatched UA user (grace expired)"
 		}
 		s.logger.Warn(action,
@@ -673,7 +676,7 @@ func (s *Syncer) runExpiryPhase(ctx context.Context, result *SyncResult) {
 			"graceUntil", p.GraceUntil,
 		)
 
-		if s.shadowMode {
+		if shadow {
 			// Shadow contract: never touch UA-Hub, and never dequeue the
 			// pending ticket — flipping to live must re-find this row and
 			// actually run the deactivation. Count the would-be decision

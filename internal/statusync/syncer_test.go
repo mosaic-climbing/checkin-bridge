@@ -508,8 +508,8 @@ func TestSupervisedLoop_RestartsOnPanic(t *testing.T) {
 	reg := metrics.New()
 	s := &Syncer{
 		logger:  logger,
-		metrics: reg,
 		config:  Config{SyncInterval: 24 * time.Hour},
+		metrics: reg,
 	}
 
 	calls := 0

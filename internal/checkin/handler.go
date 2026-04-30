@@ -63,10 +63,14 @@ type Handler struct {
 	// (denials short-circuit straight to recordDeniedEvent). Pre-A3 this
 	// was a *statusync.Syncer; the dependency is now a narrow interface
 	// (recheck.Rechecker) so tests can stub it without spinning up
-	// statusync.
+	// statusync, and the implementation lives in its own package
+	// (internal/recheck) with its own breaker and config knobs.
 	rechecker recheck.Rechecker
 	// metrics is the optional observability sink (nil-checked at every
-	// emit site). Set once at construction; never mutated.
+	// emit site). Set once at construction; never mutated. Pre-PR3 this
+	// was an atomic.Pointer guarded by the SetMetrics setter (#1's race
+	// fix); PR3's elimination of setters lets us drop the atomic since
+	// no concurrent writer can exist after construction.
 	metrics *metrics.Registry
 	gateID  string
 	// shadowMode is set once at construction and read from the tap hot
@@ -417,6 +421,7 @@ func (h *Handler) unlockAndRecord(ctx context.Context, event unifi.AccessEvent, 
 	// Backfilled events (replayed after a WS reconnect) never unlock — the
 	// door already had its chance during the outage and the member is long
 	// gone. We still record the event so the audit trail is complete.
+	shadow := h.shadowMode
 	if event.DoorID != "" {
 		switch {
 		case event.IsBackfill:
@@ -427,7 +432,7 @@ func (h *Handler) unlockAndRecord(ctx context.Context, event unifi.AccessEvent, 
 				"customerId", member.CustomerID,
 				"timestamp", event.Timestamp,
 			)
-		case h.shadowMode:
+		case shadow:
 			h.logger.Info("SHADOW: would unlock door",
 				"doorId", event.DoorID,
 				"doorName", event.DoorName,
@@ -474,7 +479,7 @@ func (h *Handler) unlockAndRecord(ctx context.Context, event unifi.AccessEvent, 
 	// ── BACKGROUND: record in Redpoint asynchronously ────────
 	// Shadow mode logs the would-be call and skips it so we never double-record.
 
-	if h.shadowMode {
+	if shadow {
 		if h.gateID != "" {
 			h.logger.Info("SHADOW: would record check-in in Redpoint",
 				"gateId", h.gateID,
@@ -504,14 +509,23 @@ func (h *Handler) unlockAndRecord(ctx context.Context, event unifi.AccessEvent, 
 	// always equals the WG counter; the decrement runs in the same defer
 	// stack as WG.Done() so panics inside recordInRedpoint still keep the
 	// gauge honest.
+	//
+	// Snapshot the metrics registry once so Inc/Dec target the same
+	// registry. Pre-PR3 there was a SetMetrics setter that could swap
+	// the registry between the Inc and the Dec; PR3 made the field
+	// construction-only so this snapshot is now defensive cosmetics, not
+	// a correctness requirement. Kept anyway because the goroutine
+	// closure reads it twice and a single load is marginally cheaper
+	// than two field reads.
 	h.asyncWG.Add(1)
-	if h.metrics != nil {
-		h.metrics.Gauge("redpoint_async_writes_in_flight").Inc()
+	mr := h.metrics
+	if mr != nil {
+		mr.Gauge("redpoint_async_writes_in_flight").Inc()
 	}
 	go func() {
 		defer h.asyncWG.Done()
-		if h.metrics != nil {
-			defer h.metrics.Gauge("redpoint_async_writes_in_flight").Dec()
+		if mr != nil {
+			defer mr.Gauge("redpoint_async_writes_in_flight").Dec()
 		}
 		h.recordInRedpoint(ctx, member, event)
 	}()

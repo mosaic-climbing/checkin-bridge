@@ -131,14 +131,20 @@ type Config struct {
 // Service is the production Rechecker. It speaks to the local store, the
 // Redpoint GraphQL API, and (on success) the UA-Hub REST API.
 type Service struct {
-	store      Store
-	redpoint   RedpointClient
-	unifi      UnifiClient
-	breaker    *breaker
-	logger     *slog.Logger
+	store    Store
+	redpoint RedpointClient
+	unifi    UnifiClient
+	breaker  *breaker
+	logger   *slog.Logger
+	maxStale time.Duration
+	now      func() time.Time
+
+	// shadowMode is set once at construction (cfg.ShadowMode) and read on
+	// the recheck path. Pre-PR3 this was atomic.Bool guarded by the
+	// SetShadowMode setter (#1's race fix); PR3's elimination of setters
+	// lets us drop the atomic since no concurrent writer can exist after
+	// construction.
 	shadowMode bool
-	maxStale   time.Duration
-	now        func() time.Time
 }
 
 // ResetBreaker forces the internal circuit breaker back to the closed
@@ -186,9 +192,9 @@ func New(s Store, rp RedpointClient, ua UnifiClient, cfg Config, logger *slog.Lo
 		unifi:      ua,
 		breaker:    br,
 		logger:     logger,
-		shadowMode: cfg.ShadowMode,
 		maxStale:   cfg.MaxStaleness,
 		now:        now,
+		shadowMode: cfg.ShadowMode,
 	}
 }
 
