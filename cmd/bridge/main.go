@@ -27,6 +27,7 @@ import (
 	"github.com/mosaic-climbing/checkin-bridge/internal/checkin"
 	"github.com/mosaic-climbing/checkin-bridge/internal/config"
 	"github.com/mosaic-climbing/checkin-bridge/internal/ingest"
+	"github.com/mosaic-climbing/checkin-bridge/internal/jobs"
 	"github.com/mosaic-climbing/checkin-bridge/internal/metrics"
 	"github.com/mosaic-climbing/checkin-bridge/internal/mirror"
 	"github.com/mosaic-climbing/checkin-bridge/internal/recheck"
@@ -611,6 +612,67 @@ func main() {
 	// Redpoint directory walker so both mirrors reflect the same
 	// wall-clock hour; see internal/unifimirror/sync.go.
 	bgGroup.Go("ua-hub-mirror", uaHubMirror.Run)
+
+	// directory-syncer: Redpoint customer directory walk. The cache-syncer
+	// only refreshes status of customers already in the local mirror —
+	// this is the only source that adds NEW customers. Without it, new
+	// Redpoint signups never appear in /ui/search, the ingest matcher
+	// can't find them, and statusync's matcher phase silently misses
+	// recently-joined members. Scheduled at the same interval as the
+	// other syncers so the cache, ua_users, and customers tables all
+	// refresh on the same wall-clock cadence.
+	dirSyncerLogger := logger.With("component", "directory-syncer")
+	bgGroup.Go("directory-syncer", func(bgCtx context.Context) error {
+		return jobs.LoopWithInterval(bgCtx, cfg.Sync.Interval, db, dirSyncerLogger,
+			jobs.TypeDirectorySync,
+			func(ctx context.Context) (any, error) {
+				res, err := apiServer.RunDirectorySync(ctx)
+				if err != nil {
+					return nil, err
+				}
+				return map[string]any{
+					"totalFetched": res.TotalFetched,
+					"completedAt":  res.CompletedAt,
+					"duration":     res.Duration.String(),
+				}, nil
+			})
+	})
+
+	// unifi-ingest: walk UniFi users, match against the local customer
+	// mirror, and upsert into the members table (NFC UID → customer id
+	// binding). Read on the hot tap path via GetMemberByUAUserID and
+	// GetMemberByNFC. Without a scheduled run, new tags from new
+	// signups don't get a members row until someone clicks the manual
+	// button — taps are denied at the door until then.
+	//
+	// Writes (dryRun=false) per the operator decision: the scheduled
+	// pass should keep the door working, not just log what it would
+	// do. Shadow mode is unaffected — the bridge's BRIDGE_SHADOW_MODE
+	// gate covers door-unlock + UA-Hub status writes, neither of which
+	// the ingest path touches; ingest is local-store-only either way.
+	//
+	// Cache-empty failure on a fresh deploy is expected: the first
+	// directory-syncer run has to land before ingest can match anyone.
+	// We log and keep ticking, so the next interval picks up cleanly.
+	ingestLogger := logger.With("component", "unifi-ingest")
+	bgGroup.Go("unifi-ingest", func(bgCtx context.Context) error {
+		return jobs.LoopWithInterval(bgCtx, cfg.Sync.Interval, db, ingestLogger,
+			jobs.TypeUniFiIngest,
+			func(ctx context.Context) (any, error) {
+				res, err := ingester.Run(ctx, false /* dryRun: scheduled writes */)
+				if err != nil {
+					return nil, err
+				}
+				return map[string]any{
+					"dryRun":     false,
+					"unifiUsers": res.UniFiUsers,
+					"withNfc":    res.WithNFC,
+					"matched":    res.Matched,
+					"unmatched":  res.Unmatched,
+					"applied":    res.Applied,
+				}, nil
+			})
+	})
 
 	// v0.5.0: REST tap poller — on UA-Hub 4.11.19.0 / UniFi Access 4.2.16
 	// the WebSocket notifications feed no longer emits access.logs.add
