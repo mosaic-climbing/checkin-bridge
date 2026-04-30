@@ -118,7 +118,21 @@ type Server struct {
 	// jobs.progress for the in-flight jobID so the staff /ui/sync
 	// pill can show mid-flight phase updates. Added in v0.5.7.1.
 	uaHubMirrorRefresh func(ctx context.Context, progress func(phase string)) (UAHubRefreshStats, error)
+
+	// instanceName labels this process as "prod" (the default) or "stage" in
+	// the /health response. Set via SetInstanceName from cmd/bridge using
+	// cfg.Bridge.InstanceName so probes can tell at a glance which instance
+	// they've reached — useful when prod and stage co-exist on the same
+	// host with adjacent ports (3500 vs 3600). The runtime invariant
+	// "stage implies shadow" is enforced by config.validate(), not here.
+	instanceName string
 }
+
+// SetInstanceName labels the Server's /health response with the operator's
+// instance tag (typically "prod" or "stage"). Wired from cmd/bridge after
+// NewServer so the constructor signature stays stable; same setter pattern
+// as SetBreakerResetter / SetMirrorWalker / SetUAHubMirrorRefresher.
+func (s *Server) SetInstanceName(name string) { s.instanceName = name }
 
 // UAHubRefreshStats is the result payload the UA-Hub mirror refresh
 // callback returns. Mirrors unifimirror.Stats shape so the wiring in
@@ -466,9 +480,18 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			activeMembers = stats.Active
 		}
 	}
+	// instance defaults to "prod" in the response when unset, mirroring
+	// config.defaults() — keeps probes that don't bother reading
+	// BRIDGE_INSTANCE_NAME from seeing an empty string and assuming
+	// it means stage.
+	instance := s.instanceName
+	if instance == "" {
+		instance = "prod"
+	}
 	writeJSON(w, map[string]any{
 		"status":             "ok",
 		"service":            "mosaic-checkin-bridge",
+		"instance":           instance,
 		"mode":               "store-first",
 		"unifiConnected":     s.unifi.Connected(),
 		"cacheMembers":       totalMembers,
@@ -2358,11 +2381,82 @@ func (s *Server) handleFragUnmatchedMatch(w http.ResponseWriter, r *http.Request
 		s.logger.Warn("pending row delete after match failed", "uaUserId", uaUserID, "error", err)
 	}
 
+	// Backfill the members table so the matched customer appears as
+	// "Enrolled" in the directory-search view (and on the All Enrolled
+	// Members table). The /ingest/unifi pipeline does this for users
+	// matched at ingest time (ingest/unifi.go step 4); when staff
+	// resolves the match manually here, the members row never got
+	// written, so the customer kept showing the badge_denied "Not
+	// enrolled" state — matching invisibly. Symmetric fix: pull the
+	// UA-Hub user's NFC tokens and UpsertMember for each, mirroring
+	// the ingest path's member shape.
+	//
+	// Best-effort: if UA-Hub is unreachable or the user has no tokens,
+	// log and continue. The mapping is the source of truth; the members
+	// row is a UI/cache concern that the daily syncer + check-in path
+	// will eventually populate. We don't want to fail the match because
+	// of a transient UA-Hub blip.
+	memberCount := 0
+	if uaUser, err := s.unifi.FetchUser(r.Context(), uaUserID); err != nil {
+		s.logger.Warn("UA-Hub user fetch after match failed; members row not backfilled",
+			"uaUserId", uaUserID, "redpointCustomerId", customerID, "error", err)
+	} else if uaUser != nil && len(uaUser.NfcTokens) > 0 {
+		badgeStatus := "PENDING_SYNC"
+		badgeName := ""
+		if cust.Badge != nil {
+			if cust.Badge.Status != "" {
+				badgeStatus = cust.Badge.Status
+			}
+			if cust.Badge.CustomerBadge != nil {
+				badgeName = cust.Badge.CustomerBadge.Name
+			}
+		} else if cust.Active {
+			// Customer is active in Redpoint but the badge subgraph
+			// didn't come back — daily syncer will refresh.
+			badgeStatus = "ACTIVE"
+		}
+		now := time.Now().UTC().Format(time.RFC3339)
+		for _, token := range uaUser.NfcTokens {
+			m := &store.Member{
+				NfcUID:      strings.ToUpper(token),
+				CustomerID:  customerID,
+				FirstName:   cust.FirstName,
+				LastName:    cust.LastName,
+				BadgeStatus: badgeStatus,
+				BadgeName:   badgeName,
+				Active:      cust.Active,
+				CachedAt:    now,
+			}
+			if err := s.store.UpsertMember(r.Context(), m); err != nil {
+				s.logger.Warn("members row upsert after match failed",
+					"uaUserId", uaUserID, "redpointCustomerId", customerID,
+					"nfcUid", m.NfcUID, "error", err)
+				continue
+			}
+			memberCount++
+		}
+	} else {
+		// No NFC tokens on the UA-Hub user — they're managed in UA-Hub
+		// but haven't been issued a card yet. Mapping is recorded;
+		// they'll appear on the members list once their card is
+		// provisioned and the next ingest runs.
+		s.logger.Info("matched UA-Hub user has no NFC tokens; members row deferred to ingest",
+			"uaUserId", uaUserID, "redpointCustomerId", customerID)
+	}
+
 	s.audit.Log("staff_match", r.RemoteAddr, map[string]any{
 		"uaUserId":           uaUserID,
 		"redpointCustomerId": customerID,
 		"customerName":       strings.TrimSpace(cust.FirstName + " " + cust.LastName),
+		"memberRowsWritten":  memberCount,
 	})
+
+	// Invalidate the fragment cache and trigger a member-table refresh
+	// so the directory search and the All Enrolled Members table reflect
+	// the new state immediately. Mirrors the unbind/reactivate/reassign
+	// handlers (members_detail.go:208, 287; members_reassign.go:285).
+	s.htmlCache.Invalidate()
+	w.Header().Set("HX-Trigger", "member-updated")
 
 	// Rebuild the detail fragment with a confirmation alert. Since the
 	// pending row is gone, GetPending returns nil — render a success

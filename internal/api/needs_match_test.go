@@ -30,7 +30,7 @@ import (
 // A shared helper factored out from setupTestServer because these tests
 // want a *live* fake UA-Hub (so UpdateUserStatus actually lands) rather
 // than the unreachable "fake:12445" URL the existing server_test uses.
-func buildNeedsMatchTestServer(t *testing.T) (*Server, *store.Store, *testutil.FakeUniFi) {
+func buildNeedsMatchTestServer(t *testing.T) (*Server, *store.Store, *testutil.FakeUniFi, *testutil.FakeRedpoint) {
 	t.Helper()
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -77,7 +77,7 @@ func buildNeedsMatchTestServer(t *testing.T) (*Server, *store.Store, *testutil.F
 		sessionMgr, nil /* audit */, "gate-1", logger, db, nil /* ui */, nil, nil, /* trustedProxies */
 		bgGroup, false /* enableTestHooks */,
 	)
-	return srv, db, fakeUA
+	return srv, db, fakeUA, fakeRP
 }
 
 // seedPending is a tiny helper — every test needs at least one pending
@@ -119,7 +119,7 @@ func seedPendingWithIdentity(t *testing.T, db *store.Store,
 // TestNeedsMatchList_EmptyState — zero pending rows renders the "nothing
 // to match" copy plus a 0 badge; the absence of a <table> is the invariant.
 func TestNeedsMatchList_EmptyState(t *testing.T) {
-	srv, _, _ := buildNeedsMatchTestServer(t)
+	srv, _, _, _ := buildNeedsMatchTestServer(t)
 
 	req := httptest.NewRequest("GET", "/ui/frag/unmatched-list", nil)
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
@@ -141,7 +141,7 @@ func TestNeedsMatchList_EmptyState(t *testing.T) {
 // TestNeedsMatchList_RendersPendingRows — two pending rows get one <tr>
 // each, and the headline count shows "2".
 func TestNeedsMatchList_RendersPendingRows(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 	seedPending(t, db, "ua-A", store.PendingReasonNoMatch, "", 24*time.Hour)
 	seedPending(t, db, "ua-B", store.PendingReasonAmbiguousEmail, "rp-1|rp-2", 24*time.Hour)
 
@@ -174,7 +174,7 @@ func TestNeedsMatchList_RendersPendingRows(t *testing.T) {
 // absent from the rendered body. Asserting their presence is the
 // regression pin.
 func TestNeedsMatchList_RendersCachedIdentity(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 	seedPendingWithIdentity(t, db,
 		"ua-cached", store.PendingReasonNoMatch, "",
 		"Dana Cached", "dana.cached@example.com",
@@ -201,7 +201,7 @@ func TestNeedsMatchList_RendersCachedIdentity(t *testing.T) {
 // TestNeedsMatchDefer_ExtendsGraceAndAudits — grace_until should move
 // roughly 7 days forward, and a staff:defer audit row should land.
 func TestNeedsMatchDefer_ExtendsGraceAndAudits(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 	// Seed with a grace window that's almost gone.
 	seedPending(t, db, "ua-defer", store.PendingReasonNoMatch, "", 1*time.Hour)
 
@@ -238,7 +238,7 @@ func TestNeedsMatchDefer_ExtendsGraceAndAudits(t *testing.T) {
 // TestNeedsMatchDefer_MissingRow — defer against a uaUserID that isn't
 // in pending should return a user-facing error, not panic or 500.
 func TestNeedsMatchDefer_MissingRow(t *testing.T) {
-	srv, _, _ := buildNeedsMatchTestServer(t)
+	srv, _, _, _ := buildNeedsMatchTestServer(t)
 
 	req := httptest.NewRequest("POST", "/ui/frag/unmatched/ua-ghost/defer", nil)
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
@@ -258,7 +258,7 @@ func TestNeedsMatchDefer_MissingRow(t *testing.T) {
 // TestNeedsMatchSkip_DeactivatesAndAudits — skip should hit UA-Hub with
 // a DEACTIVATED PUT, drop the pending row, and write a staff:skip audit.
 func TestNeedsMatchSkip_DeactivatesAndAudits(t *testing.T) {
-	srv, db, fakeUA := buildNeedsMatchTestServer(t)
+	srv, db, fakeUA, _ := buildNeedsMatchTestServer(t)
 	seedPending(t, db, "ua-skip", store.PendingReasonNoMatch, "", 24*time.Hour)
 
 	req := httptest.NewRequest("POST", "/ui/frag/unmatched/ua-skip/skip", nil)
@@ -291,7 +291,7 @@ func TestNeedsMatchSkip_DeactivatesAndAudits(t *testing.T) {
 // the mapping table's UNIQUE(redpoint_customer_id) constraint —
 // surfacing it in the UI rather than letting the SQL error through.
 func TestNeedsMatchMatch_CollisionBlocked(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 
 	// Pre-existing mapping for someone else.
 	if err := db.UpsertMapping(context.Background(), &store.Mapping{
@@ -324,12 +324,147 @@ func TestNeedsMatchMatch_CollisionBlocked(t *testing.T) {
 	}
 }
 
+// TestNeedsMatchMatch_BackfillsMembersRow pins the v0.5.10 fix: a manual
+// match must populate the members table so the customer flips from
+// "Not enrolled" to "Enrolled" in the directory-search view (and shows
+// up on the All Enrolled Members table). Before the fix, handleFragUnmatchedMatch
+// only wrote to ua_user_mappings — the directory search renders
+// `r.InCache ? "Enrolled" : "Not enrolled"` against the members table,
+// so matched users stayed visually "not enrolled" until /ingest/unifi
+// happened to run again. The bug surfaced for "garibay sean" and
+// "brandon cooper" on Apr 30, 2026: matched in needs match, still
+// appeared as not-enrolled a day later because no ingest had cycled.
+//
+// Invariant: after a successful match, members[nfc_uid] exists with
+// the matched customer_id, an HX-Trigger:member-updated header is set
+// (so the table re-fetches), and the htmlCache is invalidated.
+func TestNeedsMatchMatch_BackfillsMembersRow(t *testing.T) {
+	srv, db, fakeUA, fakeRP := buildNeedsMatchTestServer(t)
+	ctx := context.Background()
+
+	// Seed the FakeUniFi with a user carrying an NFC token. The match
+	// handler hits GET /users/:id (FetchUser), which now looks up by id.
+	fakeUA.Users = []map[string]any{{
+		"id":         "ua-garibay",
+		"first_name": "Sean",
+		"last_name":  "Garibay",
+		"name":       "Sean Garibay",
+		"user_email": "sean@example.com",
+		"status":     "ACTIVE",
+		// Top-level nfc_token is the simplest of the formats
+		// extractNfcTokens supports.
+		"nfc_token": "abc123",
+	}}
+
+	// Seed the FakeRedpoint customer the staff member will pick.
+	// FakeRedpoint keys customers by ExternalID; the v0.5.10 fake
+	// also handles `customer(id:` queries by scanning for a matching
+	// ID. We set them equal so both lookups resolve.
+	fakeRP.AddCustomer(testutil.FakeCustomer{
+		ID:         "rp-garibay",
+		ExternalID: "rp-garibay",
+		FirstName:  "Sean",
+		LastName:   "Garibay",
+		Email:      "sean@example.com",
+		Active:     true,
+		Badge:      "ACTIVE",
+		BadgeName:  "Member",
+	})
+
+	seedPending(t, db, "ua-garibay", store.PendingReasonNoMatch, "", 24*time.Hour)
+
+	form := strings.NewReader("redpointCustomerId=rp-garibay")
+	req := httptest.NewRequest("POST", "/ui/frag/unmatched/ua-garibay/match", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %q", w.Code, w.Body.String())
+	}
+
+	// 1. Mapping landed (sanity check — the existing collision test
+	//    already covers this, but pin it here too so a regression in
+	//    UpsertMapping doesn't masquerade as a members-row bug).
+	if mp, _ := db.GetMapping(ctx, "ua-garibay"); mp == nil || mp.RedpointCustomer != "rp-garibay" {
+		t.Errorf("mapping not written: %+v", mp)
+	}
+
+	// 2. Pending row is gone.
+	if p, _ := db.GetPending(ctx, "ua-garibay"); p != nil {
+		t.Errorf("pending row should be deleted after match; got %+v", p)
+	}
+
+	// 3. members row exists keyed by the upper-cased NFC token, with
+	//    the matched customer_id. THIS is the v0.5.10 invariant.
+	mem, err := db.GetMemberByNFC(ctx, "ABC123")
+	if err != nil {
+		t.Fatalf("GetMemberByNFC: %v", err)
+	}
+	if mem == nil {
+		t.Fatal("members row missing — directory search will still render \"Not enrolled\"")
+	}
+	if mem.CustomerID != "rp-garibay" {
+		t.Errorf("member.CustomerID = %q, want rp-garibay", mem.CustomerID)
+	}
+	if mem.LastName != "Garibay" {
+		t.Errorf("member.LastName = %q, want Garibay", mem.LastName)
+	}
+
+	// 4. HX-Trigger header is set so the table re-fetches.
+	if got := w.Header().Get("HX-Trigger"); got != "member-updated" {
+		t.Errorf("HX-Trigger = %q, want member-updated (table won't refresh otherwise)", got)
+	}
+}
+
+// TestNeedsMatchMatch_NoNfcTokens_StillSucceeds — UA-Hub users without
+// NFC cards are legitimate (they're managed in UA-Hub but the card
+// hasn't been provisioned yet). The match should still record the
+// mapping; the members row is just deferred to the next ingest run.
+// Guards against a regression that fails the match when FetchUser
+// returns no tokens.
+func TestNeedsMatchMatch_NoNfcTokens_StillSucceeds(t *testing.T) {
+	srv, db, fakeUA, fakeRP := buildNeedsMatchTestServer(t)
+	ctx := context.Background()
+	fakeRP.AddCustomer(testutil.FakeCustomer{
+		ID: "rp-cooper", ExternalID: "rp-cooper",
+		FirstName: "Brandon", LastName: "Cooper",
+		Email: "brandon@example.com", Active: true, Badge: "ACTIVE",
+	})
+
+	fakeUA.Users = []map[string]any{{
+		"id":         "ua-no-card",
+		"first_name": "Brandon",
+		"last_name":  "Cooper",
+		"user_email": "brandon@example.com",
+		"status":     "ACTIVE",
+		// no nfc_token / nfc_cards / credentials
+	}}
+
+	seedPending(t, db, "ua-no-card", store.PendingReasonNoMatch, "", 24*time.Hour)
+
+	form := strings.NewReader("redpointCustomerId=rp-cooper")
+	req := httptest.NewRequest("POST", "/ui/frag/unmatched/ua-no-card/match", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	// Mapping is the source of truth — it must land regardless of
+	// whether a members row could be backfilled.
+	if mp, _ := db.GetMapping(ctx, "ua-no-card"); mp == nil {
+		t.Fatalf("mapping should be written even when UA user has no NFC tokens; status=%d body=%q",
+			w.Code, w.Body.String())
+	}
+}
+
 // TestNeedsMatchSearch_EmptyQuery — POSTing /search with an empty "q"
 // just rerenders the detail panel (candidates come from the pending
 // row's Candidates field, not the search). Guards against a nil-deref
 // on empty form.
 func TestNeedsMatchSearch_EmptyQuery(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 	seedPending(t, db, "ua-search", store.PendingReasonNoMatch, "", 24*time.Hour)
 
 	form := strings.NewReader("q=")
@@ -370,7 +505,7 @@ func TestNeedsMatchSearch_EmptyQuery(t *testing.T) {
 // was populated correctly earlier" — the latter is covered by
 // customers_fts_test.go.
 func TestNeedsMatchSearch_ByEmail_HitsLocalCache(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 	ctx := context.Background()
 
 	// Two customers in the local mirror; only one matches the email.
@@ -417,7 +552,7 @@ func TestNeedsMatchSearch_ByEmail_HitsLocalCache(t *testing.T) {
 // single-token queries, hyphenated names, and during any upstream
 // flakiness. FTS5 prefix-AND handles all of these.
 func TestNeedsMatchSearch_ByName_HitsLocalCache(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 	ctx := context.Background()
 
 	if err := db.UpsertCustomer(ctx, &store.Customer{
@@ -454,7 +589,7 @@ func TestNeedsMatchSearch_ByName_HitsLocalCache(t *testing.T) {
 // "Dana Skoglund-Jones". Guards against a regression where someone
 // "simplifies" the FTS query builder to an OR.
 func TestNeedsMatchSearch_PrefixAND(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 	ctx := context.Background()
 
 	for _, c := range []store.Customer{
