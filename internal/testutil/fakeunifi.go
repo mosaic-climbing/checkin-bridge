@@ -247,7 +247,23 @@ func NewFakeUniFi() *FakeUniFi {
 			json.NewEncoder(w).Encode(map[string]any{"code": "SUCCESS"})
 
 		case sub == "" && r.Method == http.MethodGet:
-			json.NewEncoder(w).Encode(map[string]any{"code": "SUCCESS", "data": map[string]any{}})
+			// FetchUser (§3.4): look up the user by id in f.Users and
+			// echo it back. Returns an empty data object when the user
+			// isn't seeded, matching the shape of an unknown user.
+			f.mu.Lock()
+			var found map[string]any
+			for _, u := range f.Users {
+				if id, _ := u["id"].(string); id == userID {
+					found = u
+					break
+				}
+			}
+			f.mu.Unlock()
+			if found == nil {
+				json.NewEncoder(w).Encode(map[string]any{"code": "SUCCESS", "data": map[string]any{}})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"code": "SUCCESS", "data": found})
 
 		default:
 			http.Error(w, "not found", http.StatusNotFound)

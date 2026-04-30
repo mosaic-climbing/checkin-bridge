@@ -47,6 +47,47 @@ func NewFakeRedpoint() *FakeRedpoint {
 
 		w.Header().Set("Content-Type", "application/json")
 
+		// `customer(id: $id)` — used by redpoint.Client.GetCustomer.
+		// The fake keys customers by ExternalID; tests that exercise
+		// this branch should set ID == ExternalID so the lookup works.
+		// Order matters: this must come before customerByExternalId
+		// because the externalId query also contains "customer".
+		if strings.Contains(req.Query, "customer(id:") {
+			id, _ := req.Variables["id"].(string)
+			f.mu.Lock()
+			var cust *FakeCustomer
+			for _, c := range f.Customers {
+				if c.ID == id {
+					cc := c
+					cust = &cc
+					break
+				}
+			}
+			f.mu.Unlock()
+			if cust == nil {
+				json.NewEncoder(w).Encode(map[string]any{
+					"data": map[string]any{"customer": nil},
+				})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"customer": map[string]any{
+						"id": cust.ID, "active": cust.Active,
+						"firstName": cust.FirstName, "lastName": cust.LastName,
+						"email": cust.Email, "externalId": cust.ExternalID,
+						"badge": map[string]any{
+							"status": cust.Badge,
+							"customerBadge": map[string]any{
+								"id": "badge-1", "name": cust.BadgeName,
+							},
+						},
+					},
+				},
+			})
+			return
+		}
+
 		if strings.Contains(req.Query, "customerByExternalId") {
 			extID, _ := req.Variables["externalId"].(string)
 			f.mu.Lock()

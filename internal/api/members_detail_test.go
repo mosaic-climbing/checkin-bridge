@@ -81,7 +81,7 @@ func seedUAUser(t *testing.T, db *store.Store, id, firstName, lastName, email, s
 // mapping, UA user, audit) and enable every action button (Unbind,
 // Reassign, Remove). Reactivate stays disabled because status=ACTIVE.
 func TestFragMemberDetail_HappyPath(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 	ctx := context.Background()
 
 	seedMember(t, db, "04DEADBEEF", "rp-happy", "Happy", "Path")
@@ -131,7 +131,7 @@ func TestFragMemberDetail_HappyPath(t *testing.T) {
 // keyed on UA-Hub user ID" copy. Unbind/Reactivate/Reassign all land as
 // disabled; Remove stays live (verified in fragments_test).
 func TestFragMemberDetail_Orphan(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 	seedMember(t, db, "04ORPHAN01", "rp-orphan", "Orphan", "One")
 
 	req := httptest.NewRequest("GET", "/ui/frag/member/04ORPHAN01/detail", nil)
@@ -155,7 +155,7 @@ func TestFragMemberDetail_Orphan(t *testing.T) {
 // should render a friendly alert, not 404. HTMX fragments always return
 // 200 with the alert in the body so the swap target updates cleanly.
 func TestFragMemberDetail_MissingMember(t *testing.T) {
-	srv, _, _ := buildNeedsMatchTestServer(t)
+	srv, _, _, _ := buildNeedsMatchTestServer(t)
 
 	req := httptest.NewRequest("GET", "/ui/frag/member/04GHOST999/detail", nil)
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
@@ -183,7 +183,7 @@ func TestFragMemberDetail_MissingMember(t *testing.T) {
 //  4. emit HX-Trigger: member-updated
 //  5. render a success alert that names the member + customer
 func TestFragMemberUnbind_HappyPath(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 	ctx := context.Background()
 
 	seedMember(t, db, "04UNBIND01", "rp-unbind", "Un", "Bind")
@@ -246,7 +246,7 @@ func TestFragMemberUnbind_HappyPath(t *testing.T) {
 // alert (not a 500). The member cache row survives — Unbind doesn't
 // imply Remove.
 func TestFragMemberUnbind_NoMapping(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 	seedMember(t, db, "04NOMAP0001", "rp-nomap", "No", "Map")
 
 	req := httptest.NewRequest("POST", "/ui/frag/member/04NOMAP0001/unbind", nil)
@@ -273,7 +273,7 @@ func TestFragMemberUnbind_NoMapping(t *testing.T) {
 // TestFragMemberUnbind_MissingMember — unknown NFC returns an error
 // alert, writes no audit, makes no UA-Hub call.
 func TestFragMemberUnbind_MissingMember(t *testing.T) {
-	srv, _, fakeUA := buildNeedsMatchTestServer(t)
+	srv, _, fakeUA, _ := buildNeedsMatchTestServer(t)
 
 	req := httptest.NewRequest("POST", "/ui/frag/member/04GHOST999/unbind", nil)
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
@@ -299,7 +299,7 @@ func TestFragMemberUnbind_MissingMember(t *testing.T) {
 //  3. HX-Trigger: member-updated set
 //  4. alert names the member
 func TestFragMemberReactivate_HappyPath(t *testing.T) {
-	srv, db, fakeUA := buildNeedsMatchTestServer(t)
+	srv, db, fakeUA, _ := buildNeedsMatchTestServer(t)
 	ctx := context.Background()
 
 	seedMember(t, db, "04REACT0001", "rp-react", "Re", "Act")
@@ -347,7 +347,7 @@ func TestFragMemberReactivate_HappyPath(t *testing.T) {
 // error out rather than try to call UA-Hub with an empty ID. No UA-Hub
 // call, no audit row.
 func TestFragMemberReactivate_NoMapping(t *testing.T) {
-	srv, db, fakeUA := buildNeedsMatchTestServer(t)
+	srv, db, fakeUA, _ := buildNeedsMatchTestServer(t)
 	seedMember(t, db, "04NOMAP0002", "rp-nomap2", "No", "Map")
 
 	req := httptest.NewRequest("POST", "/ui/frag/member/04NOMAP0002/reactivate", nil)
@@ -373,7 +373,7 @@ func TestFragMemberReactivate_NoMapping(t *testing.T) {
 // status, and still issues the UA-Hub PUT — the point is recovery, not
 // pedantic state capture.
 func TestFragMemberReactivate_MissingUAUser(t *testing.T) {
-	srv, db, fakeUA := buildNeedsMatchTestServer(t)
+	srv, db, fakeUA, _ := buildNeedsMatchTestServer(t)
 	ctx := context.Background()
 
 	seedMember(t, db, "04NOMIRROR1", "rp-nomirror", "No", "Mirror")
@@ -411,7 +411,7 @@ func TestFragMemberReactivate_MissingUAUser(t *testing.T) {
 // as text inside the row <td>); pin both halves so nobody "helpfully"
 // adds content back to the response.
 func TestRemoveMember_NewShape(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 	seedMember(t, db, "04DELETE001", "rp-delete", "De", "Lete")
 
 	req := httptest.NewRequest("DELETE", "/members/04DELETE001", nil)
@@ -440,7 +440,7 @@ func TestRemoveMember_NewShape(t *testing.T) {
 // withholds the HX-Trigger (we don't want the table to refresh on a
 // no-op).
 func TestRemoveMember_MissingMember(t *testing.T) {
-	srv, _, _ := buildNeedsMatchTestServer(t)
+	srv, _, _, _ := buildNeedsMatchTestServer(t)
 
 	req := httptest.NewRequest("DELETE", "/members/04GHOST999", nil)
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
@@ -465,7 +465,7 @@ func TestRemoveMember_MissingMember(t *testing.T) {
 // current owner's identity, a search form, and the placeholder copy
 // ("Type a name…") since no query has been submitted yet.
 func TestFragMemberReassign_HappyPath(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 
 	seedMember(t, db, "04CARDAA01", "rp-alice", "Alice", "Alpha")
 	seedMapping(t, db, "ua-alice", "rp-alice", statusync.MatchSourceEmail)
@@ -507,7 +507,7 @@ func TestFragMemberReassign_HappyPath(t *testing.T) {
 // Reassign requires both sides for the audit trail, so the handler
 // should render an error alert rather than the picker.
 func TestFragMemberReassign_MissingMapping(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 
 	seedMember(t, db, "04ORPHAN01", "rp-orphan", "Orphan", "Row")
 
@@ -531,7 +531,7 @@ func TestFragMemberReassign_MissingMapping(t *testing.T) {
 // TestFragMemberReassign_MissingMember — handler returns an error alert
 // for an unknown NFC UID.
 func TestFragMemberReassign_MissingMember(t *testing.T) {
-	srv, _, _ := buildNeedsMatchTestServer(t)
+	srv, _, _, _ := buildNeedsMatchTestServer(t)
 
 	req := httptest.NewRequest("GET", "/ui/frag/member/04NOPE9999/reassign", nil)
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
@@ -552,7 +552,7 @@ func TestFragMemberReassign_MissingMember(t *testing.T) {
 // owner plus two candidates); a query on "bob" should surface Bob and
 // exclude the current owner by ID even if their name would match too.
 func TestFragMemberReassignSearch_FindsTarget(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 
 	seedMember(t, db, "04CARDBB02", "rp-alice", "Alice", "Alpha")
 	seedMapping(t, db, "ua-alice", "rp-alice", statusync.MatchSourceEmail)
@@ -597,7 +597,7 @@ func TestFragMemberReassignSearch_FindsTarget(t *testing.T) {
 // is the card holder) must NOT surface her in the picker. No self-
 // reassigns.
 func TestFragMemberReassignSearch_ExcludesCurrentOwner(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 
 	seedMember(t, db, "04CARDCC03", "rp-alice", "Alice", "Alpha")
 	seedMapping(t, db, "ua-alice", "rp-alice", statusync.MatchSourceEmail)
@@ -633,7 +633,7 @@ func TestFragMemberReassignSearch_ExcludesCurrentOwner(t *testing.T) {
 // TestFragMemberReassignSearch_NoMatches — the empty-results path
 // renders the "No UA-Hub users matched" hint rather than a bare table.
 func TestFragMemberReassignSearch_NoMatches(t *testing.T) {
-	srv, db, _ := buildNeedsMatchTestServer(t)
+	srv, db, _, _ := buildNeedsMatchTestServer(t)
 
 	seedMember(t, db, "04CARDDD04", "rp-alice", "Alice", "Alpha")
 	seedMapping(t, db, "ua-alice", "rp-alice", statusync.MatchSourceEmail)
@@ -663,7 +663,7 @@ func TestFragMemberReassignSearch_NoMatches(t *testing.T) {
 //     the new UA-Hub user's Redpoint mapping
 //   - HX-Trigger: member-updated fires so the table refreshes
 func TestFragMemberReassignConfirm_HappyPath(t *testing.T) {
-	srv, db, fakeUA := buildNeedsMatchTestServer(t)
+	srv, db, fakeUA, _ := buildNeedsMatchTestServer(t)
 	ctx := context.Background()
 
 	// Old side: Alice holds the card.
@@ -755,7 +755,7 @@ func TestFragMemberReassignConfirm_HappyPath(t *testing.T) {
 // calls this out so the operator doesn't wonder why the Members page
 // still shows Alice's name.
 func TestFragMemberReassignConfirm_NoTargetMapping(t *testing.T) {
-	srv, db, fakeUA := buildNeedsMatchTestServer(t)
+	srv, db, fakeUA, _ := buildNeedsMatchTestServer(t)
 	ctx := context.Background()
 
 	seedMember(t, db, "04SWAP9002", "rp-alice", "Alice", "Alpha")
@@ -797,7 +797,7 @@ func TestFragMemberReassignConfirm_NoTargetMapping(t *testing.T) {
 // owner as the target should no-op with an error alert rather than
 // double-writing audit rows.
 func TestFragMemberReassignConfirm_SelfReassign(t *testing.T) {
-	srv, db, fakeUA := buildNeedsMatchTestServer(t)
+	srv, db, fakeUA, _ := buildNeedsMatchTestServer(t)
 
 	seedMember(t, db, "04SWAP9003", "rp-alice", "Alice", "Alpha")
 	seedMapping(t, db, "ua-alice", "rp-alice", statusync.MatchSourceEmail)
@@ -825,7 +825,7 @@ func TestFragMemberReassignConfirm_SelfReassign(t *testing.T) {
 // mirror row. Handler should refuse (the audit trail can't key on a
 // non-existent user ID) without touching UA-Hub.
 func TestFragMemberReassignConfirm_MissingTarget(t *testing.T) {
-	srv, db, fakeUA := buildNeedsMatchTestServer(t)
+	srv, db, fakeUA, _ := buildNeedsMatchTestServer(t)
 
 	seedMember(t, db, "04SWAP9004", "rp-alice", "Alice", "Alpha")
 	seedMapping(t, db, "ua-alice", "rp-alice", statusync.MatchSourceEmail)

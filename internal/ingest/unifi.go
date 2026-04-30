@@ -29,10 +29,11 @@ import (
 type MatchMethod string
 
 const (
-	MatchByEmail  MatchMethod = "email"
-	MatchByName   MatchMethod = "name"
-	MatchManual   MatchMethod = "manual"
-	MatchNone     MatchMethod = "unmatched"
+	MatchByMapping MatchMethod = "mapping" // resolved from ua_user_mappings (manual or prior auto-match)
+	MatchByEmail   MatchMethod = "email"
+	MatchByName    MatchMethod = "name"
+	MatchManual    MatchMethod = "manual"
+	MatchNone      MatchMethod = "unmatched"
 )
 
 // UserMapping represents one UniFi user matched (or not) to a Redpoint customer.
@@ -137,8 +138,30 @@ func (ing *Ingester) Run(ctx context.Context, dryRun bool) (*IngestResult, error
 			Method:      MatchNone,
 		}
 
+		// Step 2a: prefer an existing ua_user_mappings row. Staff-confirmed
+		// manual matches (and prior auto-matches) live here. Without this
+		// the email/name fallbacks below can either (a) re-skip a user
+		// who was previously rescued from needs-match because the auto
+		// heuristics still don't fire — leaving them visually "Not
+		// enrolled" indefinitely — or (b) silently re-bind them to a
+		// *different* customer if a typo'd email later collides with
+		// someone else's record. Honoring the mapping first fixes both.
+		if mp, err := ing.store.GetMapping(ctx, u.ID); err == nil && mp != nil {
+			if rec, err := ing.store.GetCustomerByID(ctx, mp.RedpointCustomer); err == nil && rec != nil {
+				m.RedpointID = rec.RedpointID
+				m.RedpointName = rec.FirstName + " " + rec.LastName
+				m.RedpointEmail = rec.Email
+				m.Active = rec.Active
+				m.Method = MatchByMapping
+			}
+			// If GetCustomerByID returned nothing the mapping points at a
+			// customer the local directory hasn't seen — fall through to
+			// the heuristics rather than dropping the user. The next
+			// /directory/sync will plug the gap.
+		}
+
 		// Try email match first (most reliable)
-		if u.Email != "" {
+		if m.Method == MatchNone && u.Email != "" {
 			rec, err := ing.store.SearchCustomersByEmail(ctx, u.Email)
 			if err == nil && rec != nil {
 				m.RedpointID = rec.RedpointID
