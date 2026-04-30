@@ -6,8 +6,9 @@
 # it differs from the running binary's reported version,
 # invokes update.sh to perform the actual install.
 #
-# Designed to be invoked by launchd every 5 minutes via
-# /Library/LaunchDaemons/com.mosaic.bridge-updater.plist.
+# Designed to be invoked by launchd every 90 seconds via
+# /Library/LaunchDaemons/com.mosaic.bridge-updater.plist (40 polls/hour,
+# under the 60/hour unauthenticated GitHub API limit).
 #
 # All the real work — download, SHA256 verify, atomic swap,
 # launchctl restart, /health probe, auto-rollback to .prev
@@ -67,7 +68,7 @@ if ! [[ "$latest" =~ $version_re ]]; then
 fi
 
 if [ "$current" = "$latest" ]; then
-    # Quiet no-op — don't log every 5-minute tick when there's nothing to do.
+    # Quiet no-op — don't log every tick when there's nothing to do.
     exit 0
 fi
 

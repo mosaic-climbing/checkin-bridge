@@ -4,20 +4,6 @@ Context and conventions for AI assistants working on this repo. Read this first.
 
 ---
 
-## ⚠️ Pending setup — remind Chris on next session
-
-- [ ] **Enable branch protection on `main`** in GitHub.
-      Settings → Branches → Add rule for `main`:
-      - Require a pull request before merging (0 reviewers is fine for solo)
-      - Require status checks to pass: `secret-scan`, `test`, and the three `build` matrix jobs
-      - Require branches to be up to date before merging
-      - Do not allow force pushes
-      - Do not allow deletions
-
-      Without this, nothing stops a broken commit from landing on `main` while CI is still running. It's the one piece of process that keeps main green regardless of discipline.
-
----
-
 ## SSH + sudo — read this before writing any ssh command
 
 **The gym MacBook does NOT have passwordless sudo.** Every `sudo` invocation on the remote needs a password prompt. That constrains how you write remote commands from your laptop. I keep getting this wrong; this section exists to stop that.
