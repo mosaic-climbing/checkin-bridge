@@ -151,7 +151,7 @@
                 Dry Run <span id="ingest-spinner" class="htmx-indicator"><span class="spinner"></span></span>
             </button>
             <button class="btn btn-primary btn-sm"
-                    hx-post="/ingest/unifi"
+                    hx-post="/ingest/unifi?dry_run=false"
                     hx-target="#sync-result"
                     hx-swap="innerHTML"
                     hx-headers='{"X-Requested-With":"XMLHttpRequest"}'
