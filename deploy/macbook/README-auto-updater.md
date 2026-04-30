@@ -1,15 +1,15 @@
 # Mac auto-updater
 
-A `launchd` daemon that polls GitHub Releases every 5 minutes and rolls out new tags to the gym MacBook automatically. No SSH step.
+A `launchd` daemon that polls GitHub Releases every 90 seconds and rolls out new tags to the gym MacBook automatically. No SSH step.
 
 ## What it does
 
-- Every 5 minutes, [auto-update.sh](auto-update.sh) hits `api.github.com/repos/mosaic-climbing/checkin-bridge/releases/latest`.
+- Every 90 seconds, [auto-update.sh](auto-update.sh) hits `api.github.com/repos/mosaic-climbing/checkin-bridge/releases/latest`. That's 40 calls/hour, well under the 60/hour unauthenticated GitHub API limit per source IP.
 - If the latest tag differs from the running binary's `-version` output, it invokes [update.sh](update.sh) with the new tag.
 - `update.sh` does the actual work: SHA256 verify, atomic swap with `.prev` backup, `launchctl` restart, `:3500/health` probe, and **auto-rollback to `.prev` on health-check failure**. None of that changes — this folder just adds the polling loop on top.
-- No-op runs are silent (no log spam every 5 minutes).
+- No-op runs are silent (no log spam every tick).
 
-The auto-updater complements `make deploy`, not replaces it. `make deploy` still works for forcing an immediate roll-out from your laptop without waiting for the next 5-minute tick.
+The auto-updater complements `make deploy`, not replaces it. `make deploy` still works for forcing an immediate roll-out from your laptop without waiting for the next 90-second tick.
 
 ## One-time install (on the gym Mac)
 
@@ -26,7 +26,7 @@ sudo install -m 0644 -o root -g wheel \
     deploy/macbook/com.mosaic.bridge-updater.plist \
     /Library/LaunchDaemons/com.mosaic.bridge-updater.plist
 
-# 3. Load it. RunAtLoad=true means it kicks off immediately, then every 5 min.
+# 3. Load it. RunAtLoad=true means it kicks off immediately, then every 90 sec.
 sudo launchctl load -w /Library/LaunchDaemons/com.mosaic.bridge-updater.plist
 ```
 
@@ -70,7 +70,7 @@ After install, confirm a real release rolls out without a `make deploy`:
 ```bash
 # On your laptop:
 make release-tag VERSION=v0.5.9.1   # or whatever the next bump is
-# DO NOT run `make deploy`. Wait up to 5 minutes.
+# DO NOT run `make deploy`. Wait up to ~90 seconds (plus the release-workflow build time).
 
 # Then from your laptop, check the gym Mac:
 ssh -t $GYM '/usr/local/mosaic-bridge/mosaic-bridge -version'
@@ -101,11 +101,11 @@ sudo launchctl load -w /Library/LaunchDaemons/com.mosaic.bridge-updater.plist
 sudo /usr/local/mosaic-bridge/update.sh rollback
 ```
 
-This restores `mosaic-bridge.prev` and restarts the daemon. **Caveat:** the auto-updater will re-install the latest tag on the next 5-minute tick. If you want to *stay* on the rollback version, also `unload` the auto-updater (above). To return to auto-updating later, either bump the GitHub release past the broken one or yank the broken release.
+This restores `mosaic-bridge.prev` and restarts the daemon. **Caveat:** the auto-updater will re-install the latest tag on the next 90-second tick. If you want to *stay* on the rollback version, also `unload` the auto-updater (above). To return to auto-updating later, either bump the GitHub release past the broken one or yank the broken release.
 
 ### Yank a broken release
 
-If a release ships and the bridge auto-rolls-back on the gym Mac (you'll see a `health check FAILED` line in the log followed by `rolled back`), the auto-updater will keep retrying every 5 minutes — loud logs, no damage, but noisy. To stop the loop:
+If a release ships and the bridge auto-rolls-back on the gym Mac (you'll see a `health check FAILED` line in the log followed by `rolled back`), the auto-updater will keep retrying every 90 seconds — loud logs, no damage, but noisy. To stop the loop:
 
 1. **Delete or unpublish** the broken release on github.com/mosaic-climbing/checkin-bridge/releases. The auto-updater's `releases/latest` query then returns the prior good release, `current == latest`, and runs go silent.
 2. Cut a fixed release with a higher version number.
