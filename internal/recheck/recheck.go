@@ -30,6 +30,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/mosaic-climbing/checkin-bridge/internal/redpoint"
@@ -131,14 +132,19 @@ type Config struct {
 // Service is the production Rechecker. It speaks to the local store, the
 // Redpoint GraphQL API, and (on success) the UA-Hub REST API.
 type Service struct {
-	store      Store
-	redpoint   RedpointClient
-	unifi      UnifiClient
-	breaker    *breaker
-	logger     *slog.Logger
-	shadowMode bool
-	maxStale   time.Duration
-	now        func() time.Time
+	store    Store
+	redpoint RedpointClient
+	unifi    UnifiClient
+	breaker  *breaker
+	logger   *slog.Logger
+	maxStale time.Duration
+	now      func() time.Time
+
+	// shadowMode is read on the recheck path and written by SetShadowMode
+	// (potentially while a denied-tap recheck is in flight). Atomic so the
+	// operator toggling shadow mode can't tear the read in step 6 — same
+	// rationale as the field on statusync.Syncer / checkin.Handler.
+	shadowMode atomic.Bool
 }
 
 // ResetBreaker forces the internal circuit breaker back to the closed
@@ -180,21 +186,22 @@ func New(s Store, rp RedpointClient, ua UnifiClient, cfg Config, logger *slog.Lo
 	// breaker is internal — we don't want it logging at slog.Default while
 	// every other recheck event lives under our scoped handler).
 	br.logger = logger.With("component", "recheck.breaker")
-	return &Service{
-		store:      s,
-		redpoint:   rp,
-		unifi:      ua,
-		breaker:    br,
-		logger:     logger,
-		shadowMode: cfg.ShadowMode,
-		maxStale:   cfg.MaxStaleness,
-		now:        now,
+	svc := &Service{
+		store:    s,
+		redpoint: rp,
+		unifi:    ua,
+		breaker:  br,
+		logger:   logger,
+		maxStale: cfg.MaxStaleness,
+		now:      now,
 	}
+	svc.shadowMode.Store(cfg.ShadowMode)
+	return svc
 }
 
 // SetShadowMode toggles shadow mode at runtime. Mirrors the Setter on
 // statusync.Syncer so cmd/bridge can flip both with the same flag.
-func (s *Service) SetShadowMode(on bool) { s.shadowMode = on }
+func (s *Service) SetShadowMode(on bool) { s.shadowMode.Store(on) }
 
 // RecheckDeniedTap implements Rechecker.
 //
@@ -323,7 +330,7 @@ func (s *Service) RecheckDeniedTap(ctx context.Context, nfcToken string) (*Resul
 	// token. In shadow mode we skip the live UniFi mutation but still
 	// mark reactivated so the caller can log what the live system would
 	// have done.
-	if s.shadowMode {
+	if s.shadowMode.Load() {
 		s.logger.Info("SHADOW: would reactivate in UniFi after live recheck",
 			"name", cached.FullName(),
 			"customerId", cached.CustomerID,

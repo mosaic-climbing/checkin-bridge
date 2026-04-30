@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mosaic-climbing/checkin-bridge/internal/cardmap"
@@ -65,11 +66,17 @@ type Handler struct {
 	// (recheck.Rechecker) so tests can stub it without spinning up
 	// statusync, and the implementation lives in its own package
 	// (internal/recheck) with its own breaker and config knobs.
-	rechecker      recheck.Rechecker
-	metrics        *metrics.Registry
-	gateID         string
-	shadowMode     bool
-	logger         *slog.Logger
+	rechecker recheck.Rechecker
+	gateID    string
+	logger    *slog.Logger
+
+	// shadowMode and metrics are settable post-construction (SetShadowMode /
+	// SetMetrics) and read on the tap hot path. Atomic so the operator
+	// toggling shadow mode from the UI can't race against an in-flight
+	// HandleEvent — a torn read here is exactly the safety failure shadow
+	// mode is meant to prevent.
+	shadowMode atomic.Bool
+	metrics    atomic.Pointer[metrics.Registry]
 
 	// asyncWG tracks goroutines spawned for background Redpoint writes. The
 	// main shutdown path waits on this so we don't lose in-flight check-ins
@@ -105,7 +112,7 @@ func NewHandler(
 // Intended for parallel-run deployments that mirror production traffic without
 // mutating either system.
 func (h *Handler) SetShadowMode(on bool) {
-	h.shadowMode = on
+	h.shadowMode.Store(on)
 }
 
 // SetRechecker attaches the denied-tap recheck implementation. Called
@@ -119,9 +126,11 @@ func (h *Handler) SetRechecker(r recheck.Rechecker) {
 }
 
 // SetMetrics attaches the metrics registry for disagreement alerting.
-// Optional — if unset, the handler silently skips metric updates.
+// Optional — if Load returns nil, the handler silently skips metric
+// updates. Call sites snapshot the pointer with Load() so a registry
+// swap mid-flight cannot tear an Inc/Dec pair across two registries.
 func (h *Handler) SetMetrics(m *metrics.Registry) {
-	h.metrics = m
+	h.metrics.Store(m)
 }
 
 // noteDisagreement compares the bridge's decision (bridgeResult: "allowed",
@@ -133,7 +142,7 @@ func (h *Handler) SetMetrics(m *metrics.Registry) {
 // in the shadow-decisions panel; we don't double-log from here to keep
 // shadow-mode output quiet.
 func (h *Handler) noteDisagreement(event unifi.AccessEvent, member *store.Member, bridgeResult, denyReason string) {
-	if h.shadowMode {
+	if h.shadowMode.Load() {
 		return
 	}
 	unifiResult := strings.ToUpper(event.Result)
@@ -170,8 +179,8 @@ func (h *Handler) noteDisagreement(event unifi.AccessEvent, member *store.Member
 		)
 	}
 
-	if h.metrics != nil {
-		h.metrics.Counter("decision_disagreement_total").Inc()
+	if m := h.metrics.Load(); m != nil {
+		m.Counter("decision_disagreement_total").Inc()
 	}
 }
 
@@ -419,6 +428,7 @@ func (h *Handler) unlockAndRecord(ctx context.Context, event unifi.AccessEvent, 
 	// Backfilled events (replayed after a WS reconnect) never unlock — the
 	// door already had its chance during the outage and the member is long
 	// gone. We still record the event so the audit trail is complete.
+	shadow := h.shadowMode.Load()
 	if event.DoorID != "" {
 		switch {
 		case event.IsBackfill:
@@ -429,7 +439,7 @@ func (h *Handler) unlockAndRecord(ctx context.Context, event unifi.AccessEvent, 
 				"customerId", member.CustomerID,
 				"timestamp", event.Timestamp,
 			)
-		case h.shadowMode:
+		case shadow:
 			h.logger.Info("SHADOW: would unlock door",
 				"doorId", event.DoorID,
 				"doorName", event.DoorName,
@@ -476,7 +486,7 @@ func (h *Handler) unlockAndRecord(ctx context.Context, event unifi.AccessEvent, 
 	// ── BACKGROUND: record in Redpoint asynchronously ────────
 	// Shadow mode logs the would-be call and skips it so we never double-record.
 
-	if h.shadowMode {
+	if shadow {
 		if h.gateID != "" {
 			h.logger.Info("SHADOW: would record check-in in Redpoint",
 				"gateId", h.gateID,
@@ -506,14 +516,19 @@ func (h *Handler) unlockAndRecord(ctx context.Context, event unifi.AccessEvent, 
 	// always equals the WG counter; the decrement runs in the same defer
 	// stack as WG.Done() so panics inside recordInRedpoint still keep the
 	// gauge honest.
+	//
+	// Snapshot the metrics registry once so Inc/Dec target the same
+	// registry — without this, a SetMetrics swap between the two
+	// emissions would leave the gauge out of step with the WaitGroup.
 	h.asyncWG.Add(1)
-	if h.metrics != nil {
-		h.metrics.Gauge("redpoint_async_writes_in_flight").Inc()
+	mr := h.metrics.Load()
+	if mr != nil {
+		mr.Gauge("redpoint_async_writes_in_flight").Inc()
 	}
 	go func() {
 		defer h.asyncWG.Done()
-		if h.metrics != nil {
-			defer h.metrics.Gauge("redpoint_async_writes_in_flight").Dec()
+		if mr != nil {
+			defer mr.Gauge("redpoint_async_writes_in_flight").Dec()
 		}
 		h.recordInRedpoint(ctx, member, event)
 	}()
