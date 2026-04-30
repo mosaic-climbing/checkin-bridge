@@ -38,8 +38,7 @@ func buildExpiryTestSyncer(t *testing.T, shadow bool) (*Syncer, *testutil.FakeUn
 		SyncInterval:       time.Hour,
 		RateLimitDelay:     time.Millisecond,
 		UnmatchedGraceDays: 7,
-	}, logger)
-	s.SetShadowMode(shadow)
+	}, shadow, nil /* metrics */, logger)
 	return s, fakeUA, db
 }
 
@@ -221,7 +220,7 @@ func TestRunMatchingPhase_SkipsAlreadyMapped(t *testing.T) {
 
 	s := New(ua, rp, db, Config{
 		RateLimitDelay: time.Millisecond, UnmatchedGraceDays: 7,
-	}, logger)
+	}, false /* shadowMode */, nil /* metrics */, logger)
 
 	users := []unifi.UniFiUser{
 		{ID: "ua-bound", FirstName: "Already", LastName: "Mapped", Email: "x@example.com"},

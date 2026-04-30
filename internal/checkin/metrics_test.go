@@ -87,7 +87,7 @@ func TestAsyncGauge_TracksInFlightRedpointWrites(t *testing.T) {
 	h.gateID = "gate-test" // non-empty triggers the async path
 	h.redpointClient = redpoint.NewClient(srv.URL, "k", "F", discardLogger())
 	reg := metrics.New()
-	h.SetMetrics(reg)
+	h.metrics = reg
 
 	ctx := context.Background()
 	if err := db.UpsertMember(ctx, &store.Member{
@@ -192,7 +192,7 @@ func TestAsyncGauge_BackfillEvent_DoesNotIncrement(t *testing.T) {
 	h.gateID = "gate-test"
 	h.redpointClient = redpoint.NewClient(srv.URL, "k", "F", discardLogger())
 	reg := metrics.New()
-	h.SetMetrics(reg)
+	h.metrics = reg
 
 	ctx := context.Background()
 	if err := db.UpsertMember(ctx, &store.Member{

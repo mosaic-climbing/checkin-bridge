@@ -25,6 +25,20 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
+// noopServerCallbacks returns no-op stubs for the three callbacks
+// NewServer requires. Tests that don't exercise /debug/reset-breakers,
+// /admin/mirror/resync, or /ua-hub/sync can pass these without
+// constructing real Walker / Service / unifimirror objects.
+func noopServerCallbacks() (
+	br func() bool,
+	mw func(context.Context) error,
+	uahub func(context.Context, func(string)) (UAHubRefreshStats, error),
+) {
+	return func() bool { return false },
+		func(context.Context) error { return nil },
+		func(context.Context, func(string)) (UAHubRefreshStats, error) { return UAHubRefreshStats{}, nil }
+}
+
 func setupTestServer(t *testing.T) (*Server, *store.Store, *cardmap.Mapper) {
 	t.Helper()
 	dir := t.TempDir()
@@ -49,10 +63,13 @@ func setupTestServer(t *testing.T) (*Server, *store.Store, *cardmap.Mapper) {
 		PageSize:     100,
 	}, logger)
 
-	handler := checkin.NewHandler(unifiClient, rpClient, cm, db, "gate-1", logger)
+	handler := checkin.NewHandler(checkin.HandlerDeps{
+		UniFi: unifiClient, Redpoint: rpClient, CardMapper: cm,
+		Store: db, GateID: "gate-1", Logger: logger,
+	})
 	statusSyncer := statusync.New(unifiClient, rpClient, db, statusync.Config{
 		SyncInterval: 24 * 60 * 60 * 1e9,
-	}, logger)
+	}, false /* shadowMode */, nil /* metrics */, logger)
 	ingester := ingest.NewIngester(rpClient, db, logger)
 	sessionMgr := NewSessionManager("test-password")
 
@@ -62,7 +79,24 @@ func setupTestServer(t *testing.T) (*Server, *store.Store, *cardmap.Mapper) {
 		bgGroup.Shutdown(context.Background())
 	})
 
-	srv := NewServer(handler, unifiClient, rpClient, cm, syncer, statusSyncer, ingester, sessionMgr, nil, "gate-1", logger, db, nil, nil, nil, bgGroup, false /* enableTestHooks */)
+	br, mw, uahub := noopServerCallbacks()
+	srv := NewServer(ServerDeps{
+		Handler:              handler,
+		Unifi:                unifiClient,
+		Redpoint:             rpClient,
+		CardMapper:           cm,
+		Syncer:               syncer,
+		StatusSyncer:         statusSyncer,
+		Ingester:             ingester,
+		Sessions:             sessionMgr,
+		GateID:               "gate-1",
+		Logger:               logger,
+		Store:                db,
+		BG:                   bgGroup,
+		BreakerResetter:      br,
+		MirrorWalker:         mw,
+		UAHubMirrorRefresher: uahub,
+	})
 	return srv, db, cm
 }
 

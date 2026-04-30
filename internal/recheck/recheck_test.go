@@ -578,26 +578,10 @@ func TestRecheck_ShadowMode(t *testing.T) {
 	}
 }
 
-// TestRecheck_SetShadowMode_Runtime — SetShadowMode flips the mode
-// for subsequent calls, matching the statusync.Syncer.SetShadowMode
-// contract the bridge relies on.
-func TestRecheck_SetShadowMode_Runtime(t *testing.T) {
-	s := &fakeStore{member: denied("")}
-	rp := &fakeRedpoint{customers: []*redpoint.Customer{activeCustomer()}}
-	ua := &fakeUnifi{users: []unifi.UniFiUser{
-		{ID: "unifi-1", NfcTokens: []string{"NFC123"}},
-	}}
-	svc := newService(Config{ShadowMode: false}, s, rp, ua)
-
-	svc.SetShadowMode(true)
-	_, err := svc.RecheckDeniedTap(context.Background(), "NFC123")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ua.updateCalls != 0 {
-		t.Errorf("after SetShadowMode(true): UA must not be called (got %d)", ua.updateCalls)
-	}
-}
+// (Removed in PR3: TestRecheck_SetShadowMode_Runtime exercised a
+// SetShadowMode setter that no longer exists. ShadowMode is now
+// construction-only via Config.ShadowMode; the construction-time
+// happy path is covered by other tests in this file.)
 
 // ─── UA failure tails ───────────────────────────────────────────
 

@@ -267,8 +267,7 @@ func TestShadowMode_NoUniFiWrites(t *testing.T) {
 		SyncInterval:        time.Hour,
 		RateLimitDelay:      time.Millisecond,
 		LegacyNFCStatusLoop: true, // this test exercises the Step 2 NFC-cache loop
-	}, logger)
-	syncer.SetShadowMode(true)
+	}, true /* shadowMode */, nil /* metrics */, logger)
 
 	result, err := syncer.RunSync(context.Background())
 	if err != nil {
@@ -370,7 +369,7 @@ func TestRunSync_LegacyNFCStatusLoopDisabled(t *testing.T) {
 		SyncInterval:        time.Hour,
 		RateLimitDelay:      time.Millisecond,
 		LegacyNFCStatusLoop: false, // <-- the P2 gate
-	}, logger)
+	}, false /* shadowMode */, nil /* metrics */, logger)
 
 	result, err := syncer.RunSync(context.Background())
 	if err != nil {
@@ -438,12 +437,11 @@ func TestRunSync_StampsLivenessGauge(t *testing.T) {
 	}
 	defer db.Close()
 
+	reg := metrics.New()
 	syncer := New(unifiClient, rpClient, db, Config{
 		SyncInterval:   time.Hour,
 		RateLimitDelay: time.Millisecond,
-	}, logger)
-	reg := metrics.New()
-	syncer.SetMetrics(reg)
+	}, false /* shadowMode */, reg, logger)
 
 	before := time.Now().Unix()
 	if _, err := syncer.RunSync(context.Background()); err != nil {
@@ -509,10 +507,10 @@ func TestSupervisedLoop_RestartsOnPanic(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg := metrics.New()
 	s := &Syncer{
-		logger: logger,
-		config: Config{SyncInterval: 24 * time.Hour},
+		logger:  logger,
+		config:  Config{SyncInterval: 24 * time.Hour},
+		metrics: reg,
 	}
-	s.SetMetrics(reg)
 
 	calls := 0
 	ctx, cancel := context.WithCancel(context.Background())

@@ -26,7 +26,6 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/mosaic-climbing/checkin-bridge/internal/cardmap"
@@ -67,16 +66,21 @@ type Handler struct {
 	// statusync, and the implementation lives in its own package
 	// (internal/recheck) with its own breaker and config knobs.
 	rechecker recheck.Rechecker
-	gateID    string
-	logger    *slog.Logger
-
-	// shadowMode and metrics are settable post-construction (SetShadowMode /
-	// SetMetrics) and read on the tap hot path. Atomic so the operator
-	// toggling shadow mode from the UI can't race against an in-flight
-	// HandleEvent — a torn read here is exactly the safety failure shadow
-	// mode is meant to prevent.
-	shadowMode atomic.Bool
-	metrics    atomic.Pointer[metrics.Registry]
+	// metrics is the optional observability sink (nil-checked at every
+	// emit site). Set once at construction; never mutated. Pre-PR3 this
+	// was an atomic.Pointer guarded by the SetMetrics setter (#1's race
+	// fix); PR3's elimination of setters lets us drop the atomic since
+	// no concurrent writer can exist after construction.
+	metrics *metrics.Registry
+	gateID  string
+	// shadowMode is set once at construction and read from the tap hot
+	// path. Pre-PR3 it was settable post-construction (SetShadowMode),
+	// which made the field racy with HandleEvent reads — the operator
+	// flipping shadow mode mid-tap could see a torn read of the safety
+	// flag. Construction-only assignment closes that race without
+	// needing atomics.
+	shadowMode bool
+	logger     *slog.Logger
 
 	// asyncWG tracks goroutines spawned for background Redpoint writes. The
 	// main shutdown path waits on this so we don't lose in-flight check-ins
@@ -89,48 +93,37 @@ type Handler struct {
 	stats Stats
 }
 
-func NewHandler(
-	unifiClient *unifi.Client,
-	redpointClient *redpoint.Client,
-	cardMapper *cardmap.Mapper,
-	s *store.Store,
-	gateID string,
-	logger *slog.Logger,
-) *Handler {
+// HandlerDeps groups the dependencies NewHandler needs. Replaces the
+// 6-arg positional constructor + the three post-construction setters
+// (SetShadowMode, SetRechecker, SetMetrics) — same fail-fast pattern as
+// api.ServerDeps. None of the runtime-mode fields (shadowMode, metrics,
+// rechecker) need to be settable after construction; cmd/bridge knew
+// their values at boot and just ran into a wiring-order constraint
+// that's resolved by reordering the wire-up.
+type HandlerDeps struct {
+	UniFi      *unifi.Client
+	Redpoint   *redpoint.Client
+	CardMapper *cardmap.Mapper
+	Store      *store.Store
+	Rechecker  recheck.Rechecker // nil disables the live recheck path
+	Metrics    *metrics.Registry // nil disables metric emissions
+	GateID     string
+	ShadowMode bool
+	Logger     *slog.Logger
+}
+
+func NewHandler(deps HandlerDeps) *Handler {
 	return &Handler{
-		unifiClient:    unifiClient,
-		redpointClient: redpointClient,
-		cardMapper:     cardMapper,
-		store:          s,
-		gateID:         gateID,
-		logger:         logger,
+		unifiClient:    deps.UniFi,
+		redpointClient: deps.Redpoint,
+		cardMapper:     deps.CardMapper,
+		store:          deps.Store,
+		rechecker:      deps.Rechecker,
+		metrics:        deps.Metrics,
+		gateID:         deps.GateID,
+		shadowMode:     deps.ShadowMode,
+		logger:         deps.Logger,
 	}
-}
-
-// SetShadowMode toggles shadow mode. When on, the handler performs all lookups
-// and logs every decision but never calls UniFi unlock or Redpoint createCheckIn.
-// Intended for parallel-run deployments that mirror production traffic without
-// mutating either system.
-func (h *Handler) SetShadowMode(on bool) {
-	h.shadowMode.Store(on)
-}
-
-// SetRechecker attaches the denied-tap recheck implementation. Called
-// after both the handler and the recheck.Service are initialized in
-// cmd/bridge. nil disables the recheck path (denials are immediate).
-//
-// Renamed from SetStatusSyncer in A3 — the recheck is no longer
-// owned by the status syncer.
-func (h *Handler) SetRechecker(r recheck.Rechecker) {
-	h.rechecker = r
-}
-
-// SetMetrics attaches the metrics registry for disagreement alerting.
-// Optional — if Load returns nil, the handler silently skips metric
-// updates. Call sites snapshot the pointer with Load() so a registry
-// swap mid-flight cannot tear an Inc/Dec pair across two registries.
-func (h *Handler) SetMetrics(m *metrics.Registry) {
-	h.metrics.Store(m)
 }
 
 // noteDisagreement compares the bridge's decision (bridgeResult: "allowed",
@@ -142,7 +135,7 @@ func (h *Handler) SetMetrics(m *metrics.Registry) {
 // in the shadow-decisions panel; we don't double-log from here to keep
 // shadow-mode output quiet.
 func (h *Handler) noteDisagreement(event unifi.AccessEvent, member *store.Member, bridgeResult, denyReason string) {
-	if h.shadowMode.Load() {
+	if h.shadowMode {
 		return
 	}
 	unifiResult := strings.ToUpper(event.Result)
@@ -179,8 +172,8 @@ func (h *Handler) noteDisagreement(event unifi.AccessEvent, member *store.Member
 		)
 	}
 
-	if m := h.metrics.Load(); m != nil {
-		m.Counter("decision_disagreement_total").Inc()
+	if h.metrics != nil {
+		h.metrics.Counter("decision_disagreement_total").Inc()
 	}
 }
 
@@ -428,7 +421,7 @@ func (h *Handler) unlockAndRecord(ctx context.Context, event unifi.AccessEvent, 
 	// Backfilled events (replayed after a WS reconnect) never unlock — the
 	// door already had its chance during the outage and the member is long
 	// gone. We still record the event so the audit trail is complete.
-	shadow := h.shadowMode.Load()
+	shadow := h.shadowMode
 	if event.DoorID != "" {
 		switch {
 		case event.IsBackfill:
@@ -518,10 +511,14 @@ func (h *Handler) unlockAndRecord(ctx context.Context, event unifi.AccessEvent, 
 	// gauge honest.
 	//
 	// Snapshot the metrics registry once so Inc/Dec target the same
-	// registry — without this, a SetMetrics swap between the two
-	// emissions would leave the gauge out of step with the WaitGroup.
+	// registry. Pre-PR3 there was a SetMetrics setter that could swap
+	// the registry between the Inc and the Dec; PR3 made the field
+	// construction-only so this snapshot is now defensive cosmetics, not
+	// a correctness requirement. Kept anyway because the goroutine
+	// closure reads it twice and a single load is marginally cheaper
+	// than two field reads.
 	h.asyncWG.Add(1)
-	mr := h.metrics.Load()
+	mr := h.metrics
 	if mr != nil {
 		mr.Gauge("redpoint_async_writes_in_flight").Inc()
 	}

@@ -29,7 +29,7 @@ func buildTestSyncer(t *testing.T, fake *testutil.FakeRedpoint, graceDays int) (
 	// unifi client is constructed but never called here; ListAllUsersWithStatus
 	// etc. aren't part of the matchOne path.
 	ua := unifi.NewClient("wss://unused", "http://unused", "test-token", 500, "", logger)
-	s := New(ua, rp, db, Config{UnmatchedGraceDays: graceDays}, logger)
+	s := New(ua, rp, db, Config{UnmatchedGraceDays: graceDays}, false /* shadowMode */, nil /* metrics */, logger)
 	return s, db
 }
 
