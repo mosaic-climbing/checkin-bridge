@@ -61,8 +61,11 @@ func buildNeedsMatchTestServer(t *testing.T) (*Server, *store.Store, *testutil.F
 		SyncInterval:       24 * time.Hour,
 		RateLimitDelay:     time.Millisecond,
 		UnmatchedGraceDays: 7,
-	}, logger)
-	handler := checkin.NewHandler(uaClient, rpClient, cm, db, "gate-1", logger)
+	}, false /* shadowMode */, nil /* metrics */, logger)
+	handler := checkin.NewHandler(checkin.HandlerDeps{
+		UniFi: uaClient, Redpoint: rpClient, CardMapper: cm,
+		Store: db, GateID: "gate-1", Logger: logger,
+	})
 	ingester := ingest.NewIngester(rpClient, db, logger)
 	sessionMgr := NewSessionManager("test-password")
 
@@ -72,11 +75,24 @@ func buildNeedsMatchTestServer(t *testing.T) (*Server, *store.Store, *testutil.F
 		bgGroup.Shutdown(context.Background())
 	})
 
-	srv := NewServer(
-		handler, uaClient, rpClient, cm, syncer, statusSyncer, ingester,
-		sessionMgr, nil /* audit */, "gate-1", logger, db, nil /* ui */, nil, nil, /* trustedProxies */
-		bgGroup, false /* enableTestHooks */,
-	)
+	br, mw, uahub := noopServerCallbacks()
+	srv := NewServer(ServerDeps{
+		Handler:              handler,
+		Unifi:                uaClient,
+		Redpoint:             rpClient,
+		CardMapper:           cm,
+		Syncer:               syncer,
+		StatusSyncer:         statusSyncer,
+		Ingester:             ingester,
+		Sessions:             sessionMgr,
+		GateID:               "gate-1",
+		Logger:               logger,
+		Store:                db,
+		BG:                   bgGroup,
+		BreakerResetter:      br,
+		MirrorWalker:         mw,
+		UAHubMirrorRefresher: uahub,
+	})
 	return srv, db, fakeUA, fakeRP
 }
 

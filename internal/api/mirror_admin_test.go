@@ -19,12 +19,15 @@ import (
 )
 
 // TestMirrorResync_NoWalkerConfigured asserts that /admin/mirror/resync
-// returns 503 when the Walker setter hasn't been invoked. This is the
-// same defensive shape as /debug/reset-breakers and prevents a
-// misconfigured bridge from silently dispatching a no-op "sync".
+// returns 503 when the walker callback is missing. Production can no
+// longer reach this state — NewServer panics on a nil MirrorWalker as
+// of PR3 — but the handler retains a defensive nil-check so a future
+// refactor that breaks the construction invariant doesn't silently
+// dispatch a no-op "sync". We exercise the defensive path by clearing
+// the field after construction.
 func TestMirrorResync_NoWalkerConfigured(t *testing.T) {
 	srv, _, _ := setupTestServer(t)
-	// Intentionally do NOT call SetMirrorWalker.
+	srv.mirrorWalk = nil
 
 	req := httptest.NewRequest("POST", "/admin/mirror/resync", nil)
 	w := httptest.NewRecorder()
@@ -43,14 +46,14 @@ func TestMirrorResync_Dispatches_202(t *testing.T) {
 
 	var walkCalls int32
 	walkDone := make(chan struct{})
-	srv.SetMirrorWalker(func(ctx context.Context) error {
+	srv.mirrorWalk = func(ctx context.Context) error {
 		// Use atomic-alike without importing sync/atomic — a plain
 		// int32 ++ is unsafe under -race, so use a mutex-guarded
 		// counter.
 		testCounterInc(&walkCalls)
 		close(walkDone)
 		return nil
-	})
+	}
 
 	req := httptest.NewRequest("POST", "/admin/mirror/resync", nil)
 	w := httptest.NewRecorder()
@@ -94,10 +97,10 @@ func TestMirrorResync_409WhenRunningFresh(t *testing.T) {
 	}
 
 	var walkCalls int32
-	srv.SetMirrorWalker(func(ctx context.Context) error {
+	srv.mirrorWalk = func(ctx context.Context) error {
 		testCounterInc(&walkCalls)
 		return nil
-	})
+	}
 
 	req := httptest.NewRequest("POST", "/admin/mirror/resync", nil)
 	w := httptest.NewRecorder()
@@ -135,10 +138,10 @@ func TestMirrorResync_AllowsWhenRunningIsStale(t *testing.T) {
 	}
 
 	fired := make(chan struct{})
-	srv.SetMirrorWalker(func(ctx context.Context) error {
+	srv.mirrorWalk = func(ctx context.Context) error {
 		close(fired)
 		return nil
-	})
+	}
 
 	req := httptest.NewRequest("POST", "/admin/mirror/resync", nil)
 	w := httptest.NewRecorder()
@@ -163,10 +166,10 @@ func TestMirrorResync_WalkerErrorDoesNotPanic(t *testing.T) {
 	srv, _, _ := setupTestServer(t)
 
 	done := make(chan struct{})
-	srv.SetMirrorWalker(func(ctx context.Context) error {
+	srv.mirrorWalk = func(ctx context.Context) error {
 		defer close(done)
 		return errors.New("simulated failure")
-	})
+	}
 
 	req := httptest.NewRequest("POST", "/admin/mirror/resync", nil)
 	w := httptest.NewRecorder()
@@ -237,7 +240,7 @@ func TestMirrorStats_HappyPath(t *testing.T) {
 // registers them on s.mux, this test catches the regression.
 func TestMirrorAdmin_RoutesOnControlMux(t *testing.T) {
 	srv, _, _ := setupTestServer(t)
-	srv.SetMirrorWalker(func(ctx context.Context) error { return nil })
+	srv.mirrorWalk = func(ctx context.Context) error { return nil }
 
 	for _, tc := range []struct {
 		method, path string

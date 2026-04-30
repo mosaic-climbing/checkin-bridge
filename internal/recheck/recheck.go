@@ -192,10 +192,6 @@ func New(s Store, rp RedpointClient, ua UnifiClient, cfg Config, logger *slog.Lo
 	}
 }
 
-// SetShadowMode toggles shadow mode at runtime. Mirrors the Setter on
-// statusync.Syncer so cmd/bridge can flip both with the same flag.
-func (s *Service) SetShadowMode(on bool) { s.shadowMode = on }
-
 // RecheckDeniedTap implements Rechecker.
 //
 // Flow:

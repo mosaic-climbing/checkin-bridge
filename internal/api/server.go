@@ -41,7 +41,7 @@ type Server struct {
 	logger       *slog.Logger
 	// mux serves the public data plane: /health, /stats, /ui/*, the
 	// read-only /checkins, /directory/search, etc. Bound to BindAddr:Port.
-	mux          *http.ServeMux
+	mux *http.ServeMux
 	// controlMux serves the control plane: the two routes that cause
 	// physical-world side effects (POST /unlock/{doorId}, devhooks-gated
 	// POST /test-checkin) and aren't called by the staff UI directly.
@@ -49,10 +49,10 @@ type Server struct {
 	// (default 127.0.0.1) on ControlPort. The bulk-sync mutations stay on
 	// mux because the staff UI posts to them from the browser. See A1 in
 	// docs/architecture-review.md.
-	controlMux   *http.ServeMux
-	store        *store.Store
-	ui           *ui.Handler
-	metrics      *metrics.Registry
+	controlMux *http.ServeMux
+	store      *store.Store
+	ui         *ui.Handler
+	metrics    *metrics.Registry
 	// trustedProxies is the parsed CIDR list supplied by SecurityConfig.
 	// Used by handleUILogin and any other handler that needs a peer
 	// identity consistent with the IP allowlist / CSRF logging paths.
@@ -72,67 +72,45 @@ type Server struct {
 	// htmlCache caches rendered HTML fragments with TTL invalidation.
 	// See P1 in docs/architecture-review.md.
 	htmlCache *htmlCache
-	// breakerResetter, when non-nil, is called by POST /debug/reset-breakers
-	// to force-close the recheck circuit breaker. Wired via
-	// SetBreakerResetter from cmd/bridge after the recheck.Service is
-	// constructed. We use a function-typed setter rather than a direct
-	// *recheck.Service reference to avoid an import cycle back into recheck
-	// (which is deliberately upstream of api) and to keep the Server's
-	// dependency surface narrow — the debug endpoint genuinely only needs
-	// "press the reset button" and nothing else from the Service. The
-	// return value propagates the "was it open?" flag up into the HTTP
-	// response so operators can tell a meaningful reset from a no-op.
+	// breakerResetter is called by POST /debug/reset-breakers to
+	// force-close the recheck circuit breaker. Required at construction
+	// (NewServer panics if nil); the debug endpoint exists unconditionally
+	// in the binary so requiring the wire-up at boot is the right
+	// fail-fast — a missing wire silently 503'd before this PR.
+	//
+	// We hold a bare func rather than a *recheck.Service to avoid an
+	// import cycle and to keep the Server's dependency surface narrow.
+	// The endpoint only needs "press the reset button"; the return value
+	// is the "was it open?" flag for the HTTP response.
 	breakerResetter func() (wasOpen bool)
 
-	// mirrorWalk, when non-nil, runs one pass of the local customer
-	// mirror when POST /admin/mirror/resync is invoked. Wired via
-	// SetMirrorWalker from cmd/bridge so the Server's constructor
-	// signature stays stable (same rationale as breakerResetter:
-	// NewServer already has 18 positional args; a 19th for a
-	// cross-package ref would be noisy).
+	// mirrorWalk runs one pass of the local Redpoint customer mirror
+	// when POST /admin/mirror/resync is invoked. Required at construction;
+	// see breakerResetter for the fail-fast rationale.
 	//
-	// We store a bare func rather than a *mirror.Walker to keep this
-	// package free of a dependency on internal/mirror. The handler
-	// doesn't need anything from the walker beyond "run once with
-	// this ctx" — that's exactly what a func captures.
+	// Bare func rather than *mirror.Walker keeps this package free of a
+	// dependency on internal/mirror.
 	mirrorWalk func(ctx context.Context) error
 
-	// uaHubMirrorRefresh, when non-nil, runs one pass of the UA-Hub
-	// directory mirror when POST /ua-hub/sync is invoked. Wired via
-	// SetUAHubMirrorRefresher from cmd/bridge after the unifimirror
-	// Syncer is constructed. The function returns a UAHubRefreshStats
-	// value so the handler can show the operator what the pass
-	// observed without the api package having to import the
-	// unifimirror package (and pull in the Syncer type into every
-	// test file transitively).
+	// uaHubMirrorRefresh runs one pass of the UA-Hub directory mirror
+	// when POST /ua-hub/sync is invoked. Required at construction.
 	//
-	// Same setter-based rationale as breakerResetter and mirrorWalk:
-	// keep NewServer's constructor signature stable, and keep the
-	// api → unifimirror dependency implicit (via callback) rather
-	// than explicit (via struct field).
+	// Returns UAHubRefreshStats (mirrors unifimirror.Stats) so the
+	// handler can display what the pass observed without the api
+	// package having to import unifimirror.
 	//
-	// progress is optional and may be nil — the wired unifimirror
-	// closure in cmd/bridge drops a nil straight through (no
-	// WithProgress attached), so the Syncer emits no phase updates.
-	// When non-nil, the handler passes a closure that writes to
-	// jobs.progress for the in-flight jobID so the staff /ui/sync
-	// pill can show mid-flight phase updates. Added in v0.5.7.1.
+	// progress is optional and may be nil. When non-nil the handler
+	// passes a closure that writes to jobs.progress for the in-flight
+	// jobID so the staff /ui/sync pill can show mid-flight phase
+	// updates.
 	uaHubMirrorRefresh func(ctx context.Context, progress func(phase string)) (UAHubRefreshStats, error)
 
-	// instanceName labels this process as "prod" (the default) or "stage" in
-	// the /health response. Set via SetInstanceName from cmd/bridge using
-	// cfg.Bridge.InstanceName so probes can tell at a glance which instance
-	// they've reached — useful when prod and stage co-exist on the same
-	// host with adjacent ports (3500 vs 3600). The runtime invariant
+	// instanceName labels this process as "prod" (the default) or "stage"
+	// in the /health response. Useful when prod and stage co-exist on the
+	// same host with adjacent ports (3500 vs 3600). The runtime invariant
 	// "stage implies shadow" is enforced by config.validate(), not here.
 	instanceName string
 }
-
-// SetInstanceName labels the Server's /health response with the operator's
-// instance tag (typically "prod" or "stage"). Wired from cmd/bridge after
-// NewServer so the constructor signature stays stable; same setter pattern
-// as SetBreakerResetter / SetMirrorWalker / SetUAHubMirrorRefresher.
-func (s *Server) SetInstanceName(name string) { s.instanceName = name }
 
 // UAHubRefreshStats is the result payload the UA-Hub mirror refresh
 // callback returns. Mirrors unifimirror.Stats shape so the wiring in
@@ -156,46 +134,87 @@ type UAHubRefreshStats struct {
 	Duration    time.Duration
 }
 
-func NewServer(
-	handler *checkin.Handler,
-	unifiClient *unifi.Client,
-	redpointClient *redpoint.Client,
-	cardMapper *cardmap.Mapper,
-	syncer *cache.Syncer,
-	statusSyncer *statusync.Syncer,
-	ingester *ingest.Ingester,
-	sessionMgr *SessionManager,
-	auditLogger *auditlog.Logger,
-	gateID string,
-	logger *slog.Logger,
-	db *store.Store,
-	uiHandler *ui.Handler,
-	met *metrics.Registry,
-	trustedProxies []*net.IPNet,
-	bgGroup *bg.Group,
-	enableTestHooks bool,
-) *Server {
+// ServerDeps groups every dependency NewServer needs. Replaces the
+// 17-positional-arg constructor and the four post-construction setters
+// (SetInstanceName, SetBreakerResetter, SetMirrorWalker,
+// SetUAHubMirrorRefresher) that used to paper over a wiring cycle in
+// cmd/bridge.
+//
+// The pre-PR pattern was to construct the Server with a wide signature,
+// then call four setters with callbacks captured from objects that
+// hadn't existed at construction time. A forgotten setter silently
+// 503'd the corresponding admin endpoint — there was no fail-fast at
+// boot. NewServer now panics if any of the four required callbacks are
+// missing, so a missed wire shows up at startup, not the first time an
+// operator presses Reset Breakers.
+//
+// InstanceName is optional and defaults to "" (empty string renders as
+// the unlabelled /health response). BreakerResetter, MirrorWalker, and
+// UAHubMirrorRefresher are required. The seventeen subsystem
+// dependencies are required too — none of them have meaningful zero
+// values for production.
+type ServerDeps struct {
+	Handler             *checkin.Handler
+	Unifi               *unifi.Client
+	Redpoint            *redpoint.Client
+	CardMapper          *cardmap.Mapper
+	Syncer              *cache.Syncer
+	StatusSyncer        *statusync.Syncer
+	Ingester            *ingest.Ingester
+	Sessions            *SessionManager
+	Audit               *auditlog.Logger
+	GateID              string
+	Logger              *slog.Logger
+	Store               *store.Store
+	UI                  *ui.Handler
+	Metrics             *metrics.Registry
+	TrustedProxies      []*net.IPNet
+	BG                  *bg.Group
+	EnableTestHooks     bool
+	InstanceName        string
+	BreakerResetter     func() (wasOpen bool)
+	MirrorWalker        func(ctx context.Context) error
+	UAHubMirrorRefresher func(ctx context.Context, progress func(phase string)) (UAHubRefreshStats, error)
+}
+
+// NewServer constructs the api.Server. Panics on a missing required
+// dependency — that's deliberate; the alternative (silent 503s on
+// admin endpoints) is what this struct exists to prevent.
+func NewServer(deps ServerDeps) *Server {
+	if deps.BreakerResetter == nil {
+		panic("api.NewServer: BreakerResetter is required (POST /debug/reset-breakers depends on it)")
+	}
+	if deps.MirrorWalker == nil {
+		panic("api.NewServer: MirrorWalker is required (POST /admin/mirror/resync depends on it)")
+	}
+	if deps.UAHubMirrorRefresher == nil {
+		panic("api.NewServer: UAHubMirrorRefresher is required (POST /ua-hub/sync depends on it)")
+	}
 	s := &Server{
-		handler:                handler,
-		unifi:                  unifiClient,
-		redpoint:               redpointClient,
-		cardMapper:             cardMapper,
-		syncer:                 syncer,
-		statusSyncer:           statusSyncer,
-		ingester:               ingester,
-		sessions:               sessionMgr,
-		audit:                  auditLogger,
-		gateID:                 gateID,
-		logger:                 logger,
-		mux:                    http.NewServeMux(),
-		controlMux:             http.NewServeMux(),
-		store:                  db,
-		ui:                     uiHandler,
-		metrics:                met,
-		trustedProxies:         trustedProxies,
-		bg:                     bgGroup,
-		enableTestHooks:        enableTestHooks,
-		htmlCache:              newHTMLCache(),
+		handler:            deps.Handler,
+		unifi:              deps.Unifi,
+		redpoint:           deps.Redpoint,
+		cardMapper:         deps.CardMapper,
+		syncer:             deps.Syncer,
+		statusSyncer:       deps.StatusSyncer,
+		ingester:           deps.Ingester,
+		sessions:           deps.Sessions,
+		audit:              deps.Audit,
+		gateID:             deps.GateID,
+		logger:             deps.Logger,
+		mux:                http.NewServeMux(),
+		controlMux:         http.NewServeMux(),
+		store:              deps.Store,
+		ui:                 deps.UI,
+		metrics:            deps.Metrics,
+		trustedProxies:     deps.TrustedProxies,
+		bg:                 deps.BG,
+		enableTestHooks:    deps.EnableTestHooks,
+		htmlCache:          newHTMLCache(),
+		breakerResetter:    deps.BreakerResetter,
+		mirrorWalk:         deps.MirrorWalker,
+		uaHubMirrorRefresh: deps.UAHubMirrorRefresher,
+		instanceName:       deps.InstanceName,
 	}
 	s.routes()
 	return s
@@ -211,54 +230,6 @@ func (s *Server) clientIP(r *http.Request) string {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
-}
-
-// SetBreakerResetter registers the callback used by POST /debug/reset-breakers
-// to force-close the recheck circuit breaker. Pass nil to disable the
-// endpoint (it will 503); cmd/bridge always wires the recheck.Service's
-// ResetBreaker method here.
-//
-// Setter-based rather than constructor-arg because NewServer's signature
-// is already wide (19 positional args as of C2 Layer 4d) and the
-// rechecker is constructed after the Server in cmd/bridge today. Adding
-// this as a 20th positional arg would be a noisy refactor for a single
-// debug-only wire-up.
-func (s *Server) SetBreakerResetter(fn func() bool) {
-	s.breakerResetter = fn
-}
-
-// SetMirrorWalker registers the callback used by POST /admin/mirror/resync
-// to kick off a mirror walk. Pass nil to leave the endpoint disabled (it
-// will 503). cmd/bridge wires mirror.Walker.Walk here after the Walker is
-// constructed.
-//
-// Setter-based for the same reason as SetBreakerResetter: keep NewServer's
-// signature stable, and avoid pulling internal/mirror into internal/api's
-// import graph (this package is already wide; the admin endpoint only
-// needs the "run once" verb).
-func (s *Server) SetMirrorWalker(fn func(ctx context.Context) error) {
-	s.mirrorWalk = fn
-}
-
-// SetUAHubMirrorRefresher registers the callback used by POST /ua-hub/sync
-// to refresh the local UA-Hub user directory mirror. Pass nil to leave
-// the endpoint disabled (it will 503). cmd/bridge wires the unifimirror
-// Syncer's RefreshWithStats method here after constructing the Syncer.
-//
-// Setter-based to keep the NewServer constructor signature stable and
-// to avoid an api → unifimirror import (which would otherwise need to
-// be reversed because the api test suite builds fake Server values
-// without the mirror package loaded).
-//
-// The progress argument is the optional phase reporter the handler
-// builds for the in-flight job. The cmd/bridge wiring forwards it
-// into unifimirror.WithProgress so the Syncer emits phase strings
-// ("listing UA-Hub users", "hydrating 450/1500", "reconciling
-// pending mappings"). Implementations that don't care about
-// progress (legacy callers, fake refreshers in tests) can simply
-// ignore the argument.
-func (s *Server) SetUAHubMirrorRefresher(fn func(ctx context.Context, progress func(phase string)) (UAHubRefreshStats, error)) {
-	s.uaHubMirrorRefresh = fn
 }
 
 // ControlHandler returns the control-plane http.Handler: the mux that owns

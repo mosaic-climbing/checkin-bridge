@@ -20,12 +20,16 @@ import (
 )
 
 // TestDebugResetBreakers_NotConfigured verifies the fail-closed shape
-// when cmd/bridge never wired a resetter callback. 503 rather than 200
-// because a silent "ok=true" response with no work done is actively
-// misleading for an operator firing this from a runbook.
+// when the resetter callback is missing. Production can no longer reach
+// this state — NewServer panics on a nil BreakerResetter as of PR3 —
+// but the handler retains a defensive nil-check so a future refactor
+// that breaks the construction invariant doesn't silently 200 with no
+// work done. We exercise the defensive path by clearing the field
+// after construction, which is only reachable from package-internal
+// test code.
 func TestDebugResetBreakers_NotConfigured(t *testing.T) {
 	srv, _, _ := setupTestServer(t)
-	// srv.breakerResetter is unset by default — this is the test.
+	srv.breakerResetter = nil
 
 	req := httptest.NewRequest("POST", "/debug/reset-breakers", nil)
 	w := httptest.NewRecorder()
@@ -43,10 +47,10 @@ func TestDebugResetBreakers_WasOpen(t *testing.T) {
 	srv, _, _ := setupTestServer(t)
 
 	var callCount int
-	srv.SetBreakerResetter(func() bool {
+	srv.breakerResetter = func() bool {
 		callCount++
 		return true // simulate "breaker was open"
-	})
+	}
 
 	req := httptest.NewRequest("POST", "/debug/reset-breakers", nil)
 	w := httptest.NewRecorder()
@@ -84,9 +88,9 @@ func TestDebugResetBreakers_WasOpen(t *testing.T) {
 func TestDebugResetBreakers_NoOp(t *testing.T) {
 	srv, _, _ := setupTestServer(t)
 
-	srv.SetBreakerResetter(func() bool {
+	srv.breakerResetter = func() bool {
 		return false // simulate "breaker was already closed"
-	})
+	}
 
 	req := httptest.NewRequest("POST", "/debug/reset-breakers", nil)
 	w := httptest.NewRecorder()

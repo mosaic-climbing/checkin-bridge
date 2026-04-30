@@ -88,14 +88,14 @@ func TestFullCheckInFlow(t *testing.T) {
 	}
 
 	// Create check-in handler
-	handler := checkin.NewHandler(
-		unifiClient,
-		redpointClient,
-		cardMapper,
-		db,
-		"gate-1",
-		logger,
-	)
+	handler := checkin.NewHandler(checkin.HandlerDeps{
+		UniFi:      unifiClient,
+		Redpoint:   redpointClient,
+		CardMapper: cardMapper,
+		Store:      db,
+		GateID:     "gate-1",
+		Logger:     logger,
+	})
 
 	// Verify initial state
 	stats := handler.GetStats()
@@ -213,14 +213,14 @@ func TestDeniedCheckIn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	handler := checkin.NewHandler(
-		unifiClient,
-		redpointClient,
-		cardMapper,
-		db,
-		"gate-1",
-		logger,
-	)
+	handler := checkin.NewHandler(checkin.HandlerDeps{
+		UniFi:      unifiClient,
+		Redpoint:   redpointClient,
+		CardMapper: cardMapper,
+		Store:      db,
+		GateID:     "gate-1",
+		Logger:     logger,
+	})
 
 	// Simulate NFC tap with frozen membership
 	ctx := context.Background()
@@ -318,14 +318,14 @@ func TestCardOverride(t *testing.T) {
 	// Set override: new card (04FFEEDDCC) maps to customer ID (rp-cust-3)
 	cardMapper.SetOverride("04FFEEDDCC", "rp-cust-3")
 
-	handler := checkin.NewHandler(
-		unifiClient,
-		redpointClient,
-		cardMapper,
-		db,
-		"gate-1",
-		logger,
-	)
+	handler := checkin.NewHandler(checkin.HandlerDeps{
+		UniFi:      unifiClient,
+		Redpoint:   redpointClient,
+		CardMapper: cardMapper,
+		Store:      db,
+		GateID:     "gate-1",
+		Logger:     logger,
+	})
 
 	// Tap with the override card
 	ctx := context.Background()
@@ -385,14 +385,14 @@ func TestNonNFCEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	handler := checkin.NewHandler(
-		unifiClient,
-		redpointClient,
-		cardMapper,
-		db,
-		"gate-1",
-		logger,
-	)
+	handler := checkin.NewHandler(checkin.HandlerDeps{
+		UniFi:      unifiClient,
+		Redpoint:   redpointClient,
+		CardMapper: cardMapper,
+		Store:      db,
+		GateID:     "gate-1",
+		Logger:     logger,
+	})
 
 	// Send PIN code event (not NFC)
 	ctx := context.Background()
@@ -482,15 +482,15 @@ func TestShadowMode_NoSideEffects(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	handler := checkin.NewHandler(
-		unifiClient,
-		redpointClient,
-		cardMapper,
-		db,
-		"gate-1",
-		logger,
-	)
-	handler.SetShadowMode(true)
+	handler := checkin.NewHandler(checkin.HandlerDeps{
+		UniFi:      unifiClient,
+		Redpoint:   redpointClient,
+		CardMapper: cardMapper,
+		Store:      db,
+		GateID:     "gate-1",
+		ShadowMode: true,
+		Logger:     logger,
+	})
 
 	ctx := context.Background()
 	event := unifi.AccessEvent{

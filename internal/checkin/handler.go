@@ -63,13 +63,20 @@ type Handler struct {
 	// (denials short-circuit straight to recordDeniedEvent). Pre-A3 this
 	// was a *statusync.Syncer; the dependency is now a narrow interface
 	// (recheck.Rechecker) so tests can stub it without spinning up
-	// statusync, and the implementation lives in its own package
-	// (internal/recheck) with its own breaker and config knobs.
-	rechecker      recheck.Rechecker
-	metrics        *metrics.Registry
-	gateID         string
-	shadowMode     bool
-	logger         *slog.Logger
+	// statusync.
+	rechecker recheck.Rechecker
+	// metrics is the optional observability sink (nil-checked at every
+	// emit site). Set once at construction; never mutated.
+	metrics *metrics.Registry
+	gateID  string
+	// shadowMode is set once at construction and read from the tap hot
+	// path. Pre-PR3 it was settable post-construction (SetShadowMode),
+	// which made the field racy with HandleEvent reads — the operator
+	// flipping shadow mode mid-tap could see a torn read of the safety
+	// flag. Construction-only assignment closes that race without
+	// needing atomics.
+	shadowMode bool
+	logger     *slog.Logger
 
 	// asyncWG tracks goroutines spawned for background Redpoint writes. The
 	// main shutdown path waits on this so we don't lose in-flight check-ins
@@ -82,46 +89,37 @@ type Handler struct {
 	stats Stats
 }
 
-func NewHandler(
-	unifiClient *unifi.Client,
-	redpointClient *redpoint.Client,
-	cardMapper *cardmap.Mapper,
-	s *store.Store,
-	gateID string,
-	logger *slog.Logger,
-) *Handler {
+// HandlerDeps groups the dependencies NewHandler needs. Replaces the
+// 6-arg positional constructor + the three post-construction setters
+// (SetShadowMode, SetRechecker, SetMetrics) — same fail-fast pattern as
+// api.ServerDeps. None of the runtime-mode fields (shadowMode, metrics,
+// rechecker) need to be settable after construction; cmd/bridge knew
+// their values at boot and just ran into a wiring-order constraint
+// that's resolved by reordering the wire-up.
+type HandlerDeps struct {
+	UniFi      *unifi.Client
+	Redpoint   *redpoint.Client
+	CardMapper *cardmap.Mapper
+	Store      *store.Store
+	Rechecker  recheck.Rechecker // nil disables the live recheck path
+	Metrics    *metrics.Registry // nil disables metric emissions
+	GateID     string
+	ShadowMode bool
+	Logger     *slog.Logger
+}
+
+func NewHandler(deps HandlerDeps) *Handler {
 	return &Handler{
-		unifiClient:    unifiClient,
-		redpointClient: redpointClient,
-		cardMapper:     cardMapper,
-		store:          s,
-		gateID:         gateID,
-		logger:         logger,
+		unifiClient:    deps.UniFi,
+		redpointClient: deps.Redpoint,
+		cardMapper:     deps.CardMapper,
+		store:          deps.Store,
+		rechecker:      deps.Rechecker,
+		metrics:        deps.Metrics,
+		gateID:         deps.GateID,
+		shadowMode:     deps.ShadowMode,
+		logger:         deps.Logger,
 	}
-}
-
-// SetShadowMode toggles shadow mode. When on, the handler performs all lookups
-// and logs every decision but never calls UniFi unlock or Redpoint createCheckIn.
-// Intended for parallel-run deployments that mirror production traffic without
-// mutating either system.
-func (h *Handler) SetShadowMode(on bool) {
-	h.shadowMode = on
-}
-
-// SetRechecker attaches the denied-tap recheck implementation. Called
-// after both the handler and the recheck.Service are initialized in
-// cmd/bridge. nil disables the recheck path (denials are immediate).
-//
-// Renamed from SetStatusSyncer in A3 — the recheck is no longer
-// owned by the status syncer.
-func (h *Handler) SetRechecker(r recheck.Rechecker) {
-	h.rechecker = r
-}
-
-// SetMetrics attaches the metrics registry for disagreement alerting.
-// Optional — if unset, the handler silently skips metric updates.
-func (h *Handler) SetMetrics(m *metrics.Registry) {
-	h.metrics = m
 }
 
 // noteDisagreement compares the bridge's decision (bridgeResult: "allowed",

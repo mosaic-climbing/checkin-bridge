@@ -232,6 +232,8 @@ func main() {
 			UnmatchedGraceDays:  cfg.Bridge.UnmatchedGraceDays,
 			LegacyNFCStatusLoop: cfg.Bridge.LegacyNFCStatusLoop,
 		},
+		cfg.Bridge.ShadowMode,
+		met,
 		logger.With("component", "statusync"),
 	)
 
@@ -260,19 +262,23 @@ func main() {
 	)
 
 	// ── Check-in handler ─────────────────────────────────────
-	handler := checkin.NewHandler(
-		unifiClient,
-		redpointClient,
-		cardMapper,
-		db,
-		cfg.Redpoint.GateID,
-		logger.With("component", "checkin"),
-	)
-	handler.SetRechecker(rechecker)
-	handler.SetShadowMode(cfg.Bridge.ShadowMode)
-	handler.SetMetrics(met)
-	statusSyncer.SetShadowMode(cfg.Bridge.ShadowMode)
-	statusSyncer.SetMetrics(met)
+	// All dependencies passed via HandlerDeps. Pre-PR3 the three
+	// post-construction setters (SetRechecker / SetShadowMode /
+	// SetMetrics) raced with HandleEvent reads on the tap hot path —
+	// SetShadowMode in particular could tear the safety flag mid-tap.
+	// Construction-only assignment closes the race and makes a missed
+	// wire impossible to express.
+	handler := checkin.NewHandler(checkin.HandlerDeps{
+		UniFi:      unifiClient,
+		Redpoint:   redpointClient,
+		CardMapper: cardMapper,
+		Store:      db,
+		Rechecker:  rechecker,
+		Metrics:    met,
+		GateID:     cfg.Redpoint.GateID,
+		ShadowMode: cfg.Bridge.ShadowMode,
+		Logger:     logger.With("component", "checkin"),
+	})
 
 	// (Reconnect-backfill OnReconnect registration moved to after
 	// bgGroup is constructed — see "WebSocket reconnect backfill"
@@ -449,77 +455,43 @@ func main() {
 		})
 	}
 
-	// ── API server ───────────────────────────────────────────
-	apiServer := api.NewServer(
-		handler,
-		unifiClient,
-		redpointClient,
-		cardMapper,
-		syncer,
-		statusSyncer,
-		ingester,
-		sessionMgr,
-		auditLogger,
-		cfg.Redpoint.GateID,
-		logger.With("component", "api"),
-		db,
-		uiHandler,
-		met,
-		trustedProxies,
-		bgGroup,
-		cfg.Bridge.EnableTestHooks,
-	)
-	// P3: wire the manual breaker-reset hook to the recheck.Service's
-	// exported ResetBreaker method. The /debug/reset-breakers HTTP
-	// endpoint 503s until this is set; no other caller invokes the hook.
-	apiServer.SetBreakerResetter(rechecker.ResetBreaker)
-
-	// C3 S2: construct the customer mirror walker and expose its Walk()
-	// method via the /admin/mirror/resync endpoint. The walker pages
-	// through Redpoint customers.filter{active: ACTIVE} with badge +
-	// past-due + facility fields, writing each page to the local cache.
-	// Operators (or the nightly cron) invoke /admin/mirror/resync to
-	// refresh the local mirror.
-	//
-	// We pass the default mirror.Config{} — the zero values resolve to
-	// DefaultPageSize=100 and DefaultInterPageDelay=2s inside New().
-	// Non-default knobs would be config.Mirror.* but we haven't needed
-	// them yet; the 2s delay is what keeps us below Redpoint's
-	// observed 429 threshold, and 100/page is what the legacy sync uses.
+	// ── Customer mirror walker (Redpoint) ───────────────────
+	// C3 S2: paged Redpoint customers.filter walker exposed via POST
+	// /admin/mirror/resync. Default mirror.Config{} resolves to
+	// DefaultPageSize=100 and DefaultInterPageDelay=2s inside New() —
+	// the 2s delay is what keeps us below Redpoint's observed 429
+	// threshold, and 100/page matches the legacy sync. Constructed
+	// before apiServer so we pass mirrorWalker.Walk through ServerDeps
+	// rather than via a post-construction setter (silent-503 risk if
+	// the wire was forgotten).
 	mirrorWalker := mirror.New(
 		redpointClient,
 		mirror.NewStoreAdapter(db),
 		logger.With("component", "mirror"),
 		mirror.Config{},
 	)
-	apiServer.SetMirrorWalker(mirrorWalker.Walk)
 
-	// v0.5.2: UA-Hub directory mirror. Parallels the Redpoint
-	// directory walker above — nightly pull of the full UA-Hub user
-	// list into audit.db/ua_users so the Needs Match page, ingest
-	// matcher, and recheck pre-filter can answer from SQLite instead
-	// of hitting UA-Hub live. See internal/unifimirror for rationale.
-	//
-	// The Syncer adapts to the api.Server's callback seam by wrapping
-	// RefreshWithStats in a closure that translates the local
-	// unifimirror.Stats to the package-agnostic api.UAHubRefreshStats.
-	// Keeping api → unifimirror implicit (via callback) avoids
-	// dragging unifimirror into the api test build graph.
+	// ── UA-Hub directory mirror ─────────────────────────────
+	// v0.5.2: nightly pull of the UA-Hub user list into audit.db/ua_users
+	// so Needs Match, the ingest matcher, and the recheck pre-filter can
+	// answer from SQLite instead of hitting UA-Hub live. The api.Server
+	// owns the manual /ua-hub/sync handler — we adapt RefreshWithStats
+	// into the package-agnostic api.UAHubRefreshStats here so internal/api
+	// stays free of an import on internal/unifimirror.
 	uaHubMirror := unifimirror.New(
 		unifiClient,
 		db,
 		unifimirror.SyncConfig{Interval: cfg.Sync.Interval},
 		logger.With("component", "unifimirror"),
 	)
-	apiServer.SetUAHubMirrorRefresher(func(ctx context.Context, progress func(phase string)) (api.UAHubRefreshStats, error) {
+	uaHubRefresher := func(ctx context.Context, progress func(phase string)) (api.UAHubRefreshStats, error) {
 		// Attach the optional per-job progress reporter to ctx.
-		// WithProgress is a no-op when progress is nil (legacy /
-		// test callers), so the nightly ticker in unifimirror.Run
-		// continues to work unchanged. When non-nil (the
-		// /ua-hub/sync handler path), the Syncer emits phase
-		// strings and the handler's closure writes them into
-		// jobs.progress — surfacing mid-flight state in the
-		// staff /ui/sync pill.
+		// WithProgress is a no-op when progress is nil (the nightly
+		// ticker), so the Syncer emits no phase updates there. When
+		// non-nil (the /ua-hub/sync handler path), the Syncer emits
+		// phase strings and the handler's closure writes them into
+		// jobs.progress — surfacing mid-flight state in the staff
+		// /ui/sync pill.
 		ctx = unifimirror.WithProgress(ctx, unifimirror.ProgressFunc(progress))
 		stats, err := uaHubMirror.RefreshWithStats(ctx)
 		if err != nil {
@@ -533,6 +505,36 @@ func main() {
 			MirrorTotal: stats.MirrorTotal,
 			Duration:    stats.Duration,
 		}, nil
+	}
+
+	// ── API server ───────────────────────────────────────────
+	// All dependencies passed via ServerDeps. Pre-PR3 the four
+	// post-construction setters (SetBreakerResetter, SetMirrorWalker,
+	// SetUAHubMirrorRefresher, SetInstanceName) papered over a wiring
+	// cycle here — and silently 503'd the corresponding admin endpoints
+	// if the operator forgot to wire one. NewServer now panics at boot
+	// instead, so a missed wire fails fast.
+	apiServer := api.NewServer(api.ServerDeps{
+		Handler:              handler,
+		Unifi:                unifiClient,
+		Redpoint:             redpointClient,
+		CardMapper:           cardMapper,
+		Syncer:               syncer,
+		StatusSyncer:         statusSyncer,
+		Ingester:             ingester,
+		Sessions:             sessionMgr,
+		Audit:                auditLogger,
+		GateID:               cfg.Redpoint.GateID,
+		Logger:               logger.With("component", "api"),
+		Store:                db,
+		UI:                   uiHandler,
+		Metrics:              met,
+		TrustedProxies:       trustedProxies,
+		BG:                   bgGroup,
+		EnableTestHooks:      cfg.Bridge.EnableTestHooks,
+		BreakerResetter:      rechecker.ResetBreaker,
+		MirrorWalker:         mirrorWalker.Walk,
+		UAHubMirrorRefresher: uaHubRefresher,
 	})
 
 	// Build HTTP handler chain

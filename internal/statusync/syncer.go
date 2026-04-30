@@ -116,54 +116,49 @@ type Config struct {
 // circuit breaker that guarded it). Both moved to internal/recheck so
 // the per-tap policy is a separate concern from the daily sync loop.
 type Syncer struct {
-	unifi      *unifi.Client
-	redpoint   *redpoint.Client
-	store      *store.Store
-	config     Config
-	logger     *slog.Logger
-	shadowMode bool
+	unifi    *unifi.Client
+	redpoint *redpoint.Client
+	store    *store.Store
+	config   Config
+	logger   *slog.Logger
 
-	// metrics is the optional observability sink. When nil, all metric
-	// emissions are silently skipped — matches the checkin.Handler pattern
-	// so tests that don't care about metrics don't have to wire a registry.
-	metrics *metrics.Registry
+	// shadowMode and metrics are set once at construction and read on
+	// the sync hot path. Pre-PR3 they were settable post-construction
+	// (SetShadowMode, SetMetrics), which made the writes racy with the
+	// in-flight loop's reads — operator toggles could tear the
+	// shadow-mode safety flag. Construction-only assignment closes
+	// that race without needing atomics.
+	shadowMode bool
+	metrics    *metrics.Registry
 
 	mu         sync.Mutex
 	lastResult *SyncResult
 	running    bool
 }
 
-// SetShadowMode toggles shadow mode. When on, the syncer logs every
-// ACTIVE/DEACTIVATED decision but never calls UniFi UpdateUserStatus.
-// The local store is still updated so reports reflect current Redpoint state.
-func (s *Syncer) SetShadowMode(on bool) {
-	s.shadowMode = on
-}
-
-// SetMetrics attaches the metrics registry. Safe to call before or after
-// Start; metric emissions inside the sync loop do a nil-check each time so
-// the registry can be swapped at runtime without racing.
-func (s *Syncer) SetMetrics(m *metrics.Registry) {
-	s.metrics = m
-}
-
-// New creates a new status syncer.
+// New creates a new status syncer. ShadowMode and Metrics are
+// construction-only — see the field comments for the rationale that
+// drove the SetShadowMode / SetMetrics setter removal in PR3.
 func New(
 	unifiClient *unifi.Client,
 	rpClient *redpoint.Client,
 	db *store.Store,
 	cfg Config,
+	shadowMode bool,
+	met *metrics.Registry,
 	logger *slog.Logger,
 ) *Syncer {
 	if cfg.RateLimitDelay == 0 {
 		cfg.RateLimitDelay = 200 * time.Millisecond // ~5 updates/sec to avoid hammering UniFi
 	}
 	return &Syncer{
-		unifi:    unifiClient,
-		redpoint: rpClient,
-		store:    db,
-		config:   cfg,
-		logger:   logger,
+		unifi:      unifiClient,
+		redpoint:   rpClient,
+		store:      db,
+		config:     cfg,
+		logger:     logger,
+		shadowMode: shadowMode,
+		metrics:    met,
 	}
 }
 

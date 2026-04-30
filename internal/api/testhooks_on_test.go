@@ -47,10 +47,13 @@ func setupTestServerWithTestHooks(t *testing.T) (*Server, *store.Store, *cardmap
 		PageSize:     100,
 	}, logger)
 
-	handler := checkin.NewHandler(unifiClient, rpClient, cm, db, "gate-1", logger)
+	handler := checkin.NewHandler(checkin.HandlerDeps{
+		UniFi: unifiClient, Redpoint: rpClient, CardMapper: cm,
+		Store: db, GateID: "gate-1", Logger: logger,
+	})
 	statusSyncer := statusync.New(unifiClient, rpClient, db, statusync.Config{
 		SyncInterval: 24 * 60 * 60 * 1e9,
-	}, logger)
+	}, false /* shadowMode */, nil /* metrics */, logger)
 	ingester := ingest.NewIngester(rpClient, db, logger)
 	sessionMgr := NewSessionManager("test-password")
 
@@ -60,8 +63,26 @@ func setupTestServerWithTestHooks(t *testing.T) (*Server, *store.Store, *cardmap
 		bgGroup.Shutdown(context.Background())
 	})
 
-	// Key difference: enableTestHooks=true
-	srv := NewServer(handler, unifiClient, rpClient, cm, syncer, statusSyncer, ingester, sessionMgr, nil, "gate-1", logger, db, nil, nil, nil, bgGroup, true /* enableTestHooks */)
+	// Key difference: EnableTestHooks=true
+	br, mw, uahub := noopServerCallbacks()
+	srv := NewServer(ServerDeps{
+		Handler:              handler,
+		Unifi:                unifiClient,
+		Redpoint:             rpClient,
+		CardMapper:           cm,
+		Syncer:               syncer,
+		StatusSyncer:         statusSyncer,
+		Ingester:             ingester,
+		Sessions:             sessionMgr,
+		GateID:               "gate-1",
+		Logger:               logger,
+		Store:                db,
+		BG:                   bgGroup,
+		EnableTestHooks:      true,
+		BreakerResetter:      br,
+		MirrorWalker:         mw,
+		UAHubMirrorRefresher: uahub,
+	})
 	return srv, db, cm
 }
 
