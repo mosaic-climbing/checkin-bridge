@@ -5,6 +5,12 @@
 //
 // Build:  go build -o mosaic-bridge ./cmd/bridge
 // Run:    ./mosaic-bridge
+//
+// This file is the entrypoint shell only — every subsystem lives in
+// internal/app, which exposes a thin Build / Run / Close surface.
+// Pre-PR4 main.go was ~890 lines of inline wiring; that wiring now
+// lives in internal/app/build.go where it can be tested and reasoned
+// about as a unit.
 package main
 
 import (
@@ -12,31 +18,10 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
-	"os/signal"
-	"path/filepath"
-	"syscall"
-	"time"
 
-	"github.com/mosaic-climbing/checkin-bridge/internal/api"
-	"github.com/mosaic-climbing/checkin-bridge/internal/auditlog"
-	"github.com/mosaic-climbing/checkin-bridge/internal/bg"
-	"github.com/mosaic-climbing/checkin-bridge/internal/cache"
-	"github.com/mosaic-climbing/checkin-bridge/internal/cardmap"
-	"github.com/mosaic-climbing/checkin-bridge/internal/checkin"
+	"github.com/mosaic-climbing/checkin-bridge/internal/app"
 	"github.com/mosaic-climbing/checkin-bridge/internal/config"
-	"github.com/mosaic-climbing/checkin-bridge/internal/ingest"
-	"github.com/mosaic-climbing/checkin-bridge/internal/jobs"
-	"github.com/mosaic-climbing/checkin-bridge/internal/metrics"
-	"github.com/mosaic-climbing/checkin-bridge/internal/mirror"
-	"github.com/mosaic-climbing/checkin-bridge/internal/recheck"
-	"github.com/mosaic-climbing/checkin-bridge/internal/redpoint"
-	"github.com/mosaic-climbing/checkin-bridge/internal/statusync"
-	"github.com/mosaic-climbing/checkin-bridge/internal/store"
-	"github.com/mosaic-climbing/checkin-bridge/internal/ui"
-	"github.com/mosaic-climbing/checkin-bridge/internal/unifi"
-	"github.com/mosaic-climbing/checkin-bridge/internal/unifimirror"
 )
 
 // Build-time ldflags inject these. See .github/workflows/{ci,release}.yml.
@@ -47,53 +32,7 @@ var (
 	buildTime = "unknown"
 )
 
-// Hardening constants for the scheduler closures (directory-syncer,
-// unifi-ingest). The cache.Syncer and unifimirror.Syncer carry their
-// own mirror of these constants so an in-package test can pin them
-// without importing main; values must match.
-const (
-	schedulerJitter       = 0.1
-	schedulerBackoffStart = 5 * time.Second
-	schedulerBackoffMax   = 5 * time.Minute
-)
-
-// bgMetricsAdapter bridges bg.Group's tiny Metrics interface to the
-// metrics.Registry. It encodes the goroutine name as a Prometheus
-// label (`bg_goroutines_running{name="x"}`) so each tracked task gets
-// its own time series while sharing one TYPE declaration.
-//
-// We keep it local to cmd/bridge (rather than living in internal/bg)
-// so the bg package stays free of any metrics-package dependency —
-// bg can be reused or unit-tested without dragging in the registry.
-type bgMetricsAdapter struct {
-	reg *metrics.Registry
-}
-
-func (a bgMetricsAdapter) gauge(name string) *metrics.Gauge {
-	// Quote the label value the way Prometheus expects so
-	// PrometheusText() emits a syntactically valid line. The base
-	// name is stripped by prometheusBaseName when the TYPE comment
-	// is rendered, so all per-name series share one
-	// `# TYPE bg_goroutines_running gauge` header.
-	return a.reg.Gauge(fmt.Sprintf(`bg_goroutines_running{name=%q}`, name))
-}
-
-func (a bgMetricsAdapter) Inc(name string) { a.gauge(name).Inc() }
-func (a bgMetricsAdapter) Dec(name string) { a.gauge(name).Dec() }
-
-// startOfTodayLocal returns 00:00:00 in the host's local timezone for
-// the current date. Used as the initial poller cursor so the v0.5.0 tap
-// ingestion backfills same-day taps on first boot. Local, not UTC, so
-// "today" matches what the operator sees in the UI and what the
-// dashboard's daily-aggregate queries use.
-func startOfTodayLocal() time.Time {
-	now := time.Now()
-	y, m, d := now.Date()
-	return time.Date(y, m, d, 0, 0, 0, 0, now.Location())
-}
-
 func main() {
-	// ── CLI flags ────────────────────────────────────────────
 	// -version exits before loading config so deploy/macbook/update.sh
 	// can ask "what's installed?" without needing .env to be valid.
 	var showVersion bool
@@ -104,21 +43,54 @@ func main() {
 		return
 	}
 
-	// ── Load config ──────────────────────────────────────────
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config: %v\n", err)
 		os.Exit(1)
 	}
 
-	// ── Logger ───────────────────────────────────────────────
+	logger := newLogger(cfg.Bridge.LogLevel)
+	slog.SetDefault(logger)
+	logBootBanner(logger, cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bridge, err := app.Build(ctx, app.BuildOptions{
+		Cfg:       cfg,
+		Logger:    logger,
+		Version:   version,
+		BuildTime: buildTime,
+	})
+	if err != nil {
+		logger.Error("app build failed", "error", err)
+		os.Exit(1)
+	}
+	defer bridge.Close()
+
+	if err := bridge.Run(ctx); err != nil {
+		logger.Error("app run failed", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("shutdown complete")
+}
+
+// newLogger constructs the structured slog logger main owns. Kept here
+// (not in internal/app) so app.Build can take a *slog.Logger and stay
+// free of any "build-the-default-logger" responsibility — tests and
+// future callers might want a different handler entirely.
+func newLogger(level string) *slog.Logger {
 	logLevel := slog.LevelInfo
-	if cfg.Bridge.LogLevel == "debug" {
+	if level == "debug" {
 		logLevel = slog.LevelDebug
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
-	slog.SetDefault(logger)
+	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
+}
 
+// logBootBanner emits the "I am alive" header. Lives in main rather
+// than app.Build because the version + buildTime ldflag-injected
+// strings only exist in the main package.
+func logBootBanner(logger *slog.Logger, cfg *config.Config) {
 	logger.Info("════════════════════════════════════════")
 	logger.Info("  Mosaic Climbing – Check-in Bridge v2")
 	logger.Info("════════════════════════════════════════")
@@ -146,744 +118,4 @@ func main() {
 		"dataDir", cfg.Bridge.DataDir,
 		"syncInterval", cfg.Sync.Interval,
 	)
-
-	// ── Root context with cancellation ───────────────────────
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// ── Data directory ───────────────────────────────────────
-	if err := os.MkdirAll(cfg.Bridge.DataDir, 0o700); err != nil {
-		logger.Error("cannot create data directory", "error", err)
-		os.Exit(1)
-	}
-	_ = os.Chmod(cfg.Bridge.DataDir, 0o700)
-
-	if cfg.Redpoint.GateID == "" {
-		logger.Warn("REDPOINT_GATE_ID not set – check-ins won't record in Redpoint")
-		logger.Warn("run: curl http://localhost:" + fmt.Sprintf("%d", cfg.Bridge.Port) + "/gates")
-	}
-
-	// ── Unified SQLite store (v2) ────────────────────────────
-	db, err := store.Open(cfg.Bridge.DataDir, logger.With("component", "store"))
-	if err != nil {
-		logger.Error("store init failed", "error", err)
-		os.Exit(1)
-	}
-	defer db.Close()
-
-	// ── Audit logger ─────────────────────────────────────────
-	auditLogger, err := auditlog.Open(cfg.Bridge.DataDir)
-	if err != nil {
-		logger.Error("audit log init failed", "error", err)
-		os.Exit(1)
-	}
-	defer auditLogger.Close()
-
-	// ── Metrics registry ─────────────────────────────────────
-	met := metrics.New()
-
-	// ── Clients ──────────────────────────────────────────────
-	unifiClient := unifi.NewClient(
-		cfg.UniFi.WSURL(),
-		cfg.UniFi.BaseURL(),
-		cfg.UniFi.APIToken,
-		cfg.Bridge.UnlockDurationMs,
-		cfg.UniFi.TLSFingerprint,
-		logger.With("component", "unifi"),
-	)
-
-	redpointClient := redpoint.NewClient(
-		cfg.Redpoint.GraphQLURL(),
-		cfg.Redpoint.APIKey,
-		cfg.Redpoint.FacilityCode,
-		logger.With("component", "redpoint"),
-	)
-	// A5: wire the request-latency histogram + outcome counters. Done
-	// here (not in NewClient) so the redpoint package keeps its
-	// construction signature stable and remains usable in unit tests
-	// without a metrics registry.
-	redpointClient.SetMetrics(met)
-
-	// ── Card mapper (JSON overrides file) ────────────────────
-	cardMapper, err := cardmap.New(
-		cfg.Bridge.DataDir,
-		logger.With("component", "cardmap"),
-	)
-	if err != nil {
-		logger.Error("card mapper init failed", "error", err)
-		os.Exit(1)
-	}
-
-	// ── Syncers and ingester ─────────────────────────────────
-	//
-	// Stagger plan: the four schedulers driven off cfg.Sync.Interval
-	// (directory-syncer, ua-hub-mirror, unifi-ingest, cache-syncer)
-	// used to all fire at boot within milliseconds of each other,
-	// thunderherding Redpoint + UA-Hub. The InitialDelay values below
-	// spread their first runs across ~2 minutes, ordered by upstream
-	// dependency:
-	//
-	//   t=0s    directory-syncer  → fills customers (ingest needs it)
-	//   t=30s   ua-hub-mirror     → fills ua_users  (ingest needs it)
-	//   t=90s   unifi-ingest      → matches → members
-	//   t=120s  cache-syncer      → refreshes badge status on members
-	//
-	// Subsequent ticks use jitter (±10%) so the four schedules diverge
-	// over time even when InitialDelay only applies to the first run.
-	syncer := cache.NewSyncer(
-		db,
-		redpointClient,
-		cache.SyncConfig{
-			SyncInterval: cfg.Sync.Interval,
-			PageSize:     cfg.Sync.PageSize,
-			InitialDelay: 120 * time.Second,
-		},
-		logger.With("component", "syncer"),
-	)
-
-	ingester := ingest.NewIngester(
-		redpointClient,
-		db,
-		logger.With("component", "ingest"),
-	)
-
-	statusSyncer := statusync.New(
-		unifiClient,
-		redpointClient,
-		db,
-		statusync.Config{
-			SyncInterval:        cfg.Sync.Interval,
-			RateLimitDelay:      200 * time.Millisecond,
-			SyncTimeLocal:       cfg.Sync.TimeLocal,
-			UnmatchedGraceDays:  cfg.Bridge.UnmatchedGraceDays,
-			LegacyNFCStatusLoop: cfg.Bridge.LegacyNFCStatusLoop,
-		},
-		cfg.Bridge.ShadowMode,
-		met,
-		logger.With("component", "statusync"),
-	)
-
-	// ── Recheck service (denied-tap live recheck) ────────────
-	// Extracted from statusync as part of A3. The recheck is a distinct
-	// business rule from the daily-sync loop — it owns its own breaker
-	// (guarding live Redpoint calls) and its own freshness config
-	// (MaxStaleness). statusSyncer above only handles the daily cadence.
-	//
-	// Passing concrete client types here relies on structural satisfaction
-	// of the narrow interfaces defined in internal/recheck (Store,
-	// RedpointClient, UnifiClient) — no runtime coupling to those
-	// interfaces outside the recheck package.
-	rechecker := recheck.New(
-		db,
-		redpointClient,
-		unifiClient,
-		recheck.Config{
-			MaxStaleness: cfg.Bridge.RecheckMaxStaleness,
-			ShadowMode:   cfg.Bridge.ShadowMode,
-			// BreakerThreshold / BreakerCooldown left at defaults (5, 60s)
-			// to match pre-A3 behaviour. Promote to config fields if an
-			// operator ever needs to tune these independently.
-		},
-		logger.With("component", "recheck"),
-	)
-
-	// ── Check-in handler ─────────────────────────────────────
-	// All dependencies passed via HandlerDeps. Pre-PR3 the three
-	// post-construction setters (SetRechecker / SetShadowMode /
-	// SetMetrics) raced with HandleEvent reads on the tap hot path —
-	// SetShadowMode in particular could tear the safety flag mid-tap.
-	// Construction-only assignment closes the race and makes a missed
-	// wire impossible to express.
-	handler := checkin.NewHandler(checkin.HandlerDeps{
-		UniFi:      unifiClient,
-		Redpoint:   redpointClient,
-		CardMapper: cardMapper,
-		Store:      db,
-		Rechecker:  rechecker,
-		Metrics:    met,
-		GateID:     cfg.Redpoint.GateID,
-		ShadowMode: cfg.Bridge.ShadowMode,
-		Logger:     logger.With("component", "checkin"),
-	})
-
-	// (Reconnect-backfill OnReconnect registration moved to after
-	// bgGroup is constructed — see "WebSocket reconnect backfill"
-	// below. The backfill needs to be supervised by bg.Group so
-	// shutdowns drain it cleanly and the per-name gauge can see it.)
-
-	// ── Session manager ──────────────────────────────────────
-	// The HMAC signing key is persisted to <DataDir>/session.key (mode 0600,
-	// atomic write on first boot, reused afterward). Without persistence,
-	// every restart invalidated all staff sessions — S4 in the review.
-	sessionKeyPath := filepath.Join(cfg.Bridge.DataDir, "session.key")
-	sessionMgr, err := api.NewSessionManagerWithKeyFile(cfg.Bridge.StaffPassword, sessionKeyPath)
-	if err != nil {
-		logger.Error("session manager init failed", "error", err, "keyPath", sessionKeyPath)
-		os.Exit(1)
-	}
-	// Start the login-tracker janitor so stale per-IP rate-limit entries are
-	// swept on a schedule. Without this, the tracker map grows unbounded as
-	// unique source IPs probe the login endpoint (S2 in docs/architecture-review.md).
-	sessionMgr.StartJanitor(ctx)
-	// Enable secure cookies if HTTPS mode is enabled (S7 in docs/architecture-review.md).
-	sessionMgr.SetSecureCookies(cfg.Bridge.HTTPS)
-
-	// ── HTMX UI handler ─────────────────────────────────────
-	uiHandler, err := ui.New()
-	if err != nil {
-		logger.Error("UI init failed", "error", err)
-		os.Exit(1)
-	}
-
-	// ── IP allowlist ─────────────────────────────────────────
-	allowedNets, err := api.ParseAllowedNetworks(cfg.Bridge.AllowedNetworks)
-	if err != nil {
-		logger.Error("invalid ALLOWED_NETWORKS", "error", err)
-		os.Exit(1)
-	}
-	if len(allowedNets) > 0 {
-		var cidrStrs []string
-		for _, n := range allowedNets {
-			cidrStrs = append(cidrStrs, n.String())
-		}
-		logger.Info("IP allowlist enabled", "networks", cidrStrs)
-	}
-
-	// Surface-area warning: the public data plane is reachable off-host
-	// AND there is no CIDR allowlist. The staff UI is still password-
-	// protected and admin endpoints still require ADMIN_API_KEY, but any
-	// host on the routable network can probe /ui/login and /health. On
-	// the UDM Pro's nspawn container in particular, "" or "0.0.0.0"
-	// means the whole LAN. Operators who intentionally expose the
-	// dashboard should set ALLOWED_NETWORKS to the staff subnet; loud
-	// log-at-boot is cheaper than a quiet misconfiguration.
-	if cfg.Bridge.BindAddr != "127.0.0.1" && cfg.Bridge.BindAddr != "localhost" && len(allowedNets) == 0 {
-		logger.Warn("public listener reachable off-host with no IP allowlist",
-			"bind_addr", cfg.Bridge.BindAddr,
-			"hint", "set ALLOWED_NETWORKS to the staff subnet, or BIND_ADDR=127.0.0.1")
-	}
-
-	// ── Trusted reverse-proxy CIDRs (S1) ─────────────────────
-	// Empty list is the default and correct stance when nothing proxies
-	// the bridge. When populated, X-Forwarded-For / X-Real-IP headers
-	// are honoured only for requests whose peer IP falls inside one of
-	// these networks. Without this gate, any attacker reachable on the
-	// listening socket could forge an allowlisted client identity and
-	// bypass both the IP allowlist and the per-IP login rate-limit.
-	trustedProxies, err := api.ParseAllowedNetworks(cfg.Bridge.TrustedProxies)
-	if err != nil {
-		logger.Error("invalid TRUSTED_PROXIES", "error", err)
-		os.Exit(1)
-	}
-	if len(trustedProxies) > 0 {
-		var cidrStrs []string
-		for _, n := range trustedProxies {
-			cidrStrs = append(cidrStrs, n.String())
-		}
-		logger.Info("trusted reverse-proxy CIDRs configured", "networks", cidrStrs)
-	} else {
-		logger.Info("no trusted proxies configured; X-Forwarded-For / X-Real-IP will be ignored")
-	}
-
-	// ── HTTPS-aware security mode (S7) ───────────────────────
-	if cfg.Bridge.HTTPS {
-		logger.Info("HTTPS-aware mode enabled", "cookies_secure", true, "hsts", true)
-	}
-
-	// ── Background group for supervised goroutines ───────────
-	// Centralizes long-running tasks (directory sync, cache sync, status sync,
-	// reconnect backfill) under a single context and shutdown gate.
-	// S6 in docs/architecture-review.md.
-	//
-	// A2: pass a Metrics adapter so each Go(name, …) call publishes a
-	// per-name gauge bg_goroutines_running{name="…"}. The metrics
-	// package's prometheusBaseName strips the {…} suffix so the TYPE
-	// line is emitted once per base name even though the time series
-	// are split per goroutine name. The adapter lives here (not in the
-	// bg package) so internal/bg keeps no hard dependency on the
-	// metrics registry — bg only knows about a tiny Inc/Dec interface.
-	bgGroup := bg.NewWithMetrics(
-		ctx,
-		logger.With("component", "bg"),
-		bgMetricsAdapter{reg: met},
-	)
-
-	// ── WebSocket reconnect backfill ─────────────────────────
-	// Optional: backfill missed tap events on WebSocket reconnect so the
-	// audit trail survives brief UA-Hub outages. The door obviously can't
-	// unlock retroactively, but the checkins table, shadow-decisions panel,
-	// and Redpoint records stay complete. Gated behind a config flag
-	// because replaying during a partial-recovery window could double-
-	// record Redpoint check-ins.
-	//
-	// A2: prior to A2 the backfill ran inside an anonymous `go cb(...)`
-	// fired from internal/unifi/client.go — outside any supervised
-	// context, invisible to the gauge, and not drained on shutdown. The
-	// callback is now invoked synchronously by the unifi client (see
-	// OnReconnect contract); we hand the actual REST work to bg.Group
-	// so it shows up as bg_goroutines_running{name="reconnect-backfill"}
-	// and Shutdown waits for it before exit.
-	if cfg.Bridge.BackfillOnReconnect {
-		logger.Info("WebSocket reconnect backfill enabled")
-		unifiClient.OnReconnect(func(lastEventAt time.Time) {
-			// If we never saw an event before the outage, conservatively
-			// don't backfill — we'd flood the handler with everything
-			// since boot. An operator can still hand-replay from the
-			// REST API if needed.
-			if lastEventAt.IsZero() {
-				logger.Warn("reconnect backfill skipped: no prior event timestamp")
-				return
-			}
-			// Give the outage a small overlap window so we don't miss
-			// an event that landed right at reconnection; dedup on the
-			// consumer side handles re-seeing the boundary event.
-			since := lastEventAt.Add(-5 * time.Second)
-
-			// Dispatch to bg.Group so the read loop is not stalled (the
-			// callback contract requires non-blocking) and so the work
-			// is drained on shutdown. bgCtx tracks the group's context
-			// — if the bridge starts shutting down mid-backfill we
-			// abandon the rest cleanly rather than racing past the
-			// deadline.
-			bgGroup.Go("reconnect-backfill", func(bgCtx context.Context) error {
-				backfillCtx, cancelBackfill := context.WithTimeout(bgCtx, 60*time.Second)
-				defer cancelBackfill()
-				events, err := unifiClient.FetchAccessLogsSince(backfillCtx, since)
-				if err != nil {
-					logger.Error("reconnect backfill fetch failed",
-						"since", since.UTC().Format(time.RFC3339),
-						"error", err,
-					)
-					return nil // already logged; don't double-log via bg.Warn
-				}
-				logger.Info("reconnect backfill: replaying missed events",
-					"since", since.UTC().Format(time.RFC3339),
-					"count", len(events),
-				)
-				for _, evt := range events {
-					if bgCtx.Err() != nil {
-						logger.Warn("reconnect backfill interrupted by shutdown",
-							"replayed", len(events)-1, // best-effort count
-						)
-						return nil
-					}
-					// Each replayed event gets its own 15s context, mirroring
-					// the live OnEvent path in HandleEvent's Start() wrapper.
-					// Parented on bgCtx so a shutdown also drops in-flight
-					// HandleEvent calls.
-					eventCtx, cancel := context.WithTimeout(bgCtx, 15*time.Second)
-					handler.HandleEvent(eventCtx, evt)
-					cancel()
-				}
-				logger.Info("reconnect backfill complete", "replayed", len(events))
-				return nil
-			})
-		})
-	}
-
-	// ── Customer mirror walker (Redpoint) ───────────────────
-	// C3 S2: paged Redpoint customers.filter walker exposed via POST
-	// /admin/mirror/resync. Default mirror.Config{} resolves to
-	// DefaultPageSize=100 and DefaultInterPageDelay=2s inside New() —
-	// the 2s delay is what keeps us below Redpoint's observed 429
-	// threshold, and 100/page matches the legacy sync. Constructed
-	// before apiServer so we pass mirrorWalker.Walk through ServerDeps
-	// rather than via a post-construction setter (silent-503 risk if
-	// the wire was forgotten).
-	mirrorWalker := mirror.New(
-		redpointClient,
-		mirror.NewStoreAdapter(db),
-		logger.With("component", "mirror"),
-		mirror.Config{},
-	)
-
-	// ── UA-Hub directory mirror ─────────────────────────────
-	// v0.5.2: nightly pull of the UA-Hub user list into audit.db/ua_users
-	// so Needs Match, the ingest matcher, and the recheck pre-filter can
-	// answer from SQLite instead of hitting UA-Hub live. The api.Server
-	// owns the manual /ua-hub/sync handler — we adapt RefreshWithStats
-	// into the package-agnostic api.UAHubRefreshStats here so internal/api
-	// stays free of an import on internal/unifimirror.
-	uaHubMirror := unifimirror.New(
-		unifiClient,
-		db,
-		unifimirror.SyncConfig{
-			Interval:     cfg.Sync.Interval,
-			InitialDelay: 30 * time.Second,
-		},
-		logger.With("component", "unifimirror"),
-	)
-	uaHubRefresher := func(ctx context.Context, progress func(phase string)) (api.UAHubRefreshStats, error) {
-		// Attach the optional per-job progress reporter to ctx.
-		// WithProgress is a no-op when progress is nil (the nightly
-		// ticker), so the Syncer emits no phase updates there. When
-		// non-nil (the /ua-hub/sync handler path), the Syncer emits
-		// phase strings and the handler's closure writes them into
-		// jobs.progress — surfacing mid-flight state in the staff
-		// /ui/sync pill.
-		ctx = unifimirror.WithProgress(ctx, unifimirror.ProgressFunc(progress))
-		stats, err := uaHubMirror.RefreshWithStats(ctx)
-		if err != nil {
-			return api.UAHubRefreshStats{}, err
-		}
-		return api.UAHubRefreshStats{
-			Observed:    stats.Observed,
-			Upserted:    stats.Upserted,
-			Hydrated:    stats.Hydrated,
-			Rechecked:   stats.Rechecked,
-			MirrorTotal: stats.MirrorTotal,
-			Duration:    stats.Duration,
-		}, nil
-	}
-
-	// ── API server ───────────────────────────────────────────
-	// All dependencies passed via ServerDeps. Pre-PR3 the four
-	// post-construction setters (SetBreakerResetter, SetMirrorWalker,
-	// SetUAHubMirrorRefresher, SetInstanceName) papered over a wiring
-	// cycle here — and silently 503'd the corresponding admin endpoints
-	// if the operator forgot to wire one. NewServer now panics at boot
-	// instead, so a missed wire fails fast.
-	apiServer := api.NewServer(api.ServerDeps{
-		Handler:              handler,
-		Unifi:                unifiClient,
-		Redpoint:             redpointClient,
-		CardMapper:           cardMapper,
-		Syncer:               syncer,
-		StatusSyncer:         statusSyncer,
-		Ingester:             ingester,
-		Sessions:             sessionMgr,
-		Audit:                auditLogger,
-		GateID:               cfg.Redpoint.GateID,
-		Logger:               logger.With("component", "api"),
-		Store:                db,
-		UI:                   uiHandler,
-		Metrics:              met,
-		TrustedProxies:       trustedProxies,
-		BG:                   bgGroup,
-		EnableTestHooks:      cfg.Bridge.EnableTestHooks,
-		BreakerResetter:      rechecker.ResetBreaker,
-		MirrorWalker:         mirrorWalker.Walk,
-		UAHubMirrorRefresher: uaHubRefresher,
-	})
-
-	// Build HTTP handler chain
-	var httpHandler http.Handler = apiServer
-	httpHandler = api.RecoveryMiddleware(logger.With("component", "api"), httpHandler)
-	httpHandler = api.SecurityMiddleware(api.SecurityConfig{
-		AdminAPIKey:     cfg.Bridge.AdminAPIKey,
-		Sessions:        sessionMgr,
-		AllowedNetworks: allowedNets,
-		TrustedProxies:  trustedProxies,
-		Logger:          logger.With("component", "security"),
-		HTTPS:           cfg.Bridge.HTTPS,
-	}, httpHandler)
-	httpHandler = api.RequestLogger(logger.With("component", "api"), trustedProxies, httpHandler)
-
-	// Build control-plane handler chain. Same middleware order as the
-	// public chain (RequestLogger → Security → Recovery → app), but the
-	// security middleware is ControlSecurityMiddleware: admin Bearer key
-	// only, no session / CSRF / /ui fall-through. Binds to ControlBindAddr
-	// (default 127.0.0.1) on ControlPort. See A1 in
-	// docs/architecture-review.md.
-	var controlHandler http.Handler = apiServer.ControlHandler()
-	controlHandler = api.RecoveryMiddleware(logger.With("component", "api-control"), controlHandler)
-	controlHandler = api.ControlSecurityMiddleware(api.ControlSecurityConfig{
-		AdminAPIKey:     cfg.Bridge.AdminAPIKey,
-		AllowedNetworks: allowedNets,
-		TrustedProxies:  trustedProxies,
-		Logger:          logger.With("component", "security-control"),
-		HTTPS:           cfg.Bridge.HTTPS,
-	}, controlHandler)
-	controlHandler = api.RequestLogger(logger.With("component", "api-control"), trustedProxies, controlHandler)
-
-	// uiHandler is registered with apiServer above; the public mux only
-	// owns /metrics (raw Prometheus text) and delegates everything else
-	// to httpHandler so the security middleware chain still applies.
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Snapshot WebSocket client state into gauges on each scrape so
-		// Prometheus sees up-to-date values. Using gauges (not counters) so
-		// the source of truth stays in the unifi.Client — we're not trying
-		// to maintain a parallel counter that could drift.
-		if unifiClient != nil {
-			connected := 0.0
-			if unifiClient.Connected() {
-				connected = 1.0
-			}
-			met.Gauge("ws_connected").Set(connected)
-			met.Gauge("ws_reconnect_count").SetInt(unifiClient.ReconnectCount())
-			met.Gauge("ws_messages_received").SetInt(unifiClient.MessagesReceived())
-			met.Gauge("ws_events_processed").SetInt(unifiClient.EventsProcessed())
-		}
-		w.Header().Set("Content-Type", "text/plain; version=0.04")
-		w.Write([]byte(met.PrometheusText()))
-	}))
-	mux.Handle("/", httpHandler)
-
-	// ADMIN_API_KEY is required by config.validate(); logging here just
-	// confirms the invariant held in main so grep-able startup output stays
-	// consistent with historical logs.
-	logger.Info("admin API authentication enabled")
-
-	// ── Start services ───────────────────────────────────────
-	logger.Info("starting mosaic checkin bridge v2",
-		"port", cfg.Bridge.Port,
-		"dataDir", cfg.Bridge.DataDir,
-		"gateID", cfg.Redpoint.GateID,
-	)
-
-	// Connect to UniFi WebSocket
-	handler.Start()
-	go unifiClient.Connect(ctx)
-
-	// Start background syncers via supervised group
-	bgGroup.Go("cache-syncer", syncer.Run)
-	bgGroup.Go("statusync", statusSyncer.Run)
-	// v0.5.2: UA-Hub directory mirror runs on the same interval as the
-	// Redpoint directory walker so both mirrors reflect the same
-	// wall-clock hour; see internal/unifimirror/sync.go.
-	bgGroup.Go("ua-hub-mirror", uaHubMirror.Run)
-
-	// directory-syncer: Redpoint customer directory walk. The cache-syncer
-	// only refreshes status of customers already in the local mirror —
-	// this is the only source that adds NEW customers. Without it, new
-	// Redpoint signups never appear in /ui/search, the ingest matcher
-	// can't find them, and statusync's matcher phase silently misses
-	// recently-joined members. Scheduled at the same interval as the
-	// other syncers; runs first in the boot stagger because both
-	// unifi-ingest and cache-syncer depend on a populated customers
-	// table.
-	dirSyncerLogger := logger.With("component", "directory-syncer")
-	bgGroup.Go("directory-syncer", func(bgCtx context.Context) error {
-		return jobs.Loop(bgCtx, jobs.LoopConfig{
-			Interval:     cfg.Sync.Interval,
-			InitialDelay: 0,
-			Jitter:       schedulerJitter,
-			BackoffStart: schedulerBackoffStart,
-			BackoffMax:   schedulerBackoffMax,
-		}, db, dirSyncerLogger, jobs.TypeDirectorySync,
-			func(ctx context.Context) (any, error) {
-				res, err := apiServer.RunDirectorySync(ctx)
-				if err != nil {
-					return nil, err
-				}
-				return map[string]any{
-					"totalFetched": res.TotalFetched,
-					"completedAt":  res.CompletedAt,
-					"duration":     res.Duration.String(),
-				}, nil
-			})
-	})
-
-	// unifi-ingest: walk UniFi users, match against the local customer
-	// mirror, and upsert into the members table (NFC UID → customer id
-	// binding). Read on the hot tap path via GetMemberByUAUserID and
-	// GetMemberByNFC. Without a scheduled run, new tags from new
-	// signups don't get a members row until someone clicks the manual
-	// button — taps are denied at the door until then.
-	//
-	// Writes (dryRun=false) per the operator decision: the scheduled
-	// pass should keep the door working, not just log what it would
-	// do. Shadow mode is unaffected — the bridge's BRIDGE_SHADOW_MODE
-	// gate covers door-unlock + UA-Hub status writes, neither of which
-	// the ingest path touches; ingest is local-store-only either way.
-	//
-	// Cache-empty / mirror-empty failures on a fresh deploy are expected
-	// while directory-syncer + ua-hub-mirror finish their first runs.
-	// Boot-time stagger (90s) gives both upstreams a head start; the
-	// exponential backoff inside jobs.Loop then handles the case where
-	// they're still empty when we land.
-	ingestLogger := logger.With("component", "unifi-ingest")
-	bgGroup.Go("unifi-ingest", func(bgCtx context.Context) error {
-		return jobs.Loop(bgCtx, jobs.LoopConfig{
-			Interval:     cfg.Sync.Interval,
-			InitialDelay: 90 * time.Second,
-			Jitter:       schedulerJitter,
-			BackoffStart: schedulerBackoffStart,
-			BackoffMax:   schedulerBackoffMax,
-		}, db, ingestLogger, jobs.TypeUniFiIngest,
-			func(ctx context.Context) (any, error) {
-				res, err := ingester.Run(ctx, false /* dryRun: scheduled writes */)
-				if err != nil {
-					return nil, err
-				}
-				return map[string]any{
-					"dryRun":     false,
-					"unifiUsers": res.UniFiUsers,
-					"withNfc":    res.WithNFC,
-					"matched":    res.Matched,
-					"unmatched":  res.Unmatched,
-					"applied":    res.Applied,
-				}, nil
-			})
-	})
-
-	// v0.5.0: REST tap poller — on UA-Hub 4.11.19.0 / UniFi Access 4.2.16
-	// the WebSocket notifications feed no longer emits access.logs.add
-	// events for door taps. The developer-API system log is now the
-	// authoritative tap source, polled every 5s via POST /system/logs
-	// with topic=door_openings.
-	//
-	// Initial cursor is today-midnight-local so on first boot after the
-	// v0.5.0 rollout we backfill all of today's taps into the checkins
-	// table. The dedup guard on checkins.unifi_log_id (idx below,
-	// migration 4) makes the rolling lookback window safe against
-	// restart-duplicates.
-	pollerStart := startOfTodayLocal()
-	bgGroup.Go("unifi-poller", func(bgCtx context.Context) error {
-		return unifiClient.StartEventPoller(bgCtx, pollerStart, 5*time.Second)
-	})
-
-	// ── HTTP server with graceful shutdown ────────────────────
-	// Default bind is 127.0.0.1 (loopback-only). Operators who need LAN
-	// reachability must set BIND_ADDR explicitly AND set ALLOWED_NETWORKS
-	// to the staff subnet; the startup warning above fires if only one is
-	// set. On the UDM Pro the nspawn container shares host networking, so
-	// 127.0.0.1 is strongly recommended unless ALLOWED_NETWORKS is set.
-	//
-	// WriteTimeout governs the longest a single response can take to
-	// finish writing. v0.4.0 had this at 30s because the then-current
-	// public routes (/ui/*, /health, /checkins, /directory/search) all
-	// responded in well under a second. v0.5.0 added /ingest/unifi and
-	// /directory/sync to the same listener — both of which can legitimately
-	// run for a minute or more against a 1600-user UA-Hub + 82k Redpoint
-	// directory. When the 30s deadline fires mid-write, the client sees
-	// "curl: (52) Empty reply from server" even though the handler still
-	// completes server-side (the ingest rows land). v0.5.1 bumps this to
-	// 60m — enough headroom for the sync-timeout-wrapped admin routes
-	// (syncTimeout=45m in internal/api/server.go) plus some buffer.
-	//
-	// The slow-client-attack concern that originally motivated the tight
-	// timeout is better handled at the header-read stage (ReadTimeout +
-	// ReadHeaderTimeout) where it actually applies. Response writes to
-	// localhost-or-LAN clients on the staff network don't need a hard
-	// body-write deadline.
-	//
-	// Per-handler bounds are still enforced via withTimeout(d, handler)
-	// inside internal/api/server.go; each route has an appropriate
-	// shortTimeout/longTimeout/syncTimeout wrapper. The server-level
-	// WriteTimeout is now just the backstop for genuinely-wedged writes.
-	addr := fmt.Sprintf("%s:%d", cfg.Bridge.BindAddr, cfg.Bridge.Port)
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      60 * time.Minute,
-		ReadHeaderTimeout: 5 * time.Second,
-		MaxHeaderBytes:    1 << 16, // 64KB
-	}
-
-	go func() {
-		logger.Info("HTTP server listening", "addr", "http://"+addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("HTTP server error", "error", err)
-			cancel() // trigger shutdown
-		}
-	}()
-
-	// ── Control-plane HTTP server ────────────────────────────
-	// Bound to ControlBindAddr (default 127.0.0.1) on ControlPort so the
-	// routes that cause physical-world side effects (POST /unlock,
-	// devhooks /test-checkin) are reachable only from the bridge host
-	// itself. Operators who need remote access should SSH-tunnel or front
-	// with a reverse proxy on the same host. Timeouts match the public
-	// plane's short-timeout routes (both control routes complete in well
-	// under a minute).
-	controlAddr := fmt.Sprintf("%s:%d", cfg.Bridge.ControlBindAddr, cfg.Bridge.ControlPort)
-	controlSrv := &http.Server{
-		Addr:              controlAddr,
-		Handler:           controlHandler,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		ReadHeaderTimeout: 5 * time.Second,
-		MaxHeaderBytes:    1 << 16,
-	}
-
-	go func() {
-		logger.Info("control-plane HTTP server listening", "addr", "http://"+controlAddr)
-		if err := controlSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("control-plane HTTP server error", "error", err)
-			cancel()
-		}
-	}()
-
-	// ── Wait for shutdown signal ─────────────────────────────
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	select {
-	case sig := <-sigCh:
-		logger.Info("shutdown signal received", "signal", sig)
-	case <-ctx.Done():
-		logger.Info("context cancelled, shutting down")
-	}
-
-	// ── Graceful shutdown sequence ───────────────────────────
-	logger.Info("starting graceful shutdown...")
-
-	// 1. Stop accepting new HTTP requests on both the public and control
-	//    planes. Shut control down first so a still-running sync can't
-	//    start fresh UniFi writes after the public side has drained; the
-	//    handler.Shutdown drain step below then catches any tail of
-	//    in-flight work either server kicked off.
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
-	if err := controlSrv.Shutdown(shutdownCtx); err != nil {
-		logger.Error("control-plane HTTP shutdown error", "error", err)
-	}
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		logger.Error("HTTP shutdown error", "error", err)
-	}
-
-	// 2. Close WebSocket first so no new tap events start new async writes
-	//    while we're trying to drain. Done before cancel() so the WS reader
-	//    sees a clean close rather than a context-cancel error.
-	unifiClient.Close()
-
-	// 3. Drain in-flight async Redpoint writes. The door has already
-	//    unlocked for these members; skipping the drain means their
-	//    check-in never lands in HQ and they appear as a no-show today.
-	//    Budget 8s out of the overall 10s shutdown window; if that's not
-	//    enough, a slow GraphQL endpoint is the likely cause and we log
-	//    rather than hang the process.
-	drainCtx, drainCancel := context.WithTimeout(context.Background(), 8*time.Second)
-	if err := handler.Shutdown(drainCtx); err != nil {
-		logger.Warn("async Redpoint drain incomplete — some check-ins may not reach HQ",
-			"error", err,
-		)
-	} else {
-		logger.Info("async Redpoint drain complete")
-	}
-	drainCancel()
-
-	// 4. Drain background goroutines (directory sync, cache sync, status sync).
-	//    Budget 30s for these to finish gracefully; if a mid-sync shutdown
-	//    occurs, syncs can finish their current page rather than being torn.
-	//    S6 in docs/architecture-review.md.
-	bgShutdownCtx, bgShutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	if err := bgGroup.Shutdown(bgShutdownCtx); err != nil {
-		logger.Warn("background group drain incomplete — some background work may not have finished",
-			"error", err,
-		)
-	} else {
-		logger.Info("background group drain complete")
-	}
-	bgShutdownCancel()
-
-	// 5. Cancel all remaining context-based goroutines.
-	//    At this point bgGroup has already shut down its goroutines, so this
-	//    primarily affects any direct context-dependent tasks still running.
-	cancel()
-
-	// 6. Wait for the login-tracker janitor to return. Its ctx was the same
-	//    root ctx cancelled above, so this is just the join — we give it a
-	//    short deadline so a wedged goroutine can't hang shutdown.
-	janitorCtx, janitorCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	if err := sessionMgr.Shutdown(janitorCtx); err != nil {
-		logger.Warn("session-manager janitor did not stop in time", "error", err)
-	}
-	janitorCancel()
-
-	// 7. Resources closed by defers (auditLogger, db)
-	logger.Info("shutdown complete")
 }
