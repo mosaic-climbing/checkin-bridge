@@ -32,21 +32,28 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/mosaic-climbing/checkin-bridge/internal/jobs"
 	"github.com/mosaic-climbing/checkin-bridge/internal/ui"
 )
 
 // Sync job type labels. These are stored verbatim in jobs.type and
 // also form the path segment on GET /ui/frag/sync-last-run/{type}.
+//
+// Aliased to internal/jobs so the manual HTTP handlers below and the
+// scheduled syncer goroutines (which call jobs.Track) write the same
+// strings into the jobs table — otherwise the /ui/sync "Last run"
+// pill silently misses scheduled runs because the type label doesn't
+// match.
 const (
-	jobTypeCacheSync     = "cache_sync"
-	jobTypeStatusSync    = "status_sync"
-	jobTypeDirectorySync = "directory_sync"
-	jobTypeUniFiIngest   = "unifi_ingest"
+	jobTypeCacheSync     = jobs.TypeCacheSync
+	jobTypeStatusSync    = jobs.TypeStatusSync
+	jobTypeDirectorySync = jobs.TypeDirectorySync
+	jobTypeUniFiIngest   = jobs.TypeUniFiIngest
 	// jobTypeUAHubSync is the nightly (and manually-triggered) UA-Hub
 	// directory mirror refresh. Parallels jobTypeDirectorySync for the
 	// Redpoint side: ListAllUsersWithStatus → ua_users upsert. Added
 	// in v0.5.2.
-	jobTypeUAHubSync = "ua_hub_sync"
+	jobTypeUAHubSync = jobs.TypeUAHubSync
 )
 
 // wantsHTMX returns true when the request is coming from the staff UI's

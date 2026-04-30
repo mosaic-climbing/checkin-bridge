@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/mosaic-climbing/checkin-bridge/internal/jobs"
 	"github.com/mosaic-climbing/checkin-bridge/internal/redpoint"
 	"github.com/mosaic-climbing/checkin-bridge/internal/store"
 )
@@ -52,16 +53,45 @@ func (s *Syncer) Start(ctx context.Context) {
 // Run performs an initial membership status refresh and then enters the periodic
 // sync loop. It blocks until ctx is cancelled. Returns ctx.Err() when cancelled.
 // This is the preferred way to launch the cache syncer in a supervised group.
+//
+// Each refresh — the initial one and every scheduled tick — is bracketed by
+// a jobs.Track call so the row lands in the jobs table. Without this, the
+// /ui/sync page's "Last run" pill silently dropped every scheduled run; only
+// manual triggers via POST /cache/sync (which bracket via the api package)
+// were visible to operators. See internal/jobs for the lifecycle story.
 func (s *Syncer) Run(ctx context.Context) error {
 	// Run an initial status refresh immediately
 	s.logger.Info("running initial membership status refresh...")
-	if err := s.RefreshAllStatuses(ctx); err != nil {
+	if err := s.trackedRefresh(ctx); err != nil {
 		s.logger.Error("initial status refresh failed (will retry on schedule)", "error", err)
 	}
 
 	// Periodic status refresh (default: every 24 hours)
 	s.syncLoop(ctx)
 	return ctx.Err()
+}
+
+// trackedRefresh wraps RefreshAllStatuses in a jobs.Track bracket and
+// captures cache stats + duration into the result row, matching the
+// shape that the manual /cache/sync handler writes. Used by Run and
+// the periodic syncLoop tick.
+func (s *Syncer) trackedRefresh(ctx context.Context) error {
+	return jobs.Track(ctx, s.store, s.logger, jobs.TypeCacheSync,
+		func(ctx context.Context) (any, error) {
+			started := time.Now()
+			if err := s.RefreshAllStatuses(ctx); err != nil {
+				return nil, err
+			}
+			duration := time.Since(started).Round(100 * time.Millisecond)
+			var stats *store.MemberStats
+			if s.store != nil {
+				stats, _ = s.store.MemberStats(ctx)
+			}
+			return map[string]any{
+				"cache":    stats,
+				"duration": duration.String(),
+			}, nil
+		})
 }
 
 // RefreshAllStatuses fetches fresh membership status for every member in the
@@ -192,7 +222,7 @@ func (s *Syncer) syncLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := s.RefreshAllStatuses(ctx); err != nil {
+			if err := s.trackedRefresh(ctx); err != nil {
 				s.logger.Error("scheduled status refresh failed", "error", err)
 			}
 		}

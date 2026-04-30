@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/mosaic-climbing/checkin-bridge/internal/config"
+	"github.com/mosaic-climbing/checkin-bridge/internal/jobs"
 	"github.com/mosaic-climbing/checkin-bridge/internal/metrics"
 	"github.com/mosaic-climbing/checkin-bridge/internal/redpoint"
 	"github.com/mosaic-climbing/checkin-bridge/internal/store"
@@ -267,7 +268,7 @@ func (s *Syncer) runLoop(ctx context.Context) {
 	}
 
 	s.logger.Info("running initial UniFi status sync...")
-	if result, err := s.RunSync(ctx); err != nil {
+	if result, err := s.trackedRunSync(ctx); err != nil {
 		s.logger.Error("initial status sync failed", "error", err)
 	} else {
 		s.logger.Info("initial status sync complete",
@@ -289,7 +290,7 @@ func (s *Syncer) runLoop(ctx context.Context) {
 			return
 		}
 		s.logger.Info("running scheduled UniFi status sync...")
-		if result, err := s.RunSync(ctx); err != nil {
+		if result, err := s.trackedRunSync(ctx); err != nil {
 			s.logger.Error("scheduled status sync failed", "error", err)
 		} else {
 			s.logger.Info("scheduled status sync complete",
@@ -298,6 +299,33 @@ func (s *Syncer) runLoop(ctx context.Context) {
 			)
 		}
 	}
+}
+
+// trackedRunSync wraps RunSync in a jobs.Track bracket so scheduled
+// runs land in the jobs table with the same shape the manual
+// /status-sync handler writes. The captured result fields match
+// internal/api/server.go's handleStatusSync so staff see consistent
+// rows whether the sync was scheduled or operator-triggered.
+func (s *Syncer) trackedRunSync(ctx context.Context) (*SyncResult, error) {
+	var captured *SyncResult
+	err := jobs.Track(ctx, s.store, s.logger, jobs.TypeStatusSync,
+		func(ctx context.Context) (any, error) {
+			result, err := s.RunSync(ctx)
+			captured = result
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"activated":    result.Activated,
+				"deactivated":  result.Deactivated,
+				"unchanged":    result.Unchanged,
+				"errors":       result.Errors,
+				"newlyMatched": result.NewlyMatched,
+				"newlyPending": result.NewlyPending,
+				"duration":     result.Duration,
+			}, nil
+		})
+	return captured, err
 }
 
 // scheduleNext computes the time at which the next sync run should fire.
