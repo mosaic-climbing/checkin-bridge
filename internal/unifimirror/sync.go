@@ -28,6 +28,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/mosaic-climbing/checkin-bridge/internal/jobs"
 	"github.com/mosaic-climbing/checkin-bridge/internal/store"
 	"github.com/mosaic-climbing/checkin-bridge/internal/unifi"
 )
@@ -164,7 +165,7 @@ func New(u unifiClient, s *store.Store, cfg SyncConfig, logger *slog.Logger) *Sy
 // wedge the mirror until the next restart.
 func (s *Syncer) Run(ctx context.Context) error {
 	s.logger.Info("running initial UA-Hub directory mirror refresh...")
-	if err := s.Refresh(ctx); err != nil {
+	if err := s.trackedRefresh(ctx); err != nil {
 		s.logger.Error("initial UA-Hub mirror refresh failed (will retry on schedule)",
 			"error", err)
 	}
@@ -177,12 +178,35 @@ func (s *Syncer) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := s.Refresh(ctx); err != nil {
+			if err := s.trackedRefresh(ctx); err != nil {
 				s.logger.Error("scheduled UA-Hub mirror refresh failed",
 					"error", err)
 			}
 		}
 	}
+}
+
+// trackedRefresh wraps RefreshWithStats in a jobs.Track bracket so
+// scheduled mirror runs are visible on the staff /ui/sync page. The
+// captured result mirrors the shape internal/api/server.go's
+// handleUAHubSync writes so manual and scheduled rows interleave
+// cleanly in the Recent Jobs list.
+func (s *Syncer) trackedRefresh(ctx context.Context) error {
+	return jobs.Track(ctx, s.store, s.logger, jobs.TypeUAHubSync,
+		func(ctx context.Context) (any, error) {
+			stats, err := s.RefreshWithStats(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"observed":    stats.Observed,
+				"upserted":    stats.Upserted,
+				"hydrated":    stats.Hydrated,
+				"rechecked":   stats.Rechecked,
+				"mirrorTotal": stats.MirrorTotal,
+				"duration":    stats.Duration.String(),
+			}, nil
+		})
 }
 
 // Refresh fetches the full UA-Hub user directory and upserts each
