@@ -22,7 +22,6 @@ import (
 
 	"github.com/mosaic-climbing/checkin-bridge/internal/redpoint"
 	"github.com/mosaic-climbing/checkin-bridge/internal/store"
-	"github.com/mosaic-climbing/checkin-bridge/internal/unifi"
 )
 
 // MatchMethod describes how a UniFi user was matched to a Redpoint customer.
@@ -71,21 +70,25 @@ type IngestResult struct {
 }
 
 // Ingester handles the UniFi → Redpoint user mapping process.
+//
+// Note: prior versions held a *unifi.Client for the live ListUsers
+// walk that Step 1 used to drive. That field was removed when Step 1
+// switched to reading the local ua_users mirror — the ingester is
+// now a pure store + redpoint consumer. Keep it that way; if a future
+// caller needs UA-Hub live access, it should reach for the live client
+// directly rather than re-coupling the ingester to upstream uptime.
 type Ingester struct {
-	unifi    *unifi.Client
 	redpoint *redpoint.Client
 	store    *store.Store
 	logger   *slog.Logger
 }
 
 func NewIngester(
-	unifiClient *unifi.Client,
 	redpointClient *redpoint.Client,
 	db *store.Store,
 	logger *slog.Logger,
 ) *Ingester {
 	return &Ingester{
-		unifi:    unifiClient,
 		redpoint: redpointClient,
 		store:    db,
 		logger:   logger,
@@ -93,10 +96,22 @@ func NewIngester(
 }
 
 // Run performs the full ingest pipeline:
-//  1. Fetch all UniFi users with NFC credentials
+//  1. Read UA-Hub users with NFC credentials from the local ua_users mirror
+//     (refreshed on every ua-hub-mirror tick).
 //  2. Match each against the local SQLite customer directory (by email, then name)
 //  3. For matched customers, fetch fresh status from Redpoint
 //  4. If dryRun=false, write to cache
+//
+// Step 1 used to call unifi.Client.ListUsers (live, paginated) which
+// took ~3 minutes at LEF and was the direct cause of the wedged-ingest
+// behaviour operators kept hitting in the field — a flaky UA-Hub
+// session left the HTTP client stuck on a page that would never
+// return, and the whole ingest goroutine wedged with no progress
+// logging. Reading from the mirror is one indexed SQLite query and
+// inherits no upstream uptime risk; the mirror is refreshed on every
+// ua-hub-mirror tick (cfg.Sync.Interval) so the data is at most one
+// sync cycle stale, which is the same staleness window every other
+// scheduled job already operates on.
 func (ing *Ingester) Run(ctx context.Context, dryRun bool) (*IngestResult, error) {
 	start := time.Now()
 	result := &IngestResult{
@@ -114,27 +129,37 @@ func (ing *Ingester) Run(ctx context.Context, dryRun bool) (*IngestResult, error
 	}
 	ing.logger.Info("customer store ready", "customers", count)
 
-	// ── Step 1: Fetch UniFi users ────────────────────────────
-	ing.logger.Info("step 1: fetching UniFi Access users")
-	unifiUsers, err := ing.unifi.ListUsers(ctx)
+	// ── Step 1: Read UA-Hub users from the local mirror ──────
+	ing.logger.Info("step 1: reading UA-Hub users from local mirror")
+	uaUsers, err := ing.store.AllUAUsersWithNFC(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("fetch UniFi users: %w", err)
+		return nil, fmt.Errorf("read UA-Hub mirror: %w", err)
 	}
-	result.UniFiUsers = len(unifiUsers)
-	result.WithNFC = len(unifiUsers)
+	if len(uaUsers) == 0 {
+		// Mirror empty almost always means a fresh deploy where
+		// ua-hub-mirror hasn't completed its first refresh yet.
+		// Distinct from "UA-Hub returned zero users" because the
+		// mirror would've persisted that as zero rows after a real
+		// successful refresh — we'd see the customers store empty
+		// the same way.
+		return nil, fmt.Errorf("UA-Hub mirror is empty — wait for the next ua-hub-mirror tick or POST /ua-hub/sync to populate it")
+	}
+	result.UniFiUsers = len(uaUsers)
+	result.WithNFC = len(uaUsers)
 
-	ing.logger.Info("UniFi users with NFC", "count", len(unifiUsers))
+	ing.logger.Info("UA-Hub users with NFC (from mirror)", "count", len(uaUsers))
 
 	// ── Step 2: Match against SQLite directory ───────────────
-	ing.logger.Info("step 2: matching UniFi users against local customer directory")
-	mappings := make([]*UserMapping, 0, len(unifiUsers))
+	ing.logger.Info("step 2: matching UA-Hub users against local customer directory")
+	mappings := make([]*UserMapping, 0, len(uaUsers))
 
-	for _, u := range unifiUsers {
+	for _, u := range uaUsers {
+		tokens := u.NfcTokens()
 		m := &UserMapping{
 			UniFiUserID: u.ID,
 			UniFiName:   u.FullName(),
 			UniFiEmail:  u.Email,
-			NfcTokens:   u.NfcTokens,
+			NfcTokens:   tokens,
 			Method:      MatchNone,
 		}
 
@@ -174,7 +199,7 @@ func (ing *Ingester) Run(ctx context.Context, dryRun bool) (*IngestResult, error
 
 		// Fall back to name match
 		if m.Method == MatchNone {
-			first, last := parseUniFiName(u)
+			first, last := parseUAUserName(u)
 			if first != "" || last != "" {
 				records, err := ing.store.SearchCustomersByName(ctx, first, last)
 				if err == nil {
@@ -273,7 +298,7 @@ func (ing *Ingester) Run(ctx context.Context, dryRun bool) (*IngestResult, error
 
 // ─── Helpers ─────────────────────────────────────────────────
 
-func parseUniFiName(u unifi.UniFiUser) (first, last string) {
+func parseUAUserName(u store.UAUser) (first, last string) {
 	if u.FirstName != "" || u.LastName != "" {
 		return u.FirstName, u.LastName
 	}

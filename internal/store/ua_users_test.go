@@ -209,6 +209,47 @@ func TestAllUAUsers_Ordering(t *testing.T) {
 	}
 }
 
+// TestAllUAUsersWithNFC_FiltersEmptyTokens covers the contract the
+// ingest pipeline relies on: only mirror rows that actually have an
+// NFC token enrolled come back. A user without tokens is still in
+// the mirror (the directory mirror is comprehensive — pre-enrolled
+// staff accounts, etc.) but ingest doesn't want them, so the cheap
+// `nfc_tokens != '[]'` filter is the contract.
+func TestAllUAUsersWithNFC_FiltersEmptyTokens(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	// One with tokens, one with nil tokens (stores as '[]'), one with
+	// an empty []string (also stores as '[]'). Only the first should
+	// come back.
+	if err := s.UpsertUAUser(ctx, &UAUser{ID: "with-tokens", LastSyncedAt: "2026-04-30T00:00:00Z"},
+		[]string{"abc123"}); err != nil {
+		t.Fatalf("upsert with-tokens: %v", err)
+	}
+	if err := s.UpsertUAUser(ctx, &UAUser{ID: "no-tokens", LastSyncedAt: "2026-04-30T00:00:00Z"},
+		nil); err != nil {
+		t.Fatalf("upsert no-tokens: %v", err)
+	}
+	if err := s.UpsertUAUser(ctx, &UAUser{ID: "empty-tokens", LastSyncedAt: "2026-04-30T00:00:00Z"},
+		[]string{}); err != nil {
+		t.Fatalf("upsert empty-tokens: %v", err)
+	}
+
+	got, err := s.AllUAUsersWithNFC(ctx)
+	if err != nil {
+		t.Fatalf("AllUAUsersWithNFC: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 NFC-bearing row, got %d: %+v", len(got), got)
+	}
+	if got[0].ID != "with-tokens" {
+		t.Errorf("ID = %q, want with-tokens", got[0].ID)
+	}
+	if toks := got[0].NfcTokens(); len(toks) != 1 || toks[0] != "abc123" {
+		t.Errorf("NfcTokens = %v, want [abc123]", toks)
+	}
+}
+
 // TestSearchUAUsers pins the v0.5.9 #10 contract used by the NFC
 // reassign picker: case-insensitive LIKE across first_name, last_name,
 // name, and email; whitespace-split tokens AND-ed together; empty query

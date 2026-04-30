@@ -216,7 +216,6 @@ func main() {
 	)
 
 	ingester := ingest.NewIngester(
-		unifiClient,
 		redpointClient,
 		db,
 		logger.With("component", "ingest"),
