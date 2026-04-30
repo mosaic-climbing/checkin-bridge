@@ -14,10 +14,23 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
 )
+
+// bcryptCost is the work factor used when hashing the staff password.
+// Cost 12 is ~250ms on modern hardware in plain runs and ~2.7s under -race,
+// which dominates test wall-clock since every test that constructs a
+// SessionManager pays it. testing.Testing() is true only in test binaries,
+// so production keeps the strong cost.
+func bcryptCost() int {
+	if testing.Testing() {
+		return bcrypt.MinCost
+	}
+	return 12
+}
 
 // SessionManager handles staff login sessions with signed HTTP-only cookies.
 type SessionManager struct {
@@ -151,8 +164,7 @@ func NewSessionManagerWithKeyFile(staffPassword, keyPath string) (*SessionManage
 }
 
 func newSessionManagerWithKey(staffPassword string, key []byte) *SessionManager {
-	// bcrypt the staff password — cost 12 is ~250ms on modern hardware
-	hash, err := bcrypt.GenerateFromPassword([]byte(staffPassword), 12)
+	hash, err := bcrypt.GenerateFromPassword([]byte(staffPassword), bcryptCost())
 	if err != nil {
 		// Should never fail for a reasonable password
 		panic("bcrypt hash failed: " + err.Error())

@@ -54,8 +54,10 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Run tests (final gate)
-        run: go test -race ./...
+      # No `go test -race` re-gate here. The tag points at a commit on main
+      # that already passed the same `go test -race ./...` invocation in
+      # ci.yml on its PR. Re-running it 3× across the build matrix on the
+      # exact same tree adds wall-clock without catching anything new.
 
       - name: Build binary
         env:

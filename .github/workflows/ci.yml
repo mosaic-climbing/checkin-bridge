@@ -1,8 +1,11 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
+  # Intentionally no `push: branches: [main]` trigger. Squash-merge produces a
+  # new SHA on main with the same tree the PR run already validated, so a
+  # post-merge run is pure duplication. Branch protection (no force-push, PRs
+  # required) keeps main from receiving an unvalidated commit. Tags still run
+  # the release workflow for their own gates.
   pull_request:
     branches: [main]
   workflow_dispatch:
