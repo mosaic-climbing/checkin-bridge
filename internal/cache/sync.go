@@ -85,7 +85,14 @@ func (s *Syncer) trackedRefresh(ctx context.Context) error {
 			duration := time.Since(started).Round(100 * time.Millisecond)
 			var stats *store.MemberStats
 			if s.store != nil {
-				stats, _ = s.store.MemberStats(ctx)
+				var err error
+				stats, err = s.store.MemberStats(ctx)
+				if err != nil {
+					// Don't fail the job — the refresh itself succeeded; we
+					// just can't render the post-run stats pill. Log so the
+					// gap on /ui/sync is explainable rather than silent.
+					s.logger.Warn("MemberStats failed; job result will omit cache counts", "error", err)
+				}
 			}
 			return map[string]any{
 				"cache":    stats,
@@ -101,17 +108,34 @@ func (s *Syncer) trackedRefresh(ctx context.Context) error {
 // Members whose badge goes FROZEN/EXPIRED stay in the cache with updated status
 // so they get re-activated automatically if their membership is restored.
 func (s *Syncer) RefreshAllStatuses(ctx context.Context) error {
-	customerIDs, err := s.store.AllMemberCustomerIDs(ctx)
+	// One read of the members table instead of per-customer GetMemberByCustomerID
+	// inside the loop below. RefreshCustomers gets a deduplicated customer-id
+	// list so we don't ask Redpoint about the same customer twice when a
+	// customer has multiple NFC cards bound (unusual today but legal in the
+	// schema).
+	members, err := s.store.AllMembers(ctx)
 	if err != nil {
 		return err
 	}
-
-	if len(customerIDs) == 0 {
+	if len(members) == 0 {
 		s.logger.Warn("cache is empty — nothing to refresh. Run POST /ingest/unifi to populate the cache first.")
 		return nil
 	}
 
-	s.logger.Info("refreshing membership status for all cached members", "count", len(customerIDs))
+	customerIDs := make([]string, 0, len(members))
+	seen := make(map[string]struct{}, len(members))
+	for _, m := range members {
+		if _, dup := seen[m.CustomerID]; dup {
+			continue
+		}
+		seen[m.CustomerID] = struct{}{}
+		customerIDs = append(customerIDs, m.CustomerID)
+	}
+
+	s.logger.Info("refreshing membership status for all cached members",
+		"members", len(members),
+		"customers", len(customerIDs),
+	)
 	start := time.Now()
 
 	refreshed, err := s.redpoint.RefreshCustomers(ctx, customerIDs)
@@ -119,7 +143,6 @@ func (s *Syncer) RefreshAllStatuses(ctx context.Context) error {
 		return err
 	}
 
-	// Build a map for quick lookup
 	byID := make(map[string]*redpoint.Customer, len(refreshed))
 	for _, c := range refreshed {
 		byID[c.ID] = c
@@ -129,17 +152,10 @@ func (s *Syncer) RefreshAllStatuses(ctx context.Context) error {
 	updated := 0
 	staleCount := 0
 
-	for _, id := range customerIDs {
-		existing, err := s.store.GetMemberByCustomerID(ctx, id)
-		if err != nil {
-			s.logger.Error("failed to get member by customer ID", "customerId", id, "error", err)
-			continue
-		}
-		if existing == nil {
-			continue
-		}
+	for i := range members {
+		existing := &members[i]
 
-		cust, found := byID[id]
+		cust, found := byID[existing.CustomerID]
 		if !found {
 			// Customer no longer exists in Redpoint — mark inactive but keep in cache
 			if existing.Active {
@@ -147,12 +163,13 @@ func (s *Syncer) RefreshAllStatuses(ctx context.Context) error {
 				existing.BadgeStatus = "DELETED"
 				existing.CachedAt = now
 				if err := s.store.UpsertMember(ctx, existing); err != nil {
-					s.logger.Error("failed to upsert member", "customerId", id, "error", err)
+					s.logger.Error("failed to upsert member", "customerId", existing.CustomerID, "error", err)
+					continue
 				}
 				staleCount++
 				s.logger.Info("customer no longer in Redpoint, marked inactive",
 					"name", existing.FirstName+" "+existing.LastName,
-					"customerId", id,
+					"customerId", existing.CustomerID,
 				)
 			}
 			continue
@@ -190,7 +207,7 @@ func (s *Syncer) RefreshAllStatuses(ctx context.Context) error {
 		existing.CachedAt = now
 
 		if err := s.store.UpsertMember(ctx, existing); err != nil {
-			s.logger.Error("failed to upsert member", "customerId", id, "error", err)
+			s.logger.Error("failed to upsert member", "customerId", existing.CustomerID, "error", err)
 			continue
 		}
 		updated++
@@ -198,7 +215,7 @@ func (s *Syncer) RefreshAllStatuses(ctx context.Context) error {
 
 	stats, err := s.store.MemberStats(ctx)
 	if err != nil {
-		s.logger.Error("failed to get member stats", "error", err)
+		s.logger.Warn("failed to get member stats after refresh", "error", err)
 	} else {
 		s.logger.Info("status refresh complete",
 			"requested", len(customerIDs),

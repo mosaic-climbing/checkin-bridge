@@ -565,8 +565,9 @@ func main() {
 	}, controlHandler)
 	controlHandler = api.RequestLogger(logger.With("component", "api-control"), trustedProxies, controlHandler)
 
-	// Add metrics endpoint (TODO: wire in uiHandler when UI routes are ready)
-	_ = uiHandler // TODO: register ui.Handler routes on mux
+	// uiHandler is registered with apiServer above; the public mux only
+	// owns /metrics (raw Prometheus text) and delegates everything else
+	// to httpHandler so the security middleware chain still applies.
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Snapshot WebSocket client state into gauges on each scrape so

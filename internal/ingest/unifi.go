@@ -211,7 +211,25 @@ func (ing *Ingester) Run(ctx context.Context, dryRun bool) (*IngestResult, error
 						m.Active = rec.Active
 						m.Method = MatchByName
 					} else if len(records) > 1 {
-						m.Warning = fmt.Sprintf("multiple Redpoint customers match this name (%d) — needs manual mapping", len(records))
+						// Surface the candidate Redpoint IDs (capped) so staff
+						// can resolve the ambiguity from logs / the Needs Match
+						// panel without re-running the ingest in dry-run.
+						const maxCandidates = 5
+						ids := make([]string, 0, maxCandidates)
+						for i, r := range records {
+							if i >= maxCandidates {
+								break
+							}
+							ids = append(ids, r.RedpointID)
+						}
+						suffix := ""
+						if len(records) > maxCandidates {
+							suffix = fmt.Sprintf(", +%d more", len(records)-maxCandidates)
+						}
+						m.Warning = fmt.Sprintf(
+							"multiple Redpoint customers match this name (%d) — needs manual mapping; candidates: [%s]%s",
+							len(records), strings.Join(ids, ", "), suffix,
+						)
 					}
 				}
 			}
@@ -272,7 +290,14 @@ func (ing *Ingester) Run(ctx context.Context, dryRun bool) (*IngestResult, error
 					Active:      m.Active,
 					CachedAt:    result.Timestamp,
 				}
-				ing.store.UpsertMember(ctx, member)
+				if err := ing.store.UpsertMember(ctx, member); err != nil {
+					ing.logger.Error("failed to upsert member",
+						"customerId", m.RedpointID,
+						"nfcUid", member.NfcUID,
+						"error", err,
+					)
+					continue
+				}
 				applied++
 			}
 		}

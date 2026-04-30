@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mosaic-climbing/checkin-bridge/internal/config"
@@ -116,17 +117,23 @@ type Config struct {
 // circuit breaker that guarded it). Both moved to internal/recheck so
 // the per-tap policy is a separate concern from the daily sync loop.
 type Syncer struct {
-	unifi      *unifi.Client
-	redpoint   *redpoint.Client
-	store      *store.Store
-	config     Config
-	logger     *slog.Logger
-	shadowMode bool
+	unifi    *unifi.Client
+	redpoint *redpoint.Client
+	store    *store.Store
+	config   Config
+	logger   *slog.Logger
 
-	// metrics is the optional observability sink. When nil, all metric
-	// emissions are silently skipped — matches the checkin.Handler pattern
-	// so tests that don't care about metrics don't have to wire a registry.
-	metrics *metrics.Registry
+	// shadowMode is read on every sync-decision branch and written by
+	// SetShadowMode (potentially while a sync is in flight). Atomic so
+	// the read sites in runStatusPhase / runExpiryPhase can't tear or
+	// race against the operator toggling shadow mode from the UI.
+	shadowMode atomic.Bool
+
+	// metrics is the optional observability sink. nil-Load means "no
+	// metrics registry attached" and emissions are skipped. Atomic so
+	// SetMetrics can swap the registry at runtime without racing
+	// against the readers in the sync loop and supervisor.
+	metrics atomic.Pointer[metrics.Registry]
 
 	mu         sync.Mutex
 	lastResult *SyncResult
@@ -137,14 +144,14 @@ type Syncer struct {
 // ACTIVE/DEACTIVATED decision but never calls UniFi UpdateUserStatus.
 // The local store is still updated so reports reflect current Redpoint state.
 func (s *Syncer) SetShadowMode(on bool) {
-	s.shadowMode = on
+	s.shadowMode.Store(on)
 }
 
 // SetMetrics attaches the metrics registry. Safe to call before or after
-// Start; metric emissions inside the sync loop do a nil-check each time so
-// the registry can be swapped at runtime without racing.
+// Start; reads in the sync loop snapshot the pointer with Load() so the
+// registry can be swapped at runtime without racing.
 func (s *Syncer) SetMetrics(m *metrics.Registry) {
-	s.metrics = m
+	s.metrics.Store(m)
 }
 
 // New creates a new status syncer.
@@ -225,8 +232,8 @@ func (s *Syncer) supervisedLoopWithFn(ctx context.Context, fn func(context.Conte
 			// loop), but if it does, re-launching beats silently exiting.
 			s.logger.Warn("status sync loop returned without ctx cancellation; re-launching")
 		}
-		if s.metrics != nil {
-			s.metrics.Counter("sync_loop_restarted_total").Inc()
+		if m := s.metrics.Load(); m != nil {
+			m.Counter("sync_loop_restarted_total").Inc()
 		}
 	}
 }
@@ -485,8 +492,9 @@ func (s *Syncer) RunSync(ctx context.Context) (*SyncResult, error) {
 
 			if memberAllowed && !unifiActive {
 				// Member is valid in Redpoint but locked out in UniFi → reactivate
+				shadow := s.shadowMode.Load()
 				action := "REACTIVATING user in UniFi"
-				if s.shadowMode {
+				if shadow {
 					action = "SHADOW: would REACTIVATE user in UniFi"
 				}
 				s.logger.Info(action,
@@ -495,7 +503,7 @@ func (s *Syncer) RunSync(ctx context.Context) (*SyncResult, error) {
 					"unifiStatus", user.Status,
 					"badgeStatus", cached.BadgeStatus,
 				)
-				if s.shadowMode {
+				if shadow {
 					result.Activated++
 					continue
 				}
@@ -513,8 +521,9 @@ func (s *Syncer) RunSync(ctx context.Context) (*SyncResult, error) {
 
 			} else if !memberAllowed && unifiActive {
 				// Member is expired/frozen in Redpoint but still active in UniFi → deactivate
+				shadow := s.shadowMode.Load()
 				action := "DEACTIVATING user in UniFi"
-				if s.shadowMode {
+				if shadow {
 					action = "SHADOW: would DEACTIVATE user in UniFi"
 				}
 				s.logger.Info(action,
@@ -524,7 +533,7 @@ func (s *Syncer) RunSync(ctx context.Context) (*SyncResult, error) {
 					"active", cached.Active,
 					"reason", cached.DenyReason(),
 				)
-				if s.shadowMode {
+				if shadow {
 					result.Deactivated++
 					continue
 				}
@@ -568,9 +577,9 @@ func (s *Syncer) RunSync(ctx context.Context) (*SyncResult, error) {
 	// its previous value and the alert eventually fires, which is the
 	// intended behaviour: "no successful sync in too long" is exactly what
 	// we want to page on.
-	if s.metrics != nil {
-		s.metrics.Gauge("last_sync_completed_at").SetInt(time.Now().Unix())
-		s.metrics.Counter("sync_runs_total").Inc()
+	if m := s.metrics.Load(); m != nil {
+		m.Gauge("last_sync_completed_at").SetInt(time.Now().Unix())
+		m.Counter("sync_runs_total").Inc()
 	}
 
 	return result, nil
@@ -667,8 +676,9 @@ func (s *Syncer) runExpiryPhase(ctx context.Context, result *SyncResult) {
 		if err := ctx.Err(); err != nil {
 			return
 		}
+		shadow := s.shadowMode.Load()
 		action := "DEACTIVATING unmatched UA user (grace window expired)"
-		if s.shadowMode {
+		if shadow {
 			action = "SHADOW: would DEACTIVATE unmatched UA user (grace expired)"
 		}
 		s.logger.Warn(action,
@@ -678,7 +688,7 @@ func (s *Syncer) runExpiryPhase(ctx context.Context, result *SyncResult) {
 			"graceUntil", p.GraceUntil,
 		)
 
-		if s.shadowMode {
+		if shadow {
 			// Shadow contract: never touch UA-Hub, and never dequeue the
 			// pending ticket — flipping to live must re-find this row and
 			// actually run the deactivation. Count the would-be decision

@@ -509,10 +509,10 @@ func TestSupervisedLoop_RestartsOnPanic(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg := metrics.New()
 	s := &Syncer{
-		logger:  logger,
-		metrics: reg,
-		config:  Config{SyncInterval: 24 * time.Hour},
+		logger: logger,
+		config: Config{SyncInterval: 24 * time.Hour},
 	}
+	s.SetMetrics(reg)
 
 	calls := 0
 	ctx, cancel := context.WithCancel(context.Background())
