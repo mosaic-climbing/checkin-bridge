@@ -47,6 +47,16 @@ var (
 	buildTime = "unknown"
 )
 
+// Hardening constants for the scheduler closures (directory-syncer,
+// unifi-ingest). The cache.Syncer and unifimirror.Syncer carry their
+// own mirror of these constants so an in-package test can pin them
+// without importing main; values must match.
+const (
+	schedulerJitter       = 0.1
+	schedulerBackoffStart = 5 * time.Second
+	schedulerBackoffMax   = 5 * time.Minute
+)
+
 // bgMetricsAdapter bridges bg.Group's tiny Metrics interface to the
 // metrics.Registry. It encodes the goroutine name as a Prometheus
 // label (`bg_goroutines_running{name="x"}`) so each tracked task gets
@@ -205,12 +215,28 @@ func main() {
 	}
 
 	// ── Syncers and ingester ─────────────────────────────────
+	//
+	// Stagger plan: the four schedulers driven off cfg.Sync.Interval
+	// (directory-syncer, ua-hub-mirror, unifi-ingest, cache-syncer)
+	// used to all fire at boot within milliseconds of each other,
+	// thunderherding Redpoint + UA-Hub. The InitialDelay values below
+	// spread their first runs across ~2 minutes, ordered by upstream
+	// dependency:
+	//
+	//   t=0s    directory-syncer  → fills customers (ingest needs it)
+	//   t=30s   ua-hub-mirror     → fills ua_users  (ingest needs it)
+	//   t=90s   unifi-ingest      → matches → members
+	//   t=120s  cache-syncer      → refreshes badge status on members
+	//
+	// Subsequent ticks use jitter (±10%) so the four schedules diverge
+	// over time even when InitialDelay only applies to the first run.
 	syncer := cache.NewSyncer(
 		db,
 		redpointClient,
 		cache.SyncConfig{
 			SyncInterval: cfg.Sync.Interval,
 			PageSize:     cfg.Sync.PageSize,
+			InitialDelay: 120 * time.Second,
 		},
 		logger.With("component", "syncer"),
 	)
@@ -508,7 +534,10 @@ func main() {
 	uaHubMirror := unifimirror.New(
 		unifiClient,
 		db,
-		unifimirror.SyncConfig{Interval: cfg.Sync.Interval},
+		unifimirror.SyncConfig{
+			Interval:     cfg.Sync.Interval,
+			InitialDelay: 30 * time.Second,
+		},
 		logger.With("component", "unifimirror"),
 	)
 	apiServer.SetUAHubMirrorRefresher(func(ctx context.Context, progress func(phase string)) (api.UAHubRefreshStats, error) {
@@ -619,12 +648,18 @@ func main() {
 	// Redpoint signups never appear in /ui/search, the ingest matcher
 	// can't find them, and statusync's matcher phase silently misses
 	// recently-joined members. Scheduled at the same interval as the
-	// other syncers so the cache, ua_users, and customers tables all
-	// refresh on the same wall-clock cadence.
+	// other syncers; runs first in the boot stagger because both
+	// unifi-ingest and cache-syncer depend on a populated customers
+	// table.
 	dirSyncerLogger := logger.With("component", "directory-syncer")
 	bgGroup.Go("directory-syncer", func(bgCtx context.Context) error {
-		return jobs.LoopWithInterval(bgCtx, cfg.Sync.Interval, db, dirSyncerLogger,
-			jobs.TypeDirectorySync,
+		return jobs.Loop(bgCtx, jobs.LoopConfig{
+			Interval:     cfg.Sync.Interval,
+			InitialDelay: 0,
+			Jitter:       schedulerJitter,
+			BackoffStart: schedulerBackoffStart,
+			BackoffMax:   schedulerBackoffMax,
+		}, db, dirSyncerLogger, jobs.TypeDirectorySync,
 			func(ctx context.Context) (any, error) {
 				res, err := apiServer.RunDirectorySync(ctx)
 				if err != nil {
@@ -651,13 +686,20 @@ func main() {
 	// gate covers door-unlock + UA-Hub status writes, neither of which
 	// the ingest path touches; ingest is local-store-only either way.
 	//
-	// Cache-empty failure on a fresh deploy is expected: the first
-	// directory-syncer run has to land before ingest can match anyone.
-	// We log and keep ticking, so the next interval picks up cleanly.
+	// Cache-empty / mirror-empty failures on a fresh deploy are expected
+	// while directory-syncer + ua-hub-mirror finish their first runs.
+	// Boot-time stagger (90s) gives both upstreams a head start; the
+	// exponential backoff inside jobs.Loop then handles the case where
+	// they're still empty when we land.
 	ingestLogger := logger.With("component", "unifi-ingest")
 	bgGroup.Go("unifi-ingest", func(bgCtx context.Context) error {
-		return jobs.LoopWithInterval(bgCtx, cfg.Sync.Interval, db, ingestLogger,
-			jobs.TypeUniFiIngest,
+		return jobs.Loop(bgCtx, jobs.LoopConfig{
+			Interval:     cfg.Sync.Interval,
+			InitialDelay: 90 * time.Second,
+			Jitter:       schedulerJitter,
+			BackoffStart: schedulerBackoffStart,
+			BackoffMax:   schedulerBackoffMax,
+		}, db, ingestLogger, jobs.TypeUniFiIngest,
 			func(ctx context.Context) (any, error) {
 				res, err := ingester.Run(ctx, false /* dryRun: scheduled writes */)
 				if err != nil {
