@@ -41,6 +41,10 @@ type SyncConfig struct {
 	// same daily cadence as the Redpoint directory sync so both
 	// mirrors tend to be consistent as of the same wall-clock hour.
 	Interval time.Duration
+	// InitialDelay is how long to wait before the first refresh fires.
+	// Used by cmd/bridge to stagger boot-time fires across the four
+	// schedulers that share Sync.Interval. Zero = run immediately.
+	InitialDelay time.Duration
 }
 
 // unifiClient is the narrow subset of unifi.Client the mirror calls.
@@ -155,59 +159,52 @@ func New(u unifiClient, s *store.Store, cfg SyncConfig, logger *slog.Logger) *Sy
 	}
 }
 
-// Run performs an initial Refresh and then enters the periodic sync
-// loop, blocking until ctx is cancelled. Returns ctx.Err() on
+// Run performs an initial Refresh after InitialDelay and then ticks
+// every Interval (with jitter and exponential backoff on consecutive
+// failures), blocking until ctx is cancelled. Returns ctx.Err() on
 // cancellation. Designed to be passed directly to bg.Group.Go so the
 // lifetime is supervised.
 //
-// An initial-refresh error is logged and swallowed — the periodic
-// loop should still start so a transient UA-Hub blip at boot doesn't
-// wedge the mirror until the next restart.
+// Each refresh — initial or scheduled — is bracketed by jobs.Track so
+// the staff /ui/sync page sees the row. Errors are logged and the loop
+// continues so a transient UA-Hub blip doesn't wedge the mirror.
 func (s *Syncer) Run(ctx context.Context) error {
-	s.logger.Info("running initial UA-Hub directory mirror refresh...")
-	if err := s.trackedRefresh(ctx); err != nil {
-		s.logger.Error("initial UA-Hub mirror refresh failed (will retry on schedule)",
-			"error", err)
-	}
-
-	ticker := time.NewTicker(s.config.Interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if err := s.trackedRefresh(ctx); err != nil {
-				s.logger.Error("scheduled UA-Hub mirror refresh failed",
-					"error", err)
-			}
-		}
-	}
+	return jobs.Loop(ctx, jobs.LoopConfig{
+		Interval:     s.config.Interval,
+		InitialDelay: s.config.InitialDelay,
+		Jitter:       defaultJitter,
+		BackoffStart: defaultBackoffStart,
+		BackoffMax:   defaultBackoffMax,
+	}, s.store, s.logger, jobs.TypeUAHubSync, s.refreshFn)
 }
 
-// trackedRefresh wraps RefreshWithStats in a jobs.Track bracket so
-// scheduled mirror runs are visible on the staff /ui/sync page. The
-// captured result mirrors the shape internal/api/server.go's
-// handleUAHubSync writes so manual and scheduled rows interleave
-// cleanly in the Recent Jobs list.
-func (s *Syncer) trackedRefresh(ctx context.Context) error {
-	return jobs.Track(ctx, s.store, s.logger, jobs.TypeUAHubSync,
-		func(ctx context.Context) (any, error) {
-			stats, err := s.RefreshWithStats(ctx)
-			if err != nil {
-				return nil, err
-			}
-			return map[string]any{
-				"observed":    stats.Observed,
-				"upserted":    stats.Upserted,
-				"hydrated":    stats.Hydrated,
-				"rechecked":   stats.Rechecked,
-				"mirrorTotal": stats.MirrorTotal,
-				"duration":    stats.Duration.String(),
-			}, nil
-		})
+// refreshFn is the inner body each scheduler tick wraps. The captured
+// result mirrors the shape internal/api/server.go's handleUAHubSync
+// writes so manual and scheduled rows interleave cleanly in the
+// Recent Jobs list.
+func (s *Syncer) refreshFn(ctx context.Context) (any, error) {
+	stats, err := s.RefreshWithStats(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"observed":    stats.Observed,
+		"upserted":    stats.Upserted,
+		"hydrated":    stats.Hydrated,
+		"rechecked":   stats.Rechecked,
+		"mirrorTotal": stats.MirrorTotal,
+		"duration":    stats.Duration.String(),
+	}, nil
 }
+
+// Hardening defaults applied to the unifimirror loop. Match the
+// cache.Syncer values so all four Sync.Interval-bound schedulers
+// behave identically under upstream pressure.
+const (
+	defaultJitter       = 0.1
+	defaultBackoffStart = 5 * time.Second
+	defaultBackoffMax   = 5 * time.Minute
+)
 
 // Refresh fetches the full UA-Hub user directory and upserts each
 // user into ua_users. Returns the set of rows observed; the caller

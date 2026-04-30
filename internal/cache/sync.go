@@ -16,6 +16,11 @@ type SyncConfig struct {
 	SyncInterval time.Duration
 	// PageSize for paginating through Redpoint customers (legacy, unused).
 	PageSize int
+	// InitialDelay is how long to wait before the first refresh fires.
+	// Set per-syncer in cmd/bridge to stagger boot-time fires across
+	// the four schedulers that share Sync.Interval, so they don't all
+	// hit Redpoint and UA-Hub simultaneously. Zero = run immediately.
+	InitialDelay time.Duration
 }
 
 // Syncer periodically refreshes the local membership cache from Redpoint.
@@ -35,71 +40,63 @@ func NewSyncer(s *store.Store, rp *redpoint.Client, cfg SyncConfig, logger *slog
 	}
 }
 
-// Start launches the background sync loops. Call once at startup.
-// Deprecated: Use Run instead, which combines initial refresh and periodic loop in a single goroutine.
-func (s *Syncer) Start(ctx context.Context) {
-	// Run an initial status refresh immediately (does NOT re-fetch all customers)
-	go func() {
-		s.logger.Info("running initial membership status refresh...")
-		if err := s.RefreshAllStatuses(ctx); err != nil {
-			s.logger.Error("initial status refresh failed (will retry on schedule)", "error", err)
-		}
-	}()
-
-	// Periodic status refresh (default: every 24 hours)
-	go s.syncLoop(ctx)
-}
-
-// Run performs an initial membership status refresh and then enters the periodic
-// sync loop. It blocks until ctx is cancelled. Returns ctx.Err() when cancelled.
-// This is the preferred way to launch the cache syncer in a supervised group.
+// Run performs an initial membership status refresh after the
+// InitialDelay stagger, then ticks every SyncInterval (with jitter and
+// exponential backoff on consecutive failures). Blocks until ctx is
+// cancelled. Returns ctx.Err() when cancelled. This is the preferred
+// way to launch the cache syncer in a supervised group.
 //
-// Each refresh — the initial one and every scheduled tick — is bracketed by
-// a jobs.Track call so the row lands in the jobs table. Without this, the
-// /ui/sync page's "Last run" pill silently dropped every scheduled run; only
-// manual triggers via POST /cache/sync (which bracket via the api package)
-// were visible to operators. See internal/jobs for the lifecycle story.
+// Each refresh — the initial one and every scheduled tick — is bracketed
+// by a jobs.Track call so the row lands in the jobs table. Without this,
+// the /ui/sync page's "Last run" pill silently dropped every scheduled
+// run; only manual triggers via POST /cache/sync (which bracket via the
+// api package) were visible to operators. See internal/jobs for the
+// lifecycle story and the scheduler-hardening rationale.
 func (s *Syncer) Run(ctx context.Context) error {
-	// Run an initial status refresh immediately
-	s.logger.Info("running initial membership status refresh...")
-	if err := s.trackedRefresh(ctx); err != nil {
-		s.logger.Error("initial status refresh failed (will retry on schedule)", "error", err)
+	return jobs.Loop(ctx, jobs.LoopConfig{
+		Interval:     s.config.SyncInterval,
+		InitialDelay: s.config.InitialDelay,
+		Jitter:       defaultJitter,
+		BackoffStart: defaultBackoffStart,
+		BackoffMax:   defaultBackoffMax,
+	}, s.store, s.logger, jobs.TypeCacheSync, s.refreshFn)
+}
+
+// refreshFn is the inner body each scheduler tick wraps. Pulled out as
+// a method so jobs.Loop can call it directly without an anonymous
+// closure that re-allocates per tick.
+func (s *Syncer) refreshFn(ctx context.Context) (any, error) {
+	started := time.Now()
+	if err := s.RefreshAllStatuses(ctx); err != nil {
+		return nil, err
 	}
-
-	// Periodic status refresh (default: every 24 hours)
-	s.syncLoop(ctx)
-	return ctx.Err()
+	duration := time.Since(started).Round(100 * time.Millisecond)
+	var stats *store.MemberStats
+	if s.store != nil {
+		var err error
+		stats, err = s.store.MemberStats(ctx)
+		if err != nil {
+			// Don't fail the job — the refresh itself succeeded; we
+			// just can't render the post-run stats pill. Log so the
+			// gap on /ui/sync is explainable rather than silent.
+			s.logger.Warn("MemberStats failed; job result will omit cache counts", "error", err)
+		}
+	}
+	return map[string]any{
+		"cache":    stats,
+		"duration": duration.String(),
+	}, nil
 }
 
-// trackedRefresh wraps RefreshAllStatuses in a jobs.Track bracket and
-// captures cache stats + duration into the result row, matching the
-// shape that the manual /cache/sync handler writes. Used by Run and
-// the periodic syncLoop tick.
-func (s *Syncer) trackedRefresh(ctx context.Context) error {
-	return jobs.Track(ctx, s.store, s.logger, jobs.TypeCacheSync,
-		func(ctx context.Context) (any, error) {
-			started := time.Now()
-			if err := s.RefreshAllStatuses(ctx); err != nil {
-				return nil, err
-			}
-			duration := time.Since(started).Round(100 * time.Millisecond)
-			var stats *store.MemberStats
-			if s.store != nil {
-				var err error
-				stats, err = s.store.MemberStats(ctx)
-				if err != nil {
-					// Don't fail the job — the refresh itself succeeded; we
-					// just can't render the post-run stats pill. Log so the
-					// gap on /ui/sync is explainable rather than silent.
-					s.logger.Warn("MemberStats failed; job result will omit cache counts", "error", err)
-				}
-			}
-			return map[string]any{
-				"cache":    stats,
-				"duration": duration.String(),
-			}, nil
-		})
-}
+// Hardening defaults applied uniformly to all schedulers backed by
+// jobs.Loop. The values are not yet exposed as config — operators have
+// no observed need to tune them per-deployment. Exposing them later is
+// a one-liner if that changes.
+const (
+	defaultJitter       = 0.1             // ±10% of Interval per tick
+	defaultBackoffStart = 5 * time.Second // first wait after a failure
+	defaultBackoffMax   = 5 * time.Minute // cap on doubled waits
+)
 
 // RefreshAllStatuses fetches fresh membership status for every member in the
 // cache, by their Redpoint customer ID. This does NOT add or remove members —
@@ -230,18 +227,3 @@ func (s *Syncer) RefreshAllStatuses(ctx context.Context) error {
 	return nil
 }
 
-func (s *Syncer) syncLoop(ctx context.Context) {
-	ticker := time.NewTicker(s.config.SyncInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := s.trackedRefresh(ctx); err != nil {
-				s.logger.Error("scheduled status refresh failed", "error", err)
-			}
-		}
-	}
-}
