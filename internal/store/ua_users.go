@@ -94,10 +94,17 @@ func (s *Store) UpsertUAUser(ctx context.Context, u *UAUser, tokens []string) er
 		payload = string(b)
 	}
 	u.NfcTokensJSON = payload
+	// On INSERT, first_seen defaults to the caller-supplied value or `now`
+	// when blank. On CONFLICT the DO UPDATE SET list deliberately omits
+	// first_seen so the column keeps its original-insert value — that's
+	// what makes the mirror double as a "when did we first see this UA-Hub
+	// user" audit trail. Earlier versions used a subselect inside COALESCE
+	// to look up first_seen on conflict; that subselect was always
+	// computed-then-discarded since the UPDATE never touched the column.
 	_, err := s.db.ExecContext(ctx, `
         INSERT INTO ua_users
             (id, first_name, last_name, name, email, status, nfc_tokens, first_seen, last_synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), (SELECT first_seen FROM ua_users WHERE id = ?), ?), ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), ?), ?)
         ON CONFLICT(id) DO UPDATE SET
             first_name     = excluded.first_name,
             last_name      = excluded.last_name,
@@ -107,7 +114,7 @@ func (s *Store) UpsertUAUser(ctx context.Context, u *UAUser, tokens []string) er
             nfc_tokens     = excluded.nfc_tokens,
             last_synced_at = excluded.last_synced_at
     `, u.ID, u.FirstName, u.LastName, u.Name, u.Email, u.Status,
-		u.NfcTokensJSON, u.FirstSeen, u.ID, now, u.LastSyncedAt)
+		u.NfcTokensJSON, u.FirstSeen, now, u.LastSyncedAt)
 	return err
 }
 
