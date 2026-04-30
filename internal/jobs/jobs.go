@@ -120,3 +120,50 @@ func Track(
 	Finish(ctx, s, logger, id, result, err)
 	return err
 }
+
+// LoopWithInterval runs fn on an initial-on-boot pass and then on a
+// time.Ticker schedule, wrapping each invocation in Track so the run
+// shows up in the jobs table. Errors from fn are logged at Error and
+// otherwise swallowed — a transient upstream blip should not wedge
+// the scheduler. Designed to be passed directly to bg.Group.Go so the
+// lifetime is supervised.
+//
+// Blocks until ctx is cancelled; returns ctx.Err() on exit. If
+// interval is <= 0 the function still runs the initial pass and then
+// blocks on ctx (no scheduled re-runs) — that case shouldn't happen
+// in production but defensive handling avoids a hot ticker loop on
+// misconfiguration.
+//
+// Use this for jobs whose only scheduling concern is "fire once now,
+// then every N hours". Schedulers with wall-clock pinning (statusync's
+// SyncTimeLocal) or panic-recovery supervision (statusync's
+// supervisedLoop) need their own loop bodies — this helper is the
+// simple-ticker shape only.
+func LoopWithInterval(
+	ctx context.Context,
+	interval time.Duration,
+	s *store.Store,
+	logger *slog.Logger,
+	jobType string,
+	fn func(ctx context.Context) (result any, err error),
+) error {
+	if err := Track(ctx, s, logger, jobType, fn); err != nil && logger != nil {
+		logger.Error("scheduled job failed (initial)", "type", jobType, "error", err)
+	}
+	if interval <= 0 {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := Track(ctx, s, logger, jobType, fn); err != nil && logger != nil {
+				logger.Error("scheduled job failed", "type", jobType, "error", err)
+			}
+		}
+	}
+}

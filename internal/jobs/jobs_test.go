@@ -5,7 +5,9 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mosaic-climbing/checkin-bridge/internal/store"
 )
@@ -121,6 +123,74 @@ func TestTrack_DetachesCancelledContext(t *testing.T) {
 	}
 	if row.Status != "completed" {
 		t.Errorf("row.Status = %q, want completed (Finish detach failed?)", row.Status)
+	}
+}
+
+// TestLoopWithInterval_RunsInitialPassAndTicks pins the contract:
+// fn fires once on entry (so a fresh boot doesn't have to wait a
+// full interval for the first run), and again on every ticker fire.
+// We pick a tiny interval and watch the call count cross 2, then
+// cancel — the third tick may or may not land inside the window
+// depending on scheduling, so the assertion is "≥ 2 calls", not
+// equality.
+func TestLoopWithInterval_RunsInitialPassAndTicks(t *testing.T) {
+	db := openTestStore(t)
+	logger := discardLogger()
+
+	var calls atomic.Int32
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	err := LoopWithInterval(ctx, 50*time.Millisecond, db, logger, TypeDirectorySync,
+		func(ctx context.Context) (any, error) {
+			calls.Add(1)
+			return map[string]any{"observed": calls.Load()}, nil
+		})
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("LoopWithInterval err = %v, want ctx done", err)
+	}
+	if got := calls.Load(); got < 2 {
+		t.Errorf("calls = %d, want ≥ 2 (initial + at least one tick)", got)
+	}
+
+	// Every call should have written a job row; the most recent must
+	// be 'completed' since fn returned nil error.
+	row, err := db.LastJobByType(context.Background(), TypeDirectorySync)
+	if err != nil {
+		t.Fatalf("LastJobByType: %v", err)
+	}
+	if row == nil || row.Status != "completed" {
+		t.Errorf("most recent row = %+v, want status=completed", row)
+	}
+}
+
+// TestLoopWithInterval_LogsAndContinuesOnError asserts the loop
+// doesn't bail out when fn returns an error. A transient upstream
+// failure on one tick should be logged and ticked past, not left
+// to wedge the scheduler until the bridge restarts.
+func TestLoopWithInterval_LogsAndContinuesOnError(t *testing.T) {
+	db := openTestStore(t)
+	logger := discardLogger()
+
+	var calls atomic.Int32
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	_ = LoopWithInterval(ctx, 50*time.Millisecond, db, logger, TypeUniFiIngest,
+		func(ctx context.Context) (any, error) {
+			calls.Add(1)
+			return nil, errors.New("upstream blip")
+		})
+
+	if got := calls.Load(); got < 2 {
+		t.Errorf("calls = %d, want ≥ 2 even when fn errors", got)
+	}
+	row, err := db.LastJobByType(context.Background(), TypeUniFiIngest)
+	if err != nil {
+		t.Fatalf("LastJobByType: %v", err)
+	}
+	if row == nil || row.Status != "failed" {
+		t.Errorf("most recent row = %+v, want status=failed", row)
 	}
 }
 

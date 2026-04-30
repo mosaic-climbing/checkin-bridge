@@ -998,25 +998,20 @@ func (s *Server) handleDirectorySync(w http.ResponseWriter, r *http.Request) {
 
 	// Run in background via the supervised group. The jobID is captured
 	// by value so the goroutine can stamp the terminal status even after
-	// the request context has long returned.
+	// the request context has long returned. Delegates to
+	// RunDirectorySync so the scheduled directory-syncer in cmd/bridge
+	// shares the same code path as this manual button.
 	s.bg.Go("directory-sync", func(ctx context.Context) error {
-		started := time.Now()
-		s.bulkLoadCustomers(ctx)
-		// bulkLoadCustomers writes its own sync_state row on success/
-		// failure; mirror that into the jobs-table job so the pill
-		// and Recent Jobs list reflect the same outcome.
-		finalState, _ := s.store.GetSyncState(ctx)
-		duration := time.Since(started).Round(time.Second)
-		if finalState != nil && finalState.Status == "error" {
-			s.finishSyncJob(ctx, jobID, nil, fmt.Errorf("%s", finalState.LastError))
+		res, err := s.RunDirectorySync(ctx)
+		if err != nil {
+			s.finishSyncJob(ctx, jobID, nil, err)
 			return nil
 		}
-		result := map[string]any{"duration": duration.String()}
-		if finalState != nil {
-			result["totalFetched"] = finalState.TotalFetched
-			result["completedAt"] = finalState.CompletedAt
-		}
-		s.finishSyncJob(ctx, jobID, result, nil)
+		s.finishSyncJob(ctx, jobID, map[string]any{
+			"duration":     res.Duration.String(),
+			"totalFetched": res.TotalFetched,
+			"completedAt":  res.CompletedAt,
+		}, nil)
 		return nil
 	})
 
@@ -1031,6 +1026,53 @@ func (s *Server) handleDirectorySync(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"message": "sync started — poll GET /directory/status to monitor",
 	})
+}
+
+// DirectorySyncResult is the outcome of one full RunDirectorySync pass.
+// Returned by both the manual POST /directory/sync handler and the
+// scheduled directory-syncer goroutine in cmd/bridge so callers can
+// build a uniform jobs.result body without round-tripping through
+// sync_state. Duration is rounded to whole seconds because the walk
+// is minutes-long and sub-second precision is noise.
+type DirectorySyncResult struct {
+	TotalFetched int
+	Duration     time.Duration
+	CompletedAt  string
+}
+
+// RunDirectorySync performs one full Redpoint → SQLite directory walk
+// and returns the outcome. The walker writes its progress through
+// sync_state as it goes (so /directory/status keeps reporting the
+// in-flight cursor), and on completion the final sync_state row drives
+// the returned result. An "error" status in sync_state surfaces as a
+// non-nil error so callers can fail their job row.
+//
+// Used by:
+//   - POST /directory/sync (handleDirectorySync) — manual button.
+//   - The scheduled directory-syncer goroutine (cmd/bridge), which
+//     wraps each call in jobs.Track so the run lands in the jobs
+//     table the same way manual triggers do.
+//
+// Both call sites read the same sync_state guard via GetSyncState
+// before calling — RunDirectorySync itself does NOT check for an
+// already-running sync, since the existing-walk-in-progress case is
+// a UX concern (different messaging for manual vs scheduled callers).
+func (s *Server) RunDirectorySync(ctx context.Context) (DirectorySyncResult, error) {
+	if s.store == nil {
+		return DirectorySyncResult{}, fmt.Errorf("store not available")
+	}
+	started := time.Now()
+	s.bulkLoadCustomers(ctx)
+	finalState, _ := s.store.GetSyncState(ctx)
+	if finalState != nil && finalState.Status == "error" {
+		return DirectorySyncResult{}, fmt.Errorf("%s", finalState.LastError)
+	}
+	res := DirectorySyncResult{Duration: time.Since(started).Round(time.Second)}
+	if finalState != nil {
+		res.TotalFetched = finalState.TotalFetched
+		res.CompletedAt = finalState.CompletedAt
+	}
+	return res, nil
 }
 
 // bulkLoadCustomers pages through all Redpoint customers and upserts them into the store.
