@@ -63,7 +63,7 @@ func buildNeedsMatchTestServer(t *testing.T) (*Server, *store.Store, *testutil.F
 		UnmatchedGraceDays: 7,
 	}, logger)
 	handler := checkin.NewHandler(uaClient, rpClient, cm, db, "gate-1", logger)
-	ingester := ingest.NewIngester(uaClient, rpClient, db, logger)
+	ingester := ingest.NewIngester(rpClient, db, logger)
 	sessionMgr := NewSessionManager("test-password")
 
 	// Create a supervised group for background tasks

@@ -131,6 +131,29 @@ func (s *Store) AllUAUsers(ctx context.Context) ([]UAUser, error) {
 	return us, err
 }
 
+// AllUAUsersWithNFC returns every mirror row that has at least one NFC
+// token, ordered the same way AllUAUsers is. The filter is a string
+// comparison on the JSON-encoded tokens column — the schema stores
+// nfc_tokens as a JSON array (default '[]' for the empty case), so
+// "anything other than '[]'" is the cheap, index-friendly way to ask
+// "this user has at least one NFC token enrolled" without parsing JSON
+// in SQLite.
+//
+// Drives the ingest pipeline's Step 1: walking the local UA-Hub mirror
+// instead of the live ListUsers endpoint avoids a 17-page × 10s-timeout
+// HTTP walk per ingest at LEF's scale, and decouples ingest reliability
+// from UA-Hub's. The mirror is refreshed on every ua-hub-mirror tick
+// (cfg.Sync.Interval) so a scheduled ingest reads at most one sync
+// cycle stale.
+func (s *Store) AllUAUsersWithNFC(ctx context.Context) ([]UAUser, error) {
+	var us []UAUser
+	err := s.db.SelectContext(ctx, &us, `
+		SELECT * FROM ua_users
+		WHERE nfc_tokens IS NOT NULL AND nfc_tokens != '' AND nfc_tokens != '[]'
+		ORDER BY last_synced_at DESC, id ASC`)
+	return us, err
+}
+
 // SearchUAUsers runs a case-insensitive LIKE match across first_name,
 // last_name, name, and email for the reassign-target picker (v0.5.9 #10).
 // Each whitespace-separated token in q is AND-ed together so "alice s"

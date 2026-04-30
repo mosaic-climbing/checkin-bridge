@@ -51,7 +51,7 @@ func setupTestServerWithTestHooks(t *testing.T) (*Server, *store.Store, *cardmap
 	statusSyncer := statusync.New(unifiClient, rpClient, db, statusync.Config{
 		SyncInterval: 24 * 60 * 60 * 1e9,
 	}, logger)
-	ingester := ingest.NewIngester(unifiClient, rpClient, db, logger)
+	ingester := ingest.NewIngester(rpClient, db, logger)
 	sessionMgr := NewSessionManager("test-password")
 
 	// Create a supervised group for background tasks

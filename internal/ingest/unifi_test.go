@@ -10,7 +10,6 @@ import (
 	"github.com/mosaic-climbing/checkin-bridge/internal/redpoint"
 	"github.com/mosaic-climbing/checkin-bridge/internal/store"
 	"github.com/mosaic-climbing/checkin-bridge/internal/testutil"
-	"github.com/mosaic-climbing/checkin-bridge/internal/unifi"
 )
 
 func TestFirstName(t *testing.T) {
@@ -66,12 +65,9 @@ func TestRun_PrefersExistingMappingOverFuzzyMatch(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	fakeUA := testutil.NewFakeUniFi()
-	t.Cleanup(fakeUA.Close)
 	fakeRP := testutil.NewFakeRedpoint()
 	t.Cleanup(fakeRP.Close)
 
-	uaClient := unifi.NewClient("wss://unused", fakeUA.BaseURL(), "test-token", 500, "", logger)
 	rpClient := redpoint.NewClient(fakeRP.GraphQLURL(), "test-api-key", "TEST", logger)
 
 	// Seed local directory with the matched customer. Email is
@@ -99,21 +95,20 @@ func TestRun_PrefersExistingMappingOverFuzzyMatch(t *testing.T) {
 		t.Fatalf("UpsertMapping: %v", err)
 	}
 
-	// FakeUniFi user: email is the typo'd version that won't
-	// SearchCustomersByEmail-hit the directory. Name is also missing
-	// so SearchCustomersByName won't rescue it. Only the mapping path
-	// can resolve this user.
-	fakeUA.Users = []map[string]any{{
-		"id":         "ua-garibay",
-		"first_name": "",
-		"last_name":  "",
-		"name":       "",
-		"user_email": "sean.garbiay@example.invalid", // typo + invalid TLD
-		"status":     "ACTIVE",
-		"nfc_token":  "abc123",
-	}}
+	// Seed the UA-Hub mirror as if ua-hub-mirror had just refreshed:
+	// email is the typo'd version that won't SearchCustomersByEmail-hit
+	// the directory, name fields are blank so SearchCustomersByName
+	// won't rescue it, and there's an NFC token so AllUAUsersWithNFC
+	// returns this row. Only the mapping path can resolve this user.
+	if err := db.UpsertUAUser(ctx, &store.UAUser{
+		ID:     "ua-garibay",
+		Email:  "sean.garbiay@example.invalid", // typo + invalid TLD
+		Status: "ACTIVE",
+	}, []string{"abc123"}); err != nil {
+		t.Fatalf("UpsertUAUser: %v", err)
+	}
 
-	ing := NewIngester(uaClient, rpClient, db, logger)
+	ing := NewIngester(rpClient, db, logger)
 	result, err := ing.Run(ctx, false /* dryRun */)
 	if err != nil {
 		t.Fatalf("ingest Run: %v", err)
@@ -149,22 +144,139 @@ func TestRun_PrefersExistingMappingOverFuzzyMatch(t *testing.T) {
 	}
 }
 
-func TestParseUniFiName(t *testing.T) {
+// TestRun_ReadsFromUAMirror_NotLiveUniFi pins the v0.5.10 swap:
+// ingest no longer holds a unifi.Client and Step 1 walks the local
+// ua_users mirror. This test seeds the mirror, runs ingest, and
+// asserts the user got matched and a members row was written —
+// proving the read source is the mirror end-to-end. Without this
+// test, a future "let's re-add the live client for X" change could
+// silently revert the durability fix.
+func TestRun_ReadsFromUAMirror_NotLiveUniFi(t *testing.T) {
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	dir := t.TempDir()
+	db, err := store.Open(dir, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	fakeRP := testutil.NewFakeRedpoint()
+	t.Cleanup(fakeRP.Close)
+	rpClient := redpoint.NewClient(fakeRP.GraphQLURL(), "test-api-key", "TEST", logger)
+
+	if err := db.UpsertCustomer(ctx, &store.Customer{
+		RedpointID: "rp-cordes",
+		FirstName:  "Tommy",
+		LastName:   "Caldwell",
+		Email:      "tommy@example.com",
+		Active:     true,
+	}); err != nil {
+		t.Fatalf("UpsertCustomer: %v", err)
+	}
+
+	// Seed the mirror with the UA-Hub user that ingest should pick up.
+	if err := db.UpsertUAUser(ctx, &store.UAUser{
+		ID:        "ua-tommy",
+		FirstName: "Tommy",
+		LastName:  "Caldwell",
+		Email:     "tommy@example.com",
+		Status:    "ACTIVE",
+	}, []string{"deadbeef"}); err != nil {
+		t.Fatalf("UpsertUAUser: %v", err)
+	}
+
+	// Also seed a tokenless mirror row to confirm AllUAUsersWithNFC's
+	// filter actually kicks — if ingest read AllUAUsers instead, this
+	// row would inflate result.UniFiUsers and fail the assertion below.
+	if err := db.UpsertUAUser(ctx, &store.UAUser{
+		ID:    "ua-staff-no-card",
+		Email: "staff@example.com",
+	}, nil); err != nil {
+		t.Fatalf("UpsertUAUser (no tokens): %v", err)
+	}
+
+	ing := NewIngester(rpClient, db, logger)
+	res, err := ing.Run(ctx, false)
+	if err != nil {
+		t.Fatalf("ingest Run: %v", err)
+	}
+	if res.UniFiUsers != 1 {
+		t.Errorf("UniFiUsers = %d, want 1 (tokenless row should be filtered)", res.UniFiUsers)
+	}
+	if res.Matched != 1 {
+		t.Errorf("Matched = %d, want 1", res.Matched)
+	}
+	mem, err := db.GetMemberByNFC(ctx, "DEADBEEF")
+	if err != nil {
+		t.Fatalf("GetMemberByNFC: %v", err)
+	}
+	if mem == nil {
+		t.Fatal("members row missing — ingest didn't write through the mirror-read path")
+	}
+	if mem.CustomerID != "rp-cordes" {
+		t.Errorf("member.CustomerID = %q, want rp-cordes", mem.CustomerID)
+	}
+}
+
+// TestRun_EmptyMirrorReturnsClearError covers the fresh-deploy case:
+// ua-hub-mirror hasn't populated yet, so AllUAUsersWithNFC returns
+// zero rows. Ingest should fail loud with a message that points
+// operators at the right next step (run /ua-hub/sync) rather than
+// silently succeeding with zero applied — the latter would let a
+// scheduled ingest tick "succeed" while doing nothing useful.
+func TestRun_EmptyMirrorReturnsClearError(t *testing.T) {
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	dir := t.TempDir()
+	db, err := store.Open(dir, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	fakeRP := testutil.NewFakeRedpoint()
+	t.Cleanup(fakeRP.Close)
+	rpClient := redpoint.NewClient(fakeRP.GraphQLURL(), "test-api-key", "TEST", logger)
+
+	// Customers populated (so the empty-customers guard doesn't trip
+	// first), but no ua_users.
+	if err := db.UpsertCustomer(ctx, &store.Customer{
+		RedpointID: "rp-1",
+		FirstName:  "X",
+		Active:     true,
+	}); err != nil {
+		t.Fatalf("UpsertCustomer: %v", err)
+	}
+
+	ing := NewIngester(rpClient, db, logger)
+	_, err = ing.Run(ctx, false)
+	if err == nil {
+		t.Fatal("Run on empty mirror should error, got nil")
+	}
+	if !strings.Contains(err.Error(), "UA-Hub mirror is empty") {
+		t.Errorf("error message should name the empty mirror; got %q", err.Error())
+	}
+}
+
+func TestParseUAUserName(t *testing.T) {
 	tests := []struct {
-		user        unifi.UniFiUser
-		wantFirst   string
-		wantLast    string
+		user      store.UAUser
+		wantFirst string
+		wantLast  string
 	}{
-		{unifi.UniFiUser{FirstName: "Alice", LastName: "Smith"}, "Alice", "Smith"},
-		{unifi.UniFiUser{Name: "Bob Jones"}, "Bob", "Jones"},
-		{unifi.UniFiUser{Name: "Carol"}, "Carol", ""},
-		{unifi.UniFiUser{Name: "Carol Ann Jones"}, "Carol", "Jones"},
-		{unifi.UniFiUser{}, "", ""},
+		{store.UAUser{FirstName: "Alice", LastName: "Smith"}, "Alice", "Smith"},
+		{store.UAUser{Name: "Bob Jones"}, "Bob", "Jones"},
+		{store.UAUser{Name: "Carol"}, "Carol", ""},
+		{store.UAUser{Name: "Carol Ann Jones"}, "Carol", "Jones"},
+		{store.UAUser{}, "", ""},
 	}
 	for _, tt := range tests {
-		first, last := parseUniFiName(tt.user)
+		first, last := parseUAUserName(tt.user)
 		if first != tt.wantFirst || last != tt.wantLast {
-			t.Errorf("parseUniFiName(%+v) = (%q, %q), want (%q, %q)",
+			t.Errorf("parseUAUserName(%+v) = (%q, %q), want (%q, %q)",
 				tt.user, first, last, tt.wantFirst, tt.wantLast)
 		}
 	}
