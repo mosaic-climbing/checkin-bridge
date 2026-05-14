@@ -106,6 +106,15 @@ type Server struct {
 	// same host with adjacent ports (3500 vs 3600). The runtime invariant
 	// "stage implies shadow" is enforced by config.validate(), not here.
 	instanceName string
+
+	// shadowMode mirrors cfg.Bridge.ShadowMode. Read by staff-action
+	// handlers that would otherwise mutate UA-Hub state (POST /unlock,
+	// frag unmatched-skip, frag member-reactivate, frag member-reassign).
+	// The contract at internal/config/config.go matches the one observed
+	// elsewhere: shadow mode means no door unlocks, no Redpoint writes,
+	// no UniFi status writes. Pre-fix, those four handlers wrote to
+	// UA-Hub unconditionally — see PR splitting them out for context.
+	shadowMode bool
 }
 
 // UAHubRefreshStats is the result payload the UA-Hub mirror refresh
@@ -168,6 +177,7 @@ type ServerDeps struct {
 	BG                  *bg.Group
 	EnableTestHooks     bool
 	InstanceName        string
+	ShadowMode          bool
 	BreakerResetter     func() (wasOpen bool)
 	MirrorWalker        func(ctx context.Context) error
 	UAHubMirrorRefresher func(ctx context.Context, progress func(phase string)) (UAHubRefreshStats, error)
@@ -211,6 +221,7 @@ func NewServer(deps ServerDeps) *Server {
 		mirrorWalk:         deps.MirrorWalker,
 		uaHubMirrorRefresh: deps.UAHubMirrorRefresher,
 		instanceName:       deps.InstanceName,
+		shadowMode:         deps.ShadowMode,
 	}
 	s.routes()
 	return s

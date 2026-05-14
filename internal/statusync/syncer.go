@@ -592,6 +592,22 @@ func (s *Syncer) runMatchingPhase(
 		if err := ctx.Err(); err != nil {
 			return
 		}
+		// Skip DEACTIVATED UA-Hub users. ListAllUsersWithStatus returns
+		// everyone (no status filter), so without this guard a user
+		// staff has just skipped (handleFragUnmatchedSkip → status
+		// DEACTIVATED, pending row deleted) re-appears in the pending
+		// queue on the next sync. The matcher has no concept of
+		// "staff already decided to ignore this person"; the UA-Hub
+		// status field is the durable signal.
+		//
+		// External re-activations (a UA-Hub admin flipping the user
+		// back to ACTIVE outside the bridge) flow through this guard
+		// correctly: next sync sees ACTIVE + no mapping → falls through
+		// to matchOne → re-queued in Needs Match, which is the desired
+		// behaviour.
+		if u.Status == "DEACTIVATED" {
+			continue
+		}
 		existing, err := s.store.GetMapping(ctx, u.ID)
 		if err != nil {
 			s.logger.Error("GetMapping failed; skipping match for user",

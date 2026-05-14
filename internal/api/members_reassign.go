@@ -204,6 +204,27 @@ func (s *Server) handleFragMemberReassignConfirm(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// Shadow contract (config.go:98): no UA-Hub writes. AssignNFCCard
+	// rebinds a credential and is exactly the kind of mutation shadow
+	// mode exists to suppress. Skip the call and the dependent local
+	// audit/member-row writes (per the symmetry rule in
+	// statusync.runExpiryPhase).
+	if s.shadowMode {
+		s.logger.Info("SHADOW: would reassign NFC card",
+			"nfcUid", rc.member.NfcUID,
+			"fromUaUid", rc.uaUser.ID,
+			"toUaUid", targetUAUserID)
+		s.audit.Log("staff_reassign_shadow", r.RemoteAddr, map[string]any{
+			"nfcUid":    rc.member.NfcUID,
+			"fromUaUid": rc.uaUser.ID,
+			"toUaUid":   targetUAUserID,
+		})
+		ui.RenderFragment(w, ui.AlertFragment(false, fmt.Sprintf(
+			"SHADOW MODE: would reassign card %s from %s to %s, but shadow mode blocks UA-Hub writes. Disable shadow mode and try again.",
+			rc.member.NfcUID, rc.uaUser.FullName(), target.FullName())))
+		return
+	}
+
 	// ── Step 1: UA-Hub reassignment ─────────────────────────────────
 	// force_add=true asks UA-Hub to unbind the card from the current
 	// owner (and from the target, if they already had one) as part of

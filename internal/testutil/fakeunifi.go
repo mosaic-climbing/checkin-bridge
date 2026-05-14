@@ -394,6 +394,11 @@ func (f *FakeUniFi) StatusUpdateCount() int {
 	defer f.mu.Unlock()
 	return len(f.StatusUpdates)
 }
+func (f *FakeUniFi) NFCCardAssignmentCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.NFCCardAssignments)
+}
 
 func newUserID(n int) string {
 	return "fake-user-" + strconv.Itoa(n)
