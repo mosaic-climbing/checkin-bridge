@@ -764,6 +764,12 @@ func (s *Server) handleFragUnmatchedMatch(w http.ResponseWriter, r *http.Request
 
 // handleFragUnmatchedSkip — POST: deactivate UA-Hub user immediately and
 // drop the pending row. Used for ex-member cards predating the bridge.
+//
+// Shadow contract (config.go:98): in shadow mode this MUST NOT call
+// UpdateUserStatus. Mirrors the convention in statusync.runExpiryPhase
+// (syncer.go:679) — log the would-be decision, skip the UA-Hub mutation,
+// and leave the pending row in place so flipping to live mode re-finds
+// the staff intent and actually executes it.
 func (s *Server) handleFragUnmatchedSkip(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil || s.unifi == nil {
 		ui.RenderFragment(w, ui.AlertFragment(false, "Store or UniFi client not configured"))
@@ -772,6 +778,14 @@ func (s *Server) handleFragUnmatchedSkip(w http.ResponseWriter, r *http.Request)
 	uaUserID := r.PathValue("uaUserId")
 	if uaUserID == "" {
 		ui.RenderFragment(w, ui.AlertFragment(false, "Missing UA user ID"))
+		return
+	}
+	if s.shadowMode {
+		s.logger.Info("SHADOW: would skip (deactivate) UA-Hub user",
+			"uaUserId", uaUserID)
+		s.audit.Log("staff_skip_shadow", r.RemoteAddr, map[string]any{"uaUserId": uaUserID})
+		ui.RenderFragment(w, ui.AlertFragment(false,
+			fmt.Sprintf("SHADOW MODE: would deactivate UA-Hub user %s, but shadow mode blocks UA-Hub writes. The user remains in Needs Match and will be skipped when shadow mode is disabled.", uaUserID)))
 		return
 	}
 	if err := s.unifi.UpdateUserStatus(r.Context(), uaUserID, "DEACTIVATED"); err != nil {

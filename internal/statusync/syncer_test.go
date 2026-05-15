@@ -551,3 +551,82 @@ func TestSupervisedLoop_RestartsOnPanic(t *testing.T) {
 		t.Errorf("sync_loop_restarted_total = %d; want 1 or 2", got)
 	}
 }
+
+// TestRunMatchingPhase_SkipsDeactivatedUsers pins the matcher behaviour
+// that lets staff-skipped users actually stay skipped.
+//
+// Before this guard, the skip flow looked like:
+//   1. Staff hits "Skip" → UA-Hub user → DEACTIVATED, pending row deleted.
+//   2. Next nightly: runMatchingPhase walks ALL UA users (DEACTIVATED
+//      included, because ListAllUsersWithStatus has no status filter)
+//      and re-creates a pending row for anyone without a mapping.
+//   3. The skipped user re-appears in Needs Match every night.
+//
+// The fix is a one-line status filter in runMatchingPhase. This test
+// drives a single DEACTIVATED, unmapped UA user through a full
+// RunSync and asserts that no pending row was created.
+func TestRunMatchingPhase_SkipsDeactivatedUsers(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	fakeUnifi := testutil.NewFakeUniFi()
+	defer fakeUnifi.Close()
+	fakeUnifi.Users = []map[string]any{
+		{
+			"id":         "ua-skipped",
+			"first_name": "Skipped",
+			"last_name":  "User",
+			"email":      "skipped@example.com",
+			"status":     "DEACTIVATED",
+		},
+	}
+
+	fakeRedpoint := testutil.NewFakeRedpoint()
+	defer fakeRedpoint.Close()
+
+	unifiClient := unifi.NewClient(
+		"wss://unused",
+		fakeUnifi.BaseURL(),
+		"test-token",
+		500,
+		"",
+		logger,
+	)
+	rpClient := redpoint.NewClient(
+		fakeRedpoint.GraphQLURL(),
+		"test-api-key",
+		"TEST",
+		logger,
+	)
+
+	dir := t.TempDir()
+	db, err := store.Open(dir, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	syncer := New(unifiClient, rpClient, db, Config{
+		SyncInterval:   time.Hour,
+		RateLimitDelay: time.Millisecond,
+	}, false /* shadowMode */, nil /* metrics */, logger)
+
+	result, err := syncer.RunSync(context.Background())
+	if err != nil {
+		t.Fatalf("RunSync: %v", err)
+	}
+
+	if result.NewlyPending != 0 {
+		t.Errorf("NewlyPending = %d, want 0 — DEACTIVATED users must not be re-queued in Needs Match", result.NewlyPending)
+	}
+	if result.NewlyMatched != 0 {
+		t.Errorf("NewlyMatched = %d, want 0 — DEACTIVATED users must not be matched either", result.NewlyMatched)
+	}
+
+	got, err := db.GetPending(context.Background(), "ua-skipped")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Error("pending row created for a DEACTIVATED UA user; matcher must skip them")
+	}
+}

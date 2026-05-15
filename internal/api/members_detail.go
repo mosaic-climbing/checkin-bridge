@@ -264,6 +264,23 @@ func (s *Server) handleFragMemberReactivate(w http.ResponseWriter, r *http.Reque
 		beforeStatus = uaUser.Status
 	}
 
+	// Shadow contract (config.go:98): no UA-Hub status writes. Skip the
+	// REST call and the audit row (the latter only makes sense after a
+	// successful UA-Hub mutation, per the symmetry rule in
+	// statusync.runExpiryPhase).
+	if s.shadowMode {
+		s.logger.Info("SHADOW: would reactivate UA-Hub user",
+			"uaUserId", mapping.UAUserID, "nfcUid", nfcUID,
+			"beforeStatus", beforeStatus)
+		s.audit.Log("staff_reactivate_shadow", r.RemoteAddr, map[string]any{
+			"uaUserId": mapping.UAUserID,
+			"nfcUid":   nfcUID,
+		})
+		ui.RenderFragment(w, ui.AlertFragment(false, fmt.Sprintf(
+			"SHADOW MODE: would reactivate %s, but shadow mode blocks UA-Hub writes. Disable shadow mode and try again.", m.FullName())))
+		return
+	}
+
 	if err := s.unifi.UpdateUserStatus(ctx, mapping.UAUserID, "ACTIVE"); err != nil {
 		ui.RenderFragment(w, ui.AlertFragment(false, "UA-Hub reactivate failed: "+err.Error()))
 		return

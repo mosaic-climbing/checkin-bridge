@@ -15,6 +15,18 @@ func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid door ID")
 		return
 	}
+	// Shadow contract (config.go:98): no door unlocks. The check-in hot
+	// path already honours this at internal/checkin/handler.go:435; the
+	// manual unlock endpoint must do the same or shadow mode leaks
+	// physical-world side effects through the control plane.
+	if s.shadowMode {
+		s.logger.Info("SHADOW: would unlock door via manual control endpoint",
+			"doorId", doorID)
+		s.audit.Log("manual_unlock_shadow", r.RemoteAddr, map[string]any{"doorId": doorID})
+		writeJSON(w, map[string]any{"success": false, "doorId": doorID, "shadow": true,
+			"message": "shadow mode: door unlock suppressed"})
+		return
+	}
 	if err := s.unifi.UnlockDoor(r.Context(), doorID); err != nil {
 		writeError(w, http.StatusBadGateway, "unlock failed")
 		return
