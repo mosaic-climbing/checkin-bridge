@@ -80,7 +80,12 @@ type Handler struct {
 	// flag. Construction-only assignment closes that race without
 	// needing atomics.
 	shadowMode bool
-	logger     *slog.Logger
+	// checkinRecordingLive gates the async Redpoint createCheckIn write —
+	// rung 1 of the go-live ladder. Independent of shadowMode so check-in
+	// recording can go live while door-affecting capabilities stay
+	// shadow. Construction-only, same as shadowMode.
+	checkinRecordingLive bool
+	logger               *slog.Logger
 
 	// asyncWG tracks goroutines spawned for background Redpoint writes. The
 	// main shutdown path waits on this so we don't lose in-flight check-ins
@@ -109,7 +114,12 @@ type HandlerDeps struct {
 	Metrics    *metrics.Registry // nil disables metric emissions
 	GateID     string
 	ShadowMode bool
-	Logger     *slog.Logger
+	// CheckinRecordingLive enables the async Redpoint check-in write for
+	// live (non-backfill) events. Wired from
+	// config.Bridge.CheckinRecordingLive() — which derives from
+	// !ShadowMode unless BRIDGE_LIVE_CHECKIN_RECORDING overrides it.
+	CheckinRecordingLive bool
+	Logger               *slog.Logger
 }
 
 func NewHandler(deps HandlerDeps) *Handler {
@@ -120,9 +130,10 @@ func NewHandler(deps HandlerDeps) *Handler {
 		store:          deps.Store,
 		rechecker:      deps.Rechecker,
 		metrics:        deps.Metrics,
-		gateID:         deps.GateID,
-		shadowMode:     deps.ShadowMode,
-		logger:         deps.Logger,
+		gateID:               deps.GateID,
+		shadowMode:           deps.ShadowMode,
+		checkinRecordingLive: deps.CheckinRecordingLive,
+		logger:               deps.Logger,
 	}
 }
 
@@ -432,6 +443,16 @@ func (h *Handler) unlockAndRecord(ctx context.Context, event unifi.AccessEvent, 
 				"customerId", member.CustomerID,
 				"timestamp", event.Timestamp,
 			)
+		case event.ViaPoller:
+			// UA-Hub already decided this tap (and opened the door on
+			// ACCESS) before the poller ever saw it — a bridge unlock here
+			// is redundant at best and a double-open at worst. The
+			// deliberate recheck-reactivation unlock happens inside the
+			// recheck service, not here.
+			h.logger.Debug("poller event: main-path unlock suppressed (UA-Hub already decided)",
+				"doorId", event.DoorID,
+				"member", member.FullName(),
+			)
 		case shadow:
 			h.logger.Info("SHADOW: would unlock door",
 				"doorId", event.DoorID,
@@ -477,9 +498,13 @@ func (h *Handler) unlockAndRecord(ctx context.Context, event unifi.AccessEvent, 
 	h.recordAllowedEvent(ctx, event, member)
 
 	// ── BACKGROUND: record in Redpoint asynchronously ────────
-	// Shadow mode logs the would-be call and skips it so we never double-record.
+	// Gated by the check-in-recording capability (rung 1 of the go-live
+	// ladder), not the master shadow flag: recording can go live while
+	// door-affecting capabilities stay shadow. When held, log the
+	// would-be call so shadow evidence shows exactly what live mode
+	// would have written.
 
-	if shadow {
+	if !h.checkinRecordingLive {
 		if h.gateID != "" {
 			h.logger.Info("SHADOW: would record check-in in Redpoint",
 				"gateId", h.gateID,

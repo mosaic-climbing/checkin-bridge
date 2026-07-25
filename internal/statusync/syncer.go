@@ -65,10 +65,26 @@ type SyncResult struct {
 	NewlyMatched int `json:"newlyMatched,omitempty"`
 	// NewlyPending: matcher couldn't bind and wrote/refreshed a pending row.
 	NewlyPending int `json:"newlyPending,omitempty"`
-	// Expired: pending rows whose grace window ran out this run and the
-	// bridge default-deactivated the UA user. Counted here AND rolled into
-	// Deactivated for dashboard continuity.
+	// Expired: pending rows whose grace window has elapsed. As of the
+	// alert-only expiry policy these users are NOT deactivated — the
+	// count surfaces in the digest so staff resolves them in the Needs
+	// Match panel; the rows stay pending.
 	Expired int `json:"expired,omitempty"`
+	// MappedNoCache: UA users with a ua_user_mappings row but no members
+	// cache row yet (ingest hasn't materialised them). Skipped by the
+	// mapping-driven status pass; a persistently non-zero value means the
+	// scheduled unifi-ingest isn't running.
+	MappedNoCache int `json:"mappedNoCache,omitempty"`
+	// HeldDeactivations: deactivation decisions suppressed by the
+	// status-writes mode ("off"/"activate-only") or by the
+	// mass-deactivation guard. Rolled into Deactivated as well so
+	// dashboard continuity holds ("Deactivated" = decisions, live or not).
+	HeldDeactivations int `json:"heldDeactivations,omitempty"`
+	// GuardTripped: the mapping-driven pass wanted to deactivate more
+	// than MaxDeactivationsPerRun users and held ALL of them. The digest
+	// escalates this — it usually means a bad or partial directory sync,
+	// not a real mass lapse.
+	GuardTripped bool `json:"guardTripped,omitempty"`
 }
 
 // (RecheckResult moved to internal/recheck.Result as part of A3 — the
@@ -100,14 +116,33 @@ type Config struct {
 	// default matches config.Bridge.UnmatchedGraceDays so zero-value
 	// Config{} doesn't accidentally produce an immediate-expiry loop.
 	UnmatchedGraceDays int
-	// LegacyNFCStatusLoop gates Step 2 of RunSync — the GetMemberByNFC-
-	// driven activation/deactivation pass. When false, RunSync still runs
-	// the C2 matching phase (Step 1.5) and the pending-expiry pass (Step 4)
-	// but skips Step 2 entirely. Set false for gyms that don't populate the
-	// legacy members table via /directory/sync + /ingest/unifi, to avoid
-	// noisy "name=Unknown, would DEACTIVATE" decisions against a
-	// half-populated cache. Mirrors config.Bridge.LegacyNFCStatusLoop.
+	// LegacyNFCStatusLoop selects which status-enforcement engine Step 2
+	// runs. When true (backward-compat default), the legacy GetMemberByNFC-
+	// driven pass runs — it keys on raw NFC tokens, which hashed-token
+	// firmware can never match, and it needs the members cache populated
+	// via /directory/sync + /ingest/unifi. When false, the mapping-driven
+	// pass runs instead: ua_user_mappings → members → IsAllowed(), the
+	// C2-completing engine that doesn't depend on raw card UIDs. Exactly
+	// one engine runs per sync so a user is never evaluated (or written)
+	// twice in one run; flipping the flag swaps engines atomically.
+	// Mirrors config.Bridge.LegacyNFCStatusLoop.
 	LegacyNFCStatusLoop bool
+
+	// StatusWrites gates UA-Hub status mutations from BOTH engines:
+	// "off" (log-only — classic shadow), "activate-only" (ACTIVE writes
+	// apply, DEACTIVATED writes are held — the can't-lock-anyone-out
+	// rung), "full" (all writes apply). Empty resolves against the
+	// positional shadowMode argument to New: "off" when shadow, "full"
+	// when live — which is exactly the pre-split behavior.
+	StatusWrites string
+
+	// MaxDeactivationsPerRun is the mass-deactivation circuit guard for
+	// the mapping-driven pass: if a single run wants to deactivate more
+	// users than this, ALL of that run's deactivations are held and the
+	// result is flagged (GuardTripped) so the digest pages the operator.
+	// Protects against the "bad directory sync locks out the whole gym"
+	// failure. 0 means the default of 10.
+	MaxDeactivationsPerRun int
 
 	// OnRunComplete, when non-nil, is invoked after every scheduled sync
 	// run with the result and error (exactly one of which is meaningful:
@@ -141,7 +176,10 @@ type Syncer struct {
 	// makes the atomics unnecessary — no concurrent writer can exist
 	// after construction — so we revert to plain types.
 	shadowMode bool
-	metrics    *metrics.Registry
+	// statusWrites is Config.StatusWrites resolved against shadowMode at
+	// construction: always one of "off", "activate-only", "full".
+	statusWrites string
+	metrics      *metrics.Registry
 
 	mu         sync.Mutex
 	lastResult *SyncResult
@@ -163,14 +201,26 @@ func New(
 	if cfg.RateLimitDelay == 0 {
 		cfg.RateLimitDelay = 200 * time.Millisecond // ~5 updates/sec to avoid hammering UniFi
 	}
+	if cfg.MaxDeactivationsPerRun <= 0 {
+		cfg.MaxDeactivationsPerRun = 10
+	}
+	statusWrites := cfg.StatusWrites
+	if statusWrites == "" {
+		if shadowMode {
+			statusWrites = "off"
+		} else {
+			statusWrites = "full"
+		}
+	}
 	return &Syncer{
-		unifi:      unifiClient,
-		redpoint:   rpClient,
-		store:      db,
-		config:     cfg,
-		logger:     logger,
-		shadowMode: shadowMode,
-		metrics:    met,
+		unifi:        unifiClient,
+		redpoint:     rpClient,
+		store:        db,
+		config:       cfg,
+		logger:       logger,
+		shadowMode:   shadowMode,
+		statusWrites: statusWrites,
+		metrics:      met,
 	}
 }
 
@@ -495,7 +545,7 @@ func (s *Syncer) RunSync(ctx context.Context) (*SyncResult, error) {
 
 			if memberAllowed && !unifiActive {
 				// Member is valid in Redpoint but locked out in UniFi → reactivate
-				shadow := s.shadowMode
+				shadow := s.statusWrites == "off"
 				action := "REACTIVATING user in UniFi"
 				if shadow {
 					action = "SHADOW: would REACTIVATE user in UniFi"
@@ -523,8 +573,11 @@ func (s *Syncer) RunSync(ctx context.Context) (*SyncResult, error) {
 				time.Sleep(s.config.RateLimitDelay)
 
 			} else if !memberAllowed && unifiActive {
-				// Member is expired/frozen in Redpoint but still active in UniFi → deactivate
-				shadow := s.shadowMode
+				// Member is expired/frozen in Redpoint but still active in
+				// UniFi → deactivate. Held in both "off" and "activate-only"
+				// modes — deactivation is the member-facing risk, so it's
+				// the last write to go live.
+				shadow := s.statusWrites != "full"
 				action := "DEACTIVATING user in UniFi"
 				if shadow {
 					action = "SHADOW: would DEACTIVATE user in UniFi"
@@ -538,6 +591,7 @@ func (s *Syncer) RunSync(ctx context.Context) (*SyncResult, error) {
 				)
 				if shadow {
 					result.Deactivated++
+					result.HeldDeactivations++
 					continue
 				}
 				if err := s.unifi.UpdateUserStatus(ctx, user.ID, "DEACTIVATED"); err != nil {
@@ -557,7 +611,9 @@ func (s *Syncer) RunSync(ctx context.Context) (*SyncResult, error) {
 			}
 		}
 	} else {
-		s.logger.Debug("legacy NFC status loop disabled by config; skipping Step 2")
+		// Mapping-driven status pass — the C2-completing replacement for
+		// the legacy loop above. Exactly one engine runs per sync.
+		s.runMappingStatusPass(ctx, unifiUsers, result)
 	}
 
 	// Step 4: Pending expiry pass. After matching is populated and status
@@ -663,17 +719,182 @@ func (s *Syncer) runMatchingPhase(
 	}
 }
 
-// runExpiryPhase default-deactivates pending UA users whose grace window
-// has elapsed. Each row results in:
+// mappingDecision is one intended status change computed by the read
+// phase of runMappingStatusPass. Collected before any write so the
+// mass-deactivation guard can see the whole run's intent.
+type mappingDecision struct {
+	uaUserID   string
+	name       string
+	activate   bool // true → ACTIVE, false → DEACTIVATED
+	badge      string
+	denyReason string
+}
+
+// runMappingStatusPass is the mapping-driven status engine: for every
+// UA-Hub user bound in ua_user_mappings, read the member row the
+// mapping points at (whose active/badge state the cache-syncer
+// refreshes from Redpoint live — including lapses and deletions,
+// which the ACTIVE-filtered directory sync alone cannot see) and
+// converge the UA-Hub status to Redpoint truth.
 //
-//  1. A UA-Hub PUT /users/:id status=DEACTIVATED (skipped in shadow mode).
-//  2. A match_audit row (field=user_status, before=ACTIVE, after=DEACTIVATED,
-//     source=bridge:unmatched-expired). Written in both live and shadow
-//     modes so the audit trail reflects what the bridge decided.
-//  3. Deletion of the pending row.
+// This is the pass promised when Step 2 was first gated off ("a
+// follow-up change will replace Step 2 with a mapping-driven status
+// pass"): it keys on the authoritative UA-user↔customer binding
+// instead of raw NFC tokens, so it works on hashed-token firmware and
+// ignores PIN-only staff users (no mapping → no opinion) by design.
 //
-// The audit and pending-delete are skipped if step 1 fails so a transient
-// UA-Hub outage doesn't swallow the expiry ticket — the next sync retries.
+// Two-phase shape: decisions are computed read-only first, then writes
+// apply — so the mass-deactivation guard can veto the whole
+// deactivation set atomically when a run wants to lock out more than
+// MaxDeactivationsPerRun users (the "bad directory sync locks out the
+// gym" failure). Activations are never guarded; wrongly activating is
+// self-correcting on the next sync, wrongly deactivating is a member
+// at the door.
+func (s *Syncer) runMappingStatusPass(ctx context.Context, unifiUsers []unifi.UniFiUser, result *SyncResult) {
+	// ── Read phase ───────────────────────────────────────────
+	var decisions []mappingDecision
+	for _, user := range unifiUsers {
+		if ctx.Err() != nil {
+			return
+		}
+		mapping, err := s.store.GetMapping(ctx, user.ID)
+		if err != nil {
+			s.logger.Error("mapping status pass: GetMapping failed",
+				"uaUserId", user.ID, "error", err)
+			result.Errors++
+			continue
+		}
+		if mapping == nil {
+			// No binding: PIN-only staff, or still pending. The matching
+			// phase owns pending users; nothing to enforce here.
+			result.Unmatched++
+			continue
+		}
+		member, err := s.store.GetMemberByUAUserID(ctx, user.ID)
+		if err != nil {
+			s.logger.Error("mapping status pass: member lookup failed",
+				"uaUserId", user.ID, "error", err)
+			result.Errors++
+			continue
+		}
+		if member == nil {
+			// Mapping exists but ingest hasn't materialised the members
+			// row yet. Skip rather than guess — the scheduled ingest will
+			// close the gap; a persistently non-zero count is the signal
+			// that it isn't running.
+			result.MappedNoCache++
+			s.logger.Warn("mapping status pass: mapped user has no members-cache row yet",
+				"uaUserId", user.ID, "redpointCustomerId", mapping.RedpointCustomer)
+			continue
+		}
+		result.Matched++
+
+		memberAllowed := member.IsAllowed()
+		unifiActive := user.Status == "ACTIVE"
+		switch {
+		case memberAllowed && !unifiActive:
+			decisions = append(decisions, mappingDecision{
+				uaUserID: user.ID, name: member.FullName(),
+				activate: true, badge: member.BadgeStatus,
+			})
+		case !memberAllowed && unifiActive:
+			decisions = append(decisions, mappingDecision{
+				uaUserID: user.ID, name: member.FullName(),
+				activate: false, badge: member.BadgeStatus,
+				denyReason: member.DenyReason(),
+			})
+		default:
+			result.Unchanged++
+		}
+	}
+
+	// ── Guard phase ──────────────────────────────────────────
+	wouldDeactivate := 0
+	for _, d := range decisions {
+		if !d.activate {
+			wouldDeactivate++
+		}
+	}
+	guardTripped := wouldDeactivate > s.config.MaxDeactivationsPerRun
+	if guardTripped {
+		result.GuardTripped = true
+		s.logger.Error("mapping status pass: mass-deactivation guard TRIPPED — holding all deactivations",
+			"wouldDeactivate", wouldDeactivate,
+			"maxPerRun", s.config.MaxDeactivationsPerRun,
+			"hint", "usually a bad or partial directory sync, not a real mass lapse; investigate before raising the cap",
+		)
+	}
+
+	// ── Write phase ──────────────────────────────────────────
+	for _, d := range decisions {
+		if ctx.Err() != nil {
+			return
+		}
+		if d.activate {
+			held := s.statusWrites == "off"
+			action := "REACTIVATING user in UniFi (mapping pass)"
+			if held {
+				action = "SHADOW: would REACTIVATE user in UniFi (mapping pass)"
+			}
+			s.logger.Info(action, "name", d.name, "unifiId", d.uaUserID, "badgeStatus", d.badge)
+			if held {
+				result.Activated++
+				continue
+			}
+			if err := s.unifi.UpdateUserStatus(ctx, d.uaUserID, "ACTIVE"); err != nil {
+				s.logger.Error("mapping status pass: reactivate failed",
+					"name", d.name, "unifiId", d.uaUserID, "error", err)
+				result.Errors++
+			} else {
+				result.Activated++
+			}
+			time.Sleep(s.config.RateLimitDelay)
+			continue
+		}
+
+		held := s.statusWrites != "full" || guardTripped
+		action := "DEACTIVATING user in UniFi (mapping pass)"
+		if held {
+			action = "SHADOW: would DEACTIVATE user in UniFi (mapping pass)"
+		}
+		s.logger.Info(action,
+			"name", d.name, "unifiId", d.uaUserID,
+			"badgeStatus", d.badge, "reason", d.denyReason,
+			"heldByGuard", guardTripped,
+		)
+		if held {
+			result.Deactivated++
+			result.HeldDeactivations++
+			continue
+		}
+		if err := s.unifi.UpdateUserStatus(ctx, d.uaUserID, "DEACTIVATED"); err != nil {
+			s.logger.Error("mapping status pass: deactivate failed",
+				"name", d.name, "unifiId", d.uaUserID, "error", err)
+			result.Errors++
+		} else {
+			result.Deactivated++
+		}
+		time.Sleep(s.config.RateLimitDelay)
+	}
+}
+
+// runExpiryPhase surfaces pending UA users whose grace window has
+// elapsed. ALERT-ONLY by operator decision: an unmatched user is never
+// auto-deactivated, because a wrong auto-deactivation is member-facing
+// and not self-healing (the denied-tap recheck cannot resolve an
+// unmapped user). Instead:
+//
+//  1. Each overdue row logs at Warn (names are fine in the local log;
+//     push payloads carry only counts).
+//  2. result.Expired carries the overdue count into the digest push, so
+//     a non-zero queue reaches the operator's phone every sync.
+//  3. The pending rows stay put — staff resolves them in the Needs
+//     Match panel (Match / Skip / Defer), which is the only path that
+//     removes them.
+//
+// The pre-alert-only implementation deactivated these users in UA-Hub
+// (with a match_audit trail); MatchSourceBridgeExpiry remains defined
+// for reading that historical audit data.
 func (s *Syncer) runExpiryPhase(ctx context.Context, result *SyncResult) {
 	if ctx.Err() != nil {
 		// Caller-driven shutdown — not a phase error.
@@ -695,63 +916,13 @@ func (s *Syncer) runExpiryPhase(ctx context.Context, result *SyncResult) {
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		shadow := s.shadowMode
-		action := "DEACTIVATING unmatched UA user (grace window expired)"
-		if shadow {
-			action = "SHADOW: would DEACTIVATE unmatched UA user (grace expired)"
-		}
-		s.logger.Warn(action,
+		s.logger.Warn("unmatched UA user past grace window (alert-only; resolve in Needs Match)",
 			"uaUserId", p.UAUserID,
 			"reason", p.Reason,
 			"firstSeen", p.FirstSeen,
 			"graceUntil", p.GraceUntil,
 		)
-
-		if shadow {
-			// Shadow contract: never touch UA-Hub, and never dequeue the
-			// pending ticket — flipping to live must re-find this row and
-			// actually run the deactivation. Count the would-be decision
-			// so operators see what live mode would do, and skip audit +
-			// pending-delete for symmetry with the live path which only
-			// writes those after a successful UA-Hub mutation.
-			result.Expired++
-			result.Deactivated++
-			continue
-		}
-
-		if err := s.unifi.UpdateUserStatus(ctx, p.UAUserID, "DEACTIVATED"); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			s.logger.Error("failed to deactivate expired pending user",
-				"uaUserId", p.UAUserID, "error", err,
-			)
-			result.Errors++
-			continue
-		}
-		time.Sleep(s.config.RateLimitDelay)
-
-		if auditErr := s.store.AppendMatchAudit(ctx, &store.MatchAudit{
-			UAUserID:  p.UAUserID,
-			Field:     "user_status",
-			BeforeVal: "ACTIVE",
-			AfterVal:  "DEACTIVATED",
-			Source:    MatchSourceBridgeExpiry,
-		}); auditErr != nil {
-			s.logger.Error("expired-pending audit row failed to persist",
-				"uaUserId", p.UAUserID, "error", auditErr,
-			)
-			// Non-fatal: the deactivation landed, audit is best-effort.
-		}
-		if delErr := s.store.DeletePending(ctx, p.UAUserID); delErr != nil {
-			s.logger.Error("failed to delete expired pending row",
-				"uaUserId", p.UAUserID, "error", delErr,
-			)
-			result.Errors++
-			continue
-		}
 		result.Expired++
-		result.Deactivated++
 	}
 }
 

@@ -41,7 +41,10 @@ func setupHandler(t *testing.T) (*Handler, *store.Store, *cardmap.Mapper) {
 		cardMapper:     cm,
 		store:          db,
 		gateID:         "", // empty = skip Redpoint recording
-		logger:         logger,
+		// Live recording, matching the pre-capability-split "shadow off"
+		// default these tests were written against.
+		checkinRecordingLive: true,
+		logger:               logger,
 	}
 
 	return h, db, cm

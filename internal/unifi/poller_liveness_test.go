@@ -72,3 +72,44 @@ func TestPollOnce_DoesNotStampOnFetchError(t *testing.T) {
 		t.Errorf("LastPollSuccessAt = %v after failed poll, want zero", got)
 	}
 }
+
+// TestPollOnce_FreshEventsMarkedLive pins the freshness split that makes
+// rung 1 (live check-in recording) possible on poller-only firmware: a
+// just-happened tap dispatches with IsBackfill=false + ViaPoller=true,
+// while an old tap (the boot sweep) stays IsBackfill=true.
+func TestPollOnce_FreshEventsMarkedLive(t *testing.T) {
+	freshTS := time.Now().UTC().Add(-2 * time.Second).Format(time.RFC3339)
+	staleTS := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339)
+	body := `{"code":"SUCCESS","data":{"hits":[
+		{"_id":"101","_source":{"event":{"type":"access.door.unlock","published":"` + staleTS + `","result":"ACCESS"},"actor":{"id":"ua-old","display_name":"Old Tap"},"authentication":{"credential_provider":"NFC","issuer":"tokOLD"}}},
+		{"_id":"102","_source":{"event":{"type":"access.door.unlock","published":"` + freshTS + `","result":"ACCESS"},"actor":{"id":"ua-new","display_name":"Fresh Tap"},"authentication":{"credential_provider":"NFC","issuer":"tokNEW"}}}
+	]},"msg":"ok"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	c := pollTestClient(t, srv.URL)
+	var got []AccessEvent
+	c.OnEvent(func(ev AccessEvent) { got = append(got, ev) })
+
+	cursor := time.Now().Add(-time.Hour)
+	var maxID int64
+	c.pollOnce(context.Background(), &cursor, &maxID)
+
+	if len(got) != 2 {
+		t.Fatalf("dispatched %d events, want 2", len(got))
+	}
+	// Oldest-first ordering: stale tap first.
+	stale, fresh := got[0], got[1]
+	if !stale.ViaPoller || !fresh.ViaPoller {
+		t.Error("every poller event must carry ViaPoller=true")
+	}
+	if !stale.IsBackfill {
+		t.Errorf("10-minute-old event IsBackfill = false, want true (outside freshness window)")
+	}
+	if fresh.IsBackfill {
+		t.Errorf("2-second-old event IsBackfill = true, want false (live tap stream)")
+	}
+}
