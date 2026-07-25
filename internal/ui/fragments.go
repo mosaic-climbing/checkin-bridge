@@ -581,6 +581,208 @@ func parseStoreTimestamp(ts string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// ─── "New Member" provisioning UI (C2 Layer 4d) ───────────────────────
+// The five fragments below back the /ui/members/new orchestration in
+// internal/api/members_new.go. Each fragment is the response body for one
+// rung of the staff workflow:
+//
+//   1. EmailLookupFragment                    — live validation result
+//   2. PostCreateFragment                     — "user created, pick reader"
+//   3. EnrollmentPollingFragment              — running poll, waits for tap
+//   4. EnrollmentCompleteFragment             — card bound, done
+//   5. EnrollmentFailedFragment               — timeout / cancel / error
+//
+// All five are intentionally self-contained: each carries the `id` of
+// the swap target so the next mutation can re-render the same slot
+// without the calling page needing to thread state. This matches the
+// "Needs Match" panel pattern that the staff already know.
+//
+// Removed in v0.5.9's member-management overhaul, restored in Phase 2b
+// of the revival plan (the provisioning flow is the intended member-
+// creation path; UniFi-console creation is what kept refilling the
+// Needs Match queue).
+
+// MemberLookupResult is the single Redpoint customer surfaced by the
+// live email validation step. Empty UserID means "no clean match" — the
+// fragment renders a blocking validation error instead.
+type MemberLookupResult struct {
+	RedpointCustomerID string
+	Name               string
+	Email              string
+	Active             bool
+	BadgeName          string
+	BadgeStatus        string
+	// AmbiguousCount > 0 means email matched multiple Redpoint customers
+	// and name disambiguation didn't land on one. Drives a different
+	// error message (so staff knows to pass first+last too) than a flat
+	// "no match found".
+	AmbiguousCount int
+}
+
+// EmailLookupFragment renders the live email-validation result that
+// /ui/members/new/lookup returns. ok==true → green "this is who I'd
+// create them as" hint; ok==false → red blocking validation message
+// the staff must resolve before submitting the form.
+func EmailLookupFragment(ok bool, msg string, hit *MemberLookupResult) string {
+	if !ok {
+		return fmt.Sprintf(`<div class="alert alert-error" data-lookup="error">%s</div>`,
+			HTMLEscape(msg))
+	}
+	if hit == nil {
+		// Defensive: ok==true must come with a non-nil hit. Render an
+		// alert so the operator sees the bug rather than a silent blank.
+		return `<div class="alert alert-error" data-lookup="error">internal: lookup ok=true but no result</div>`
+	}
+	activeBadge := `<span class="badge badge-denied">inactive</span>`
+	if hit.Active {
+		activeBadge = `<span class="badge badge-active">active</span>`
+	}
+	badgeChip := HTMLEscape(hit.BadgeName)
+	if hit.BadgeStatus != "" {
+		badgeChip = fmt.Sprintf(`%s <span style="color: var(--text-muted); font-size: 11px">(%s)</span>`,
+			HTMLEscape(hit.BadgeName), HTMLEscape(hit.BadgeStatus))
+	}
+	return fmt.Sprintf(
+		`<div class="alert alert-success" data-lookup="ok"`+
+			` data-redpoint-customer-id="%s">`+
+			`Will create UA-Hub user → Redpoint <strong>%s</strong> `+
+			`(%s) %s · %s`+
+			`</div>`,
+		HTMLEscape(hit.RedpointCustomerID),
+		HTMLEscape(hit.Name),
+		HTMLEscape(hit.Email),
+		badgeChip,
+		activeBadge,
+	)
+}
+
+// DoorOption is one entry in the reader picker for the post-create
+// fragment. Surfaces the human-friendly door name plus the device ID
+// the §6.2 enrollment call needs.
+type DoorOption struct {
+	DeviceID string
+	Name     string
+}
+
+// PostCreateFragment renders the "user created, pick a reader and tap"
+// widget that POST /ui/members/new returns. It's the bridge between
+// "user exists in UA-Hub" and "card is enrolled and bound" — staff
+// picks a reader and clicks "Start enrollment", which triggers the
+// §6.2 call.
+func PostCreateFragment(uaUserID, displayName, redpointCustomerID string, readers []DoorOption) string {
+	var sb strings.Builder
+	sb.WriteString(`<div class="card" id="members-new-result">`)
+	sb.WriteString(fmt.Sprintf(
+		`<div class="alert alert-success">`+
+			`Created UA-Hub user <strong>%s</strong> `+
+			`(<code>%s</code>) → Redpoint <code>%s</code>. `+
+			`Now bind their NFC card.`+
+			`</div>`,
+		HTMLEscape(displayName),
+		HTMLEscape(uaUserID),
+		HTMLEscape(redpointCustomerID),
+	))
+	sb.WriteString(`<form hx-post="/ui/members/new/`)
+	sb.WriteString(HTMLEscape(uaUserID))
+	sb.WriteString(`/enroll" hx-target="#members-new-result" hx-swap="outerHTML"`)
+	sb.WriteString(` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>`)
+	sb.WriteString(`<div class="form-row">`)
+	sb.WriteString(`<div class="form-group"><label>Reader</label>`)
+	sb.WriteString(`<select name="device_id" required>`)
+	if len(readers) == 0 {
+		sb.WriteString(`<option value="">(no readers found)</option>`)
+	}
+	for _, r := range readers {
+		sb.WriteString(fmt.Sprintf(`<option value="%s">%s</option>`,
+			HTMLEscape(r.DeviceID), HTMLEscape(r.Name)))
+	}
+	sb.WriteString(`</select></div>`)
+	sb.WriteString(`<button type="submit" class="btn btn-primary">Start enrollment</button>`)
+	sb.WriteString(`</div></form></div>`)
+	return sb.String()
+}
+
+// EnrollmentPollingFragment renders the "waiting for tap" panel that
+// POST /ui/members/new/{id}/enroll returns. It contains an HTMX
+// hx-trigger="every 500ms" pointing at the poll endpoint, so the same
+// slot will re-render itself with a new fragment as soon as the tap
+// is detected (or the timeout fires).
+func EnrollmentPollingFragment(uaUserID, displayName, sessionID string) string {
+	pollURL := fmt.Sprintf(`/ui/members/new/%s/enroll/%s/poll`,
+		HTMLEscape(uaUserID), HTMLEscape(sessionID))
+	cancelURL := fmt.Sprintf(`/ui/members/new/%s/enroll/%s`,
+		HTMLEscape(uaUserID), HTMLEscape(sessionID))
+	return fmt.Sprintf(`<div class="card" id="members-new-result">`+
+		`<div class="alert" style="background: var(--info-bg, #1e293b)">`+
+		`<strong>Tap a card on the reader now.</strong> `+
+		`Bridge is waiting for %s — UA-Hub session <code>%s</code>.`+
+		`</div>`+
+		`<div hx-get="%s" hx-trigger="load, every 500ms" hx-swap="outerHTML"`+
+		` hx-target="#members-new-result"`+
+		` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>`+
+		`<span class="spinner"></span> waiting for card tap…`+
+		`</div>`+
+		`<button class="btn btn-danger btn-sm" style="margin-top: 12px"`+
+		` hx-delete="%s" hx-target="#members-new-result" hx-swap="outerHTML"`+
+		` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'`+
+		` hx-confirm="Cancel enrollment? The UA-Hub user stays, but the card is not bound.">Cancel</button>`+
+		`</div>`,
+		HTMLEscape(displayName),
+		HTMLEscape(sessionID),
+		pollURL,
+		cancelURL,
+	)
+}
+
+// EnrollmentCompleteFragment renders the terminal "all done" panel
+// after AssignNFCCard succeeds. No more polling — staff can close the
+// page or click "Add another".
+func EnrollmentCompleteFragment(uaUserID, displayName, token string) string {
+	return fmt.Sprintf(`<div class="card" id="members-new-result">`+
+		`<div class="alert alert-success">`+
+		`<strong>%s</strong> is enrolled — UA-Hub user <code>%s</code>, `+
+		`card token <code>%s</code>. They can tap in now.`+
+		`</div>`+
+		`<a class="btn btn-primary" href="/ui/members/new">Add another</a>`+
+		`</div>`,
+		HTMLEscape(displayName),
+		HTMLEscape(uaUserID),
+		HTMLEscape(token),
+	)
+}
+
+// EnrollmentFailedFragment renders the terminal error/cancel panel.
+// Used by both the timeout path (poll exceeds the deadline) and the
+// "card already bound to someone else" guard (§6.7 result conflicts
+// with §3.7's intent). Staff can retry the enrollment without losing
+// the just-created UA-Hub user.
+func EnrollmentFailedFragment(uaUserID, displayName, message string, readers []DoorOption) string {
+	var sb strings.Builder
+	sb.WriteString(`<div class="card" id="members-new-result">`)
+	sb.WriteString(fmt.Sprintf(`<div class="alert alert-error">%s</div>`, HTMLEscape(message)))
+	sb.WriteString(fmt.Sprintf(
+		`<p style="margin: 8px 0">UA-Hub user <code>%s</code> (<strong>%s</strong>) was created. Pick a reader and try again, or close this page.</p>`,
+		HTMLEscape(uaUserID), HTMLEscape(displayName)))
+	sb.WriteString(`<form hx-post="/ui/members/new/`)
+	sb.WriteString(HTMLEscape(uaUserID))
+	sb.WriteString(`/enroll" hx-target="#members-new-result" hx-swap="outerHTML"`)
+	sb.WriteString(` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>`)
+	sb.WriteString(`<div class="form-row">`)
+	sb.WriteString(`<div class="form-group"><label>Reader</label>`)
+	sb.WriteString(`<select name="device_id" required>`)
+	if len(readers) == 0 {
+		sb.WriteString(`<option value="">(no readers found)</option>`)
+	}
+	for _, r := range readers {
+		sb.WriteString(fmt.Sprintf(`<option value="%s">%s</option>`,
+			HTMLEscape(r.DeviceID), HTMLEscape(r.Name)))
+	}
+	sb.WriteString(`</select></div>`)
+	sb.WriteString(`<button type="submit" class="btn btn-primary">Retry enrollment</button>`)
+	sb.WriteString(`</div></form></div>`)
+	return sb.String()
+}
+
 // UnmatchedRow is a single UniFi user that the ingest couldn't pair with a
 // Redpoint customer (either zero hits or multiple ambiguous hits). Surfaced
 // in the Sync page so staff can eyeball each one and either fix it in
@@ -1294,34 +1496,34 @@ func MemberDetailFragment(d MemberDetailData) string {
 //
 // MemberReassignData drives the NFC reassignment picker. Flow:
 //
-//   1. Operator clicks "Reassign NFC card" in the detail panel →
-//      handleFragMemberReassign renders this fragment with the NFC UID,
-//      the current owner's name/UA ID, an empty candidate list, and an
-//      empty search query.
+//  1. Operator clicks "Reassign NFC card" in the detail panel →
+//     handleFragMemberReassign renders this fragment with the NFC UID,
+//     the current owner's name/UA ID, an empty candidate list, and an
+//     empty search query.
 //
-//   2. Operator types in the search box + submits →
-//      handleFragMemberReassignSearch walks ua_users (via
-//      store.SearchUAUsers), filters out the current owner (no point
-//      reassigning to themselves), and re-renders this fragment with
-//      the candidate list populated.
+//  2. Operator types in the search box + submits →
+//     handleFragMemberReassignSearch walks ua_users (via
+//     store.SearchUAUsers), filters out the current owner (no point
+//     reassigning to themselves), and re-renders this fragment with
+//     the candidate list populated.
 //
-//   3. Operator clicks "Reassign here" on a candidate row →
-//      handleFragMemberReassignConfirm calls unifi.AssignNFCCard with
-//      forceAdd=true, writes two audit rows (old+new UA user IDs), and
-//      swaps in an AlertFragment plus the HX-Trigger:member-updated
-//      header so the member table refreshes.
+//  3. Operator clicks "Reassign here" on a candidate row →
+//     handleFragMemberReassignConfirm calls unifi.AssignNFCCard with
+//     forceAdd=true, writes two audit rows (old+new UA user IDs), and
+//     swaps in an AlertFragment plus the HX-Trigger:member-updated
+//     header so the member table refreshes.
 //
 // Cancel button goes back to the detail panel via hx-get on
 // /ui/frag/member/{nfcUid}/detail. Nothing is committed until step 3,
 // so the operator can back out at any point.
 type MemberReassignData struct {
-	NfcUID         string
-	CurrentUserID  string // UA-Hub ID of the current card owner
-	CurrentName    string // display name of the current owner
-	CurrentMember  string // bridge-side member name (from the member row)
-	Query          string
-	Candidates     []MemberReassignCandidate
-	ErrorMessage   string // non-empty → rendered as an inline alert above the search box
+	NfcUID        string
+	CurrentUserID string // UA-Hub ID of the current card owner
+	CurrentName   string // display name of the current owner
+	CurrentMember string // bridge-side member name (from the member row)
+	Query         string
+	Candidates    []MemberReassignCandidate
+	ErrorMessage  string // non-empty → rendered as an inline alert above the search box
 }
 
 // MemberReassignCandidate is one UA-Hub user in the reassign picker.
@@ -1462,4 +1664,3 @@ func MemberReassignFragment(d MemberReassignData) string {
 	sb.WriteString(`</div>`)
 	return sb.String()
 }
-

@@ -5,12 +5,12 @@
 
 <div class="alert alert-info" style="margin-bottom: 16px">
     <strong>Adding a new member?</strong>
-    Create the user in <em>UniFi Access</em> first — UA-Hub is the source
-    of truth for identity. On the next sync the bridge will auto-bind
-    the new user to their Redpoint record (matched on email +&nbsp;name)
-    or queue them on the
-    <a href="/ui/page/needs-match">Needs Match</a> panel for
-    manual pairing.
+    Use the <a href="/ui/members/new">New Member</a> flow — it creates
+    the UA-Hub user, binds their Redpoint record, and enrolls the NFC
+    card in one pass, so the user never lands in
+    <a href="/ui/page/needs-match">Needs Match</a>. (Users created
+    directly in the UniFi console carry no Redpoint binding and queue
+    up there for manual pairing on the next sync.)
 </div>
 
 <div class="card">
