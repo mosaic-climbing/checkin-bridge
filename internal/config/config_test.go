@@ -425,3 +425,53 @@ PLAIN_KEY=no-quotes
 		t.Errorf("PLAIN_KEY = %q", v)
 	}
 }
+
+func TestNotifyConfig_DefaultsAndEnvOverrides(t *testing.T) {
+	cfg := defaults()
+	if cfg.Notify.NtfyURL != "https://ntfy.sh" {
+		t.Errorf("default NtfyURL = %q, want https://ntfy.sh", cfg.Notify.NtfyURL)
+	}
+	if cfg.Notify.NtfyTopic != "" || cfg.Notify.NtfyToken != "" || cfg.Notify.HeartbeatURL != "" {
+		t.Errorf("notify secrets should default empty (disabled): %+v", cfg.Notify)
+	}
+
+	t.Setenv("NTFY_URL", "https://ntfy.example.com")
+	t.Setenv("NTFY_TOPIC", "mosaic-abc123")
+	t.Setenv("NTFY_TOKEN", "tk_test")
+	t.Setenv("HEARTBEAT_URL", "https://hc-ping.com/uuid-here")
+	applyEnvOverrides(cfg)
+	if cfg.Notify.NtfyURL != "https://ntfy.example.com" {
+		t.Errorf("NtfyURL = %q", cfg.Notify.NtfyURL)
+	}
+	if cfg.Notify.NtfyTopic != "mosaic-abc123" {
+		t.Errorf("NtfyTopic = %q", cfg.Notify.NtfyTopic)
+	}
+	if cfg.Notify.NtfyToken != "tk_test" {
+		t.Errorf("NtfyToken = %q", cfg.Notify.NtfyToken)
+	}
+	if cfg.Notify.HeartbeatURL != "https://hc-ping.com/uuid-here" {
+		t.Errorf("HeartbeatURL = %q", cfg.Notify.HeartbeatURL)
+	}
+}
+
+func TestNonSecretHash_IgnoresNotifyCapabilities(t *testing.T) {
+	// The notify topic/token/ping-URL are bearer capabilities. They must
+	// not vary the config hash (which is logged at boot and surfaced in
+	// /health) — otherwise the hash becomes an oracle for secret changes,
+	// and rotating an alert topic would look like a config change worth
+	// investigating.
+	a := defaults()
+	b := defaults()
+	b.Notify.NtfyTopic = "mosaic-secret-topic"
+	b.Notify.NtfyToken = "tk_secret"
+	b.Notify.HeartbeatURL = "https://hc-ping.com/some-uuid"
+	if a.NonSecretHash() != b.NonSecretHash() {
+		t.Error("NonSecretHash varies with notify capabilities; they must be redacted")
+	}
+	// But the server URL is non-secret config and SHOULD vary the hash.
+	c := defaults()
+	c.Notify.NtfyURL = "https://ntfy.example.com"
+	if a.NonSecretHash() == c.NonSecretHash() {
+		t.Error("NonSecretHash should vary with NtfyURL (non-secret)")
+	}
+}

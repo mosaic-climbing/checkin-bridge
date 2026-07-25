@@ -45,7 +45,54 @@ esac
 ASSET="mosaic-bridge-${OS}-${ARCH}"
 
 log()  { printf '[update] %s\n' "$*"; }
-fatal(){ printf '[update] FATAL: %s\n' "$*" >&2; exit 1; }
+fatal(){ printf '[update] FATAL: %s\n' "$*" >&2; notify high "Bridge update FAILED" "$*"; exit 1; }
+
+# ── push notifications ────────────────────────────────────
+# Reads NTFY_* from the deployed .env (single source of alerting truth,
+# shared with the bridge process and healthcheck.sh). Never fails the
+# update — alerting is best-effort here.
+env_val() {
+    [ -r "$INSTALL_DIR/.env" ] || return 0
+    awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/,""); gsub(/^"|"$/,""); print; exit}' "$INSTALL_DIR/.env"
+}
+notify() { # notify <priority> <title> <body>
+    local topic; topic="$(env_val NTFY_TOPIC)"
+    [ -n "$topic" ] || return 0
+    local url token
+    url="$(env_val NTFY_URL)"; url="${url:-https://ntfy.sh}"
+    token="$(env_val NTFY_TOKEN)"
+    local auth=()
+    [ -n "$token" ] && auth=(-H "Authorization: Bearer $token")
+    curl -fsS --max-time 10 \
+        -H "X-Title: $2" -H "X-Priority: $1" -H "X-Tags: package" \
+        "${auth[@]}" -d "$3" "${url%/}/$topic" > /dev/null 2>&1 || true
+}
+
+# ── .env preflight ────────────────────────────────────────
+# Refuse to restart the service on top of a missing or truncated .env.
+# The config loader would refuse to boot anyway (validate() requires the
+# API keys), but failing preflight keeps the CURRENT binary running
+# instead of bouncing the service into a crash loop. A truncated .env is
+# also the one path that could silently flip shadow mode — BRIDGE_SHADOW_
+# MODE defaults to false (live) in code when the line is absent.
+preflight_env() {
+    [ -s "$INSTALL_DIR/.env" ] || fatal ".env missing or empty at $INSTALL_DIR/.env — refusing to restart the service"
+    local k
+    for k in UNIFI_API_TOKEN REDPOINT_API_KEY ADMIN_API_KEY STAFF_PASSWORD; do
+        [ -n "$(env_val "$k")" ] || fatal ".env is missing $k — looks truncated; refusing to restart the service"
+    done
+    # Timestamped backup, keep the 10 most recent. The deployed .env is
+    # the only copy of this machine's config; every update snapshots it
+    # so an accidental edit is one `cp` away from undone.
+    local backup_dir="$INSTALL_DIR/env-backups"
+    mkdir -p "$backup_dir"
+    chmod 0700 "$backup_dir"
+    local backup="$backup_dir/.env.$(date +%Y%m%d-%H%M%S)"
+    cp -p "$INSTALL_DIR/.env" "$backup"
+    chmod 0600 "$backup"
+    ls -t "$backup_dir"/.env.* 2>/dev/null | tail -n +11 | xargs rm -f 2>/dev/null || true
+    log ".env preflight OK (backup: $backup)"
+}
 
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -65,10 +112,12 @@ if [ "${1:-}" = "rollback" ]; then
     mv "$INSTALL_DIR/mosaic-bridge.prev"  "$INSTALL_DIR/mosaic-bridge"
     launchctl load -w "/Library/LaunchDaemons/${SERVICE}.plist"
     log "rollback complete"
+    notify high "Bridge rolled back (manual)" "Operator ran update.sh rollback; previous binary restored."
     exit 0
 fi
 
 require_root "$@"
+preflight_env
 
 # ──────────────────────────────────────────────────────────
 # resolve tag: argument or "latest"
@@ -148,6 +197,7 @@ launchctl load -w "/Library/LaunchDaemons/${SERVICE}.plist"
 sleep 5
 if curl -fsS --max-time 5 http://127.0.0.1:3500/health > /dev/null; then
     log "health check OK — $TAG is live"
+    notify default "Bridge updated to $TAG" "Deploy verified: /health OK after restart."
     exit 0
 fi
 
@@ -159,6 +209,7 @@ if [ -f "$INSTALL_DIR/mosaic-bridge.prev" ]; then
     mv -f "$INSTALL_DIR/mosaic-bridge.prev" "$INSTALL_DIR/mosaic-bridge"
     launchctl load -w "/Library/LaunchDaemons/${SERVICE}.plist"
     log "rolled back — investigate /usr/local/mosaic-bridge/bridge.err"
+    notify high "Bridge update to $TAG auto-rolled back" "New binary failed /health after restart; previous binary restored. Check bridge.err."
     exit 2
 fi
 fatal "new binary unhealthy and no .prev to fall back to"

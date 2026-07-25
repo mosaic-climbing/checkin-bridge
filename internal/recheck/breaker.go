@@ -68,6 +68,25 @@ type breaker struct {
 	// breaker is safe to use without a wired logger (matches the
 	// nil-safety pattern in cmd/bridge wiring).
 	logger *slog.Logger
+
+	// onTransition, when non-nil, is invoked with the same transition +
+	// reason strings the slog lines carry ("closed_to_open",
+	// "probe_succeeded", …). It is called AFTER the mutex is released:
+	// failure() sits on the tap-time hot path, and the hook typically
+	// fans out to a push-notification client — holding b.mu across a
+	// network call would serialize every concurrent tap behind it. The
+	// hook itself must still return promptly (wiring dispatches the
+	// actual notification from a goroutine); post-unlock invocation just
+	// guarantees a slow hook degrades latency, not correctness.
+	onTransition func(transition, reason string)
+}
+
+// fire invokes the transition hook outside the lock. Callers must NOT
+// hold b.mu.
+func (b *breaker) fire(transition, reason string) {
+	if b.onTransition != nil {
+		b.onTransition(transition, reason)
+	}
 }
 
 func newBreaker(threshold int, cooldown time.Duration) *breaker {
@@ -89,6 +108,14 @@ func newBreaker(threshold int, cooldown time.Duration) *breaker {
 // but the cooldown has elapsed, it transitions back to closed so the next call
 // gets a fresh attempt; success/failure on that attempt then resets or re-trips.
 func (b *breaker) allow() bool {
+	allowed, transition, reason := b.allowLocked()
+	if transition != "" {
+		b.fire(transition, reason)
+	}
+	return allowed
+}
+
+func (b *breaker) allowLocked() (allowed bool, transition, reason string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.state == breakerOpen {
@@ -109,11 +136,11 @@ func (b *breaker) allow() bool {
 				"openForSeconds", openFor.Seconds(),
 				"cooldownSeconds", b.cooldown.Seconds(),
 			)
-			return true
+			return true, "open_to_closed", "cooldown_elapsed"
 		}
-		return false
+		return false, "", ""
 	}
-	return true
+	return true, "", ""
 }
 
 // success resets the failure counter. Safe to call even if the breaker was
@@ -123,7 +150,6 @@ func (b *breaker) allow() bool {
 // fully recover, not just the probe attempt.
 func (b *breaker) success() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	wasProbing := b.probing
 	b.failures = 0
 	b.state = breakerClosed
@@ -135,6 +161,10 @@ func (b *breaker) success() {
 			"to", "closed",
 			"reason", "probe_call_succeeded",
 		)
+	}
+	b.mu.Unlock()
+	if wasProbing {
+		b.fire("probe_succeeded", "probe_call_succeeded")
 	}
 }
 
@@ -159,14 +189,14 @@ func (b *breaker) success() {
 // semantics covered by TestBreaker_ReopensAfterCooldownOnFailure.
 func (b *breaker) failure() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	b.failures++
 
+	var transition, reason string
 	if b.failures >= b.threshold && b.state == breakerClosed {
 		b.state = breakerOpen
 		b.openedAt = b.now()
-		transition := "closed_to_open"
-		reason := "consecutive_failures_exceeded_threshold"
+		transition = "closed_to_open"
+		reason = "consecutive_failures_exceeded_threshold"
 		if b.probing {
 			transition = "closed_to_open_after_probe"
 			reason = "probe_window_failures_exceeded_threshold"
@@ -181,6 +211,10 @@ func (b *breaker) failure() {
 			"threshold", b.threshold,
 			"cooldownSeconds", b.cooldown.Seconds(),
 		)
+	}
+	b.mu.Unlock()
+	if transition != "" {
+		b.fire(transition, reason)
 	}
 }
 
@@ -216,7 +250,6 @@ func (b *breaker) isOpen() bool {
 // operators running the endpoint want feedback that their action landed.
 func (b *breaker) forceReset() (wasOpen bool) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	wasOpen = b.state == breakerOpen
 	b.state = breakerClosed
 	b.failures = 0
@@ -233,5 +266,7 @@ func (b *breaker) forceReset() (wasOpen bool) {
 		"reason", "operator_reset",
 		"wasOpen", wasOpen,
 	)
+	b.mu.Unlock()
+	b.fire("manual_reset", "operator_reset")
 	return wasOpen
 }

@@ -126,6 +126,16 @@ type Config struct {
 	// Now is injectable for testing the staleness check deterministically.
 	// Defaults to time.Now.
 	Now func() time.Time
+
+	// OnBreakerTransition, when non-nil, receives every operator-visible
+	// breaker state change ("closed_to_open", "closed_to_open_after_probe",
+	// "probe_succeeded", "open_to_closed", "manual_reset") with its reason
+	// string. Wired by app.Build to push notifications.
+	//
+	// Called from the tap-time path (outside the breaker mutex, but still
+	// synchronously) — implementations MUST return promptly and dispatch
+	// any network work to a goroutine.
+	OnBreakerTransition func(transition, reason string)
 }
 
 // Service is the production Rechecker. It speaks to the local store, the
@@ -186,6 +196,7 @@ func New(s Store, rp RedpointClient, ua UnifiClient, cfg Config, logger *slog.Lo
 	// breaker is internal — we don't want it logging at slog.Default while
 	// every other recheck event lives under our scoped handler).
 	br.logger = logger.With("component", "recheck.breaker")
+	br.onTransition = cfg.OnBreakerTransition
 	return &Service{
 		store:      s,
 		redpoint:   rp,

@@ -144,6 +144,12 @@ type Client struct {
 	// doesn't need to depend on internal/metrics.
 	messagesReceived atomic.Int64
 	eventsProcessed  atomic.Int64
+
+	// lastPollSuccess is the time of the most recent successful system-log
+	// poll (a fetch that returned without error — zero events still
+	// counts; a quiet gym is not a stale poller). Read by the watchdog's
+	// poller-staleness check via LastPollSuccessAt.
+	lastPollSuccess atomic.Value // stores time.Time
 }
 
 // NewClient creates a new UniFi Access client.
@@ -246,6 +252,18 @@ func (c *Client) MessagesReceived() int64 {
 // recognised access.logs.add or access.data.device.update events).
 func (c *Client) EventsProcessed() int64 {
 	return c.eventsProcessed.Load()
+}
+
+// LastPollSuccessAt returns the time of the most recent successful
+// system-log poll, or the zero time if no poll has succeeded since boot.
+// The watchdog's poller-staleness check keys on this — success means the
+// UA-Hub fetch returned without error, independent of how many events it
+// carried.
+func (c *Client) LastPollSuccessAt() time.Time {
+	if v := c.lastPollSuccess.Load(); v != nil {
+		return v.(time.Time)
+	}
+	return time.Time{}
 }
 
 // Health returns the current health status of the connection.
@@ -1285,6 +1303,10 @@ func (c *Client) pollOnce(ctx context.Context, cursorTime *time.Time, maxLogID *
 		c.logger.Warn("tap poller fetch failed", "error", err, "since", fetchSince.Format(time.RFC3339))
 		return
 	}
+
+	// Successful fetch — stamp liveness before the empty-result
+	// short-circuit so quiet hours don't read as a stale poller.
+	c.lastPollSuccess.Store(time.Now())
 
 	if len(events) == 0 {
 		return
