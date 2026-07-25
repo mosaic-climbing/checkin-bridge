@@ -282,6 +282,71 @@ func TestValidation_ControlPort(t *testing.T) {
 	}
 }
 
+func TestValidation_InstanceNameStageRequiresShadow(t *testing.T) {
+	// The "stage instance must run in shadow mode" invariant is the
+	// runtime-side belt that guards a same-machine staging deploy. Locking
+	// it down with tests is what stops a future refactor from silently
+	// loosening it (a `_ = cfg.Bridge.InstanceName` left unreachable would
+	// pass review without this test failing).
+	base := func() *Config {
+		cfg := defaults()
+		cfg.UniFi.APIToken = "tok"
+		cfg.Redpoint.APIKey = "key"
+		cfg.Redpoint.FacilityCode = "Mosaic"
+		cfg.Bridge.StaffPassword = "pass"
+		cfg.Bridge.AdminAPIKey = "adminkey"
+		cfg.Bridge.ControlPort = cfg.Bridge.Port + 1
+		return cfg
+	}
+
+	// Default ("prod") + shadow=false: fine. Production case.
+	cfg := base()
+	if err := validate(cfg); err != nil {
+		t.Errorf("validate(prod, shadow=false) returned %v, want nil", err)
+	}
+
+	// Stage + shadow=true: fine. Documented staging configuration.
+	cfg = base()
+	cfg.Bridge.InstanceName = "stage"
+	cfg.Bridge.ShadowMode = true
+	if err := validate(cfg); err != nil {
+		t.Errorf("validate(stage, shadow=true) returned %v, want nil", err)
+	}
+
+	// Stage + shadow=false: REFUSE. The whole point of the invariant.
+	// A non-shadow stage instance would issue real door unlocks against
+	// prod's UniFi WebSocket — exactly the failure mode the staging
+	// design exists to prevent.
+	cfg = base()
+	cfg.Bridge.InstanceName = "stage"
+	cfg.Bridge.ShadowMode = false
+	if err := validate(cfg); err == nil {
+		t.Error("validate(stage, shadow=false) returned nil, want error")
+	}
+
+	// Empty / unrecognised label + shadow=false: fine. The check is
+	// scoped to the literal string "stage" so future labels (e.g. "canary")
+	// don't unexpectedly inherit the shadow requirement.
+	cfg = base()
+	cfg.Bridge.InstanceName = "canary"
+	cfg.Bridge.ShadowMode = false
+	if err := validate(cfg); err != nil {
+		t.Errorf("validate(canary, shadow=false) returned %v, want nil (only \"stage\" is constrained)", err)
+	}
+}
+
+func TestDefaults_InstanceName(t *testing.T) {
+	// Default must be "prod" so an unmarked deployment is unambiguously
+	// production. An empty default would let an operator forget to set
+	// BRIDGE_INSTANCE_NAME on stage and get past the validate() gate by
+	// accident; freezing the default to "prod" makes that a no-op rather
+	// than a foot-gun.
+	cfg := defaults()
+	if cfg.Bridge.InstanceName != "prod" {
+		t.Errorf("defaults Bridge.InstanceName = %q, want \"prod\"", cfg.Bridge.InstanceName)
+	}
+}
+
 func TestDefaults_ControlBindAddr(t *testing.T) {
 	cfg := defaults()
 	// The whole point of the split is loopback-by-default — if someone

@@ -1,6 +1,7 @@
 .PHONY: help build test vet lint clean check-secrets tidy run \
         build-darwin-arm64 build-linux-arm64 build-linux-amd64 build-all \
-        deploy release-tag install-hooks install-precommit-hook
+        deploy release-tag install-hooks install-precommit-hook \
+        deploy-stage deploy-stage-local stage-status stage-rollback
 
 # Derive a version string from git. Falls back to "dev" if not in a git repo.
 VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -81,3 +82,60 @@ deploy: ## Tell the gym MacBook to pull + install the latest (or a specific) rel
 	# Without it, sudo errors with "a terminal is required to read the password".
 	# Type the password once per deploy — the whole run finishes in that single sudo session.
 	ssh -t $(GYM) "sudo /usr/local/mosaic-bridge/update.sh $(TAG)"
+
+# ── Staging ──────────────────────────────────────────────
+#
+# Staging runs as com.mosaic.bridge.stage on the same gym MacBook,
+# in shadow mode, alongside prod. The deploy flow uses the existing
+# CI artifact (mosaic-bridge-darwin-arm64 from .github/workflows/ci.yml)
+# rather than a release tag — staging exists to soak feature branches
+# before they earn a release tag. See CLAUDE.md "Staging" for the
+# soak-rule and the per-PR workflow.
+
+# deploy-stage: pull the CI-built darwin-arm64 artifact for the current
+# branch, scp it to the gym, and run stage-update.sh. The current branch
+# is auto-detected; override BRANCH= if you want to soak a specific one
+# without checking it out locally.
+#
+# Requires `gh` CLI authenticated against the repo (gh auth login).
+# CI must have completed for the branch — the workflow runs on PRs
+# against main, so open the PR first.
+BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD)
+deploy-stage: ## Deploy the latest CI-built darwin-arm64 artifact for the current branch to staging
+	@if [ "$(BRANCH)" = "main" ]; then \
+		echo "refusing to deploy main to staging — staging exists to soak feature branches"; \
+		exit 1; \
+	fi
+	@command -v gh >/dev/null 2>&1 || { echo "gh CLI not found — install via 'brew install gh' and run 'gh auth login'"; exit 1; }
+	@echo "fetching CI artifact for branch $(BRANCH)"
+	@rm -rf dist/stage-fetch && mkdir -p dist/stage-fetch
+	@RUN_ID=$$(gh run list --branch $(BRANCH) --workflow ci.yml --status success --limit 1 --json databaseId -q '.[0].databaseId'); \
+	  if [ -z "$$RUN_ID" ]; then \
+	    echo "no successful ci.yml run found for branch $(BRANCH) — open a PR or push more commits and wait for CI"; \
+	    exit 1; \
+	  fi; \
+	  echo "using CI run $$RUN_ID"; \
+	  gh run download $$RUN_ID --name mosaic-bridge-darwin-arm64 --dir dist/stage-fetch
+	@scp dist/stage-fetch/mosaic-bridge-darwin-arm64 $(GYM):/tmp/mosaic-bridge-stage
+	# -t per CLAUDE.md SSH+sudo rules: sudo needs a TTY for the admin password prompt.
+	ssh -t $(GYM) "sudo /usr/local/mosaic-bridge-stage/stage-update.sh"
+
+# deploy-stage-local: build darwin-arm64 locally and ship it. Escape hatch
+# for hot debugging when waiting for CI is too slow. Use sparingly — the
+# whole point of deploy-stage is that staging runs *exactly* what would
+# go to prod, and a locally-built binary subtly weakens that guarantee.
+deploy-stage-local: build-darwin-arm64 ## Build locally and deploy to staging (escape hatch — prefer deploy-stage)
+	scp dist/mosaic-bridge-darwin-arm64 $(GYM):/tmp/mosaic-bridge-stage
+	ssh -t $(GYM) "sudo /usr/local/mosaic-bridge-stage/stage-update.sh"
+
+# stage-status: probe staging's /health and show the tail of its log.
+# The /health response includes "instance":"stage" so you can tell at
+# a glance you're talking to the staging process and not prod.
+stage-status: ## Print staging /health + tail of bridge.log (over SSH)
+	@ssh $(GYM) 'curl -fsS http://127.0.0.1:3600/health && echo && echo "── bridge.log (last 30 lines) ──" && sudo tail -30 /usr/local/mosaic-bridge-stage/bridge.log' || \
+	  { echo "stage-status failed — try: ssh -t $(GYM) 'sudo tail -30 /usr/local/mosaic-bridge-stage/bridge.err'"; exit 1; }
+
+# stage-rollback: revert staging to the previously-installed binary.
+# Symmetric with `update.sh rollback` for the prod side.
+stage-rollback: ## Roll staging back to the previous binary
+	ssh -t $(GYM) "sudo /usr/local/mosaic-bridge-stage/stage-update.sh rollback"

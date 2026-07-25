@@ -134,6 +134,36 @@ func TestHealthEndpoint(t *testing.T) {
 	if resp["cacheMembers"].(float64) != 1 {
 		t.Errorf("cacheMembers = %v, want 1", resp["cacheMembers"])
 	}
+	// instance defaults to "prod" when ServerDeps.InstanceName is empty.
+	// Probes (notably update.sh's loopback /health probe and any
+	// staging-watching tooling) rely on this field; keep it asserted so a
+	// rename or accidental drop surfaces in CI rather than in production.
+	if resp["instance"] != "prod" {
+		t.Errorf("instance = %v, want prod (default when InstanceName unset)", resp["instance"])
+	}
+}
+
+func TestHealthEndpoint_StageInstance(t *testing.T) {
+	// When the operator tags the binary as a stage instance, /health
+	// should report it. Probes that watch the stage process specifically
+	// (the staging soak workflow) need this to disambiguate from a
+	// misconfigured prod instance answering on the same machine.
+	srv, _, _ := setupTestServer(t)
+	// Same-package test: set the field directly rather than adding a
+	// production setter back — ServerDeps.InstanceName is the real wire
+	// (covered via app.Build), and post-construction setters were
+	// deliberately eliminated in the Deps refactor.
+	srv.instanceName = "stage"
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["instance"] != "stage" {
+		t.Errorf("instance = %v, want stage", resp["instance"])
+	}
 }
 
 func TestStatsEndpoint(t *testing.T) {

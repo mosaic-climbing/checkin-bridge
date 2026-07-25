@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Staging launchd daemon. Mirrors com.mosaic.bridge.plist with three
+  intentional differences:
+
+    1. Label / paths point at /usr/local/mosaic-bridge-stage/ so prod and
+       stage own independent install dirs, .env files, data dirs, and logs.
+    2. Same mosaic:staff user as prod — the data dirs are isolated, so a
+       second user adds setup steps without buying us anything.
+    3. The binary itself enforces (via config.validate()) that this
+       instance has BRIDGE_INSTANCE_NAME=stage AND BRIDGE_SHADOW_MODE=true.
+       Without that pairing it refuses to start, so launchd will retry
+       under ThrottleInterval and the failure is loud rather than silent.
+
+  Install location: /Library/LaunchDaemons/com.mosaic.bridge.stage.plist
+  Load:             sudo launchctl load -w /Library/LaunchDaemons/com.mosaic.bridge.stage.plist
+  Unload:           sudo launchctl unload   /Library/LaunchDaemons/com.mosaic.bridge.stage.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.mosaic.bridge.stage</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/mosaic-bridge-stage/mosaic-bridge</string>
+  </array>
+  <key>UserName</key><string>mosaic</string>
+  <key>GroupName</key><string>staff</string>
+  <key>WorkingDirectory</key><string>/usr/local/mosaic-bridge-stage</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/usr/local/mosaic-bridge-stage/bridge.log</string>
+  <key>StandardErrorPath</key><string>/usr/local/mosaic-bridge-stage/bridge.err</string>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key><integer>4096</integer>
+  </dict>
+</dict>
+</plist>

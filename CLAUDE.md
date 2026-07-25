@@ -191,6 +191,66 @@ Don't remove shadow mode without replacing it with an equivalent safety. It's th
 
 ---
 
+## Staging
+
+Staging is a second bridge instance that runs side-by-side with prod on the gym MacBook, observing the same UA-Hub WebSocket and the same Redpoint org but with `BRIDGE_SHADOW_MODE=true` so it never issues a real door unlock or Redpoint write. Its purpose is to catch behavioural regressions — bugs that compile, pass `go test`, and survive the post-deploy `/health` probe but make the wrong decision on a real tap. The auto-rollback in `update.sh` doesn't catch that class; staging does.
+
+### Layout
+
+| | prod | stage |
+|--|--|--|
+| install dir | `/usr/local/mosaic-bridge/` | `/usr/local/mosaic-bridge-stage/` |
+| launchd label | `com.mosaic.bridge` | `com.mosaic.bridge.stage` |
+| ports | `3500` / `3501` | `3600` / `3601` |
+| binary source | GitHub release (signed by tag) | CI artifact for the candidate branch |
+| `.env` | `BRIDGE_SHADOW_MODE=false` | `BRIDGE_SHADOW_MODE=true`, `BRIDGE_INSTANCE_NAME=stage` |
+| update script | `deploy/macbook/update.sh` | `deploy/macbook/stage-update.sh` |
+
+The pair `(BRIDGE_INSTANCE_NAME=stage, BRIDGE_SHADOW_MODE=true)` is the staging invariant. It's enforced in three independent places:
+
+1. `config.validate()` — the binary refuses to start if the pair is broken.
+2. `stage-update.sh` — the installer fails preflight if the pair is broken in `.env.stage`.
+3. The deployed plist points at `/usr/local/mosaic-bridge-stage/mosaic-bridge`, so prod's binary can't accidentally serve the stage label.
+
+### Per-PR workflow (24h soak rule)
+
+Non-trivial changes — anything bigger than a docs tweak or a typo fix — must soak on staging for **at least 24 hours** before merging to `main`. The 24h window must include at least one peak-hours session at the gym, since that's when real tap traffic exercises the WebSocket and Redpoint paths.
+
+```bash
+git checkout -b feat/something
+# ... commits ...
+git push -u origin feat/something
+gh pr create --fill                  # CI runs
+
+# After CI green:
+make deploy-stage GYM=$GYM           # pulls the CI artifact, deploys to stage
+
+# During the soak:
+make stage-status GYM=$GYM           # /health + tail of bridge.log
+ssh $GYM 'tail -F /usr/local/mosaic-bridge-stage/bridge.log'
+
+# If clean after 24h + a peak window:
+gh pr merge --squash --delete-branch
+make release-tag VERSION=vX.Y.Z
+make deploy GYM=$GYM TAG=vX.Y.Z
+```
+
+`make deploy-stage` uses `gh run download` to fetch the CI-built `mosaic-bridge-darwin-arm64` artifact for the current branch. CI must have completed successfully for the branch (the workflow runs on PRs against `main`, so open the PR first). `make deploy-stage-local` is the escape hatch for hot debugging — it builds locally and ships, bypassing CI. Use sparingly; the whole point of `deploy-stage` is that staging runs *exactly* what prod will eventually run.
+
+### Trivial changes that can skip the soak
+
+- Pure docs/comment edits with no code behavior change.
+- Test-only changes that don't ship in the binary (e.g. adding a unit test).
+- Build/CI tooling changes that don't alter the bridge binary (`Makefile` non-deploy targets, workflow tweaks unrelated to building).
+
+Everything else — including changes that "should" be safe — soaks. The whole point of having staging is to catch the changes that should have been safe.
+
+### Recovering a broken stage
+
+`make stage-rollback` reverts the staging install dir to its `.prev` binary. Use this when a deploy lands but you immediately notice the staging logs showing wrong decisions; rolling back gives you a known-good staging environment to re-soak the next attempt against. It's symmetric with `update.sh rollback` for prod.
+
+---
+
 ## Local development
 
 ```bash

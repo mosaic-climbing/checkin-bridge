@@ -98,7 +98,21 @@ func logBootBanner(logger *slog.Logger, cfg *config.Config) {
 		"version", version,
 		"buildTime", buildTime,
 		"configHash", cfg.NonSecretHash(),
+		"instance", cfg.Bridge.InstanceName,
 	)
+
+	// Announce a non-prod instance loudly. The pair of (instance=stage,
+	// shadow=true) is enforced in config.validate(), so the binary won't
+	// boot in any other combination — but the operator tailing logs still
+	// benefits from a banner that makes it obvious which process they've
+	// just started. Same shape as the shadow-mode banner below for visual
+	// consistency.
+	if cfg.Bridge.InstanceName != "" && cfg.Bridge.InstanceName != "prod" {
+		logger.Warn("╔══════════════════════════════════════════════╗")
+		logger.Warn("║  NON-PROD INSTANCE                           ║",
+			"instance", cfg.Bridge.InstanceName)
+		logger.Warn("╚══════════════════════════════════════════════╝")
+	}
 
 	if cfg.Bridge.ShadowMode {
 		logger.Warn("╔══════════════════════════════════════════════╗")
