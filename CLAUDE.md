@@ -101,7 +101,7 @@ Branch name prefixes (loose, not enforced):
 - `chore/` — deps, tooling, CI, non-code
 - `docs/` — docs only
 
-**Small/urgent fixes** (one-line typo, trivial doc fix) can go straight to `main`. Use judgment.
+**Everything goes through a PR** — even one-line typo fixes. Never push to `main` directly; branch protection enforces this, and the squash-merge history is worth the extra minute.
 
 **Squash-merge on PR merge.** Keeps the `main` log linear and revert-friendly — one commit per logical change, so `git revert <sha>` rolls back cleanly without untangling a chain of WIP commits.
 
@@ -188,6 +188,42 @@ The bridge has a **shadow mode** (`BRIDGE_SHADOW_MODE=true` in `.env`). In shado
 This is the deployment safety valve. Every new deploy starts in shadow mode for several days. Watch the logs and the Shadow Decisions dashboard panel. Only flip to live mode after multiple days of correct decisions.
 
 Don't remove shadow mode without replacing it with an equivalent safety. It's the one mechanism that makes a config typo recoverable rather than destructive.
+
+---
+
+## Staging (optional escape hatch — no soak rule)
+
+Staging is a second bridge instance that can run side-by-side with prod on the gym MacBook, observing the same UA-Hub feed and the same Redpoint org but with `BRIDGE_SHADOW_MODE=true` so it never issues a real door unlock or Redpoint write. Use it **only** when a change is scary enough to want a dress rehearsal — e.g. rewiring the tap-decision path or the status-sync writes.
+
+**There is no mandatory soak.** The normal path for every change is: PR → CI green → squash-merge → `make release-tag` → the prod auto-updater installs it hands-free (SHA256 verify, `/health` probe, automatic rollback to `.prev` on failure). Behavioural safety comes from the capability-flag rungs (shadow-by-default writes, staged go-live) and push alerting, not from a human watching staging logs for 24 hours. That rule existed before alerting did, and in practice it stalled every iteration; it is retired.
+
+### Layout
+
+| | prod | stage |
+|--|--|--|
+| install dir | `/usr/local/mosaic-bridge/` | `/usr/local/mosaic-bridge-stage/` |
+| launchd label | `com.mosaic.bridge` | `com.mosaic.bridge.stage` |
+| ports | `3500` / `3501` | `3600` / `3601` |
+| binary source | GitHub release (signed by tag) | CI artifact for the candidate branch |
+| `.env` | `BRIDGE_SHADOW_MODE=false` | `BRIDGE_SHADOW_MODE=true`, `BRIDGE_INSTANCE_NAME=stage` |
+| update script | `deploy/macbook/update.sh` | `deploy/macbook/stage-update.sh` |
+
+The pair `(BRIDGE_INSTANCE_NAME=stage, BRIDGE_SHADOW_MODE=true)` is the staging invariant. It's enforced in three independent places:
+
+1. `config.validate()` — the binary refuses to start if the pair is broken.
+2. `stage-update.sh` — the installer fails preflight if the pair is broken in `.env.stage`.
+3. The deployed plist points at `/usr/local/mosaic-bridge-stage/mosaic-bridge`, so prod's binary can't accidentally serve the stage label.
+
+### Using staging (when you opt in)
+
+```bash
+# After the PR's CI is green:
+make deploy-stage GYM=$GYM           # pulls the CI artifact for the branch, deploys to stage
+make stage-status GYM=$GYM           # /health + tail of bridge.log
+make stage-rollback GYM=$GYM         # revert stage to its .prev binary
+```
+
+`make deploy-stage` uses `gh run download` to fetch the CI-built `mosaic-bridge-darwin-arm64` artifact for the current branch (open the PR first — the workflow runs on PRs against `main`). `make deploy-stage-local` builds locally and ships, bypassing CI, for hot debugging only. Watch it as long as you actually need to — minutes for most changes — then merge.
 
 ---
 

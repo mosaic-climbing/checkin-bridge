@@ -297,6 +297,7 @@ func Build(ctx context.Context, opts BuildOptions) (*App, error) {
 		BG:                   bgGroup,
 		EnableTestHooks:      cfg.Bridge.EnableTestHooks,
 		ShadowMode:           cfg.Bridge.ShadowMode,
+		InstanceName:         cfg.Bridge.InstanceName,
 		BreakerResetter:      rechecker.ResetBreaker,
 		MirrorWalker:         mirrorWalker.Walk,
 		UAHubMirrorRefresher: uaHubRefresher,

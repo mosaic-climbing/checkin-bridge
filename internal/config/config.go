@@ -97,6 +97,19 @@ type BridgeConfig struct {
 	ControlBindAddr  string `json:"controlBindAddr"`  // default: "127.0.0.1"; set "" to mirror BindAddr
 	ShadowMode       bool   `json:"shadowMode"`       // if true: no door unlocks, no Redpoint writes, no UniFi status writes
 
+	// InstanceName tags this process as "prod" (the default) or "stage". The
+	// value is surfaced in /health so an operator can tell at a glance which
+	// instance they've reached, and it acts as a runtime guard against
+	// misconfiguration: when set to "stage", validate() refuses to boot
+	// unless ShadowMode is also true. The two-key invariant ("stage =>
+	// shadow") is what makes a same-machine staging deployment safe — even
+	// if someone hand-edits .env.stage to flip shadow off, the binary
+	// itself bails before opening a UniFi WebSocket. Empty / "prod" /
+	// any other label has no behavioural effect.
+	//
+	// Env: BRIDGE_INSTANCE_NAME=stage
+	InstanceName string `json:"instanceName"`
+
 	// LegacyNFCStatusLoop controls whether Step 2 of statusync.RunSync — the
 	// GetMemberByNFC-driven activation/deactivation pass that predates C2 —
 	// runs. When true (default, for backward compatibility with gyms that
@@ -256,6 +269,7 @@ func defaults() *Config {
 			BindAddr:            "127.0.0.1",
 			ControlBindAddr:     "127.0.0.1",
 			LegacyNFCStatusLoop: true, // backward-compat default; set false for C2-only gyms
+			InstanceName:        "prod",
 		},
 		Sync: SyncConfig{
 			IntervalHours: 24,
@@ -298,6 +312,7 @@ func applyEnvOverrides(cfg *Config) {
 	envInt(&cfg.Bridge.ControlPort, "BRIDGE_CONTROL_PORT")
 	envStr(&cfg.Bridge.ControlBindAddr, "BRIDGE_CONTROL_BIND_ADDR")
 	envBool(&cfg.Bridge.ShadowMode, "BRIDGE_SHADOW_MODE")
+	envStr(&cfg.Bridge.InstanceName, "BRIDGE_INSTANCE_NAME")
 	envBool(&cfg.Bridge.LegacyNFCStatusLoop, "BRIDGE_LEGACY_NFC_STATUS_LOOP")
 	envDuration(&cfg.Bridge.RecheckMaxStaleness, "BRIDGE_RECHECK_MAX_STALENESS")
 	envBool(&cfg.Bridge.BackfillOnReconnect, "BRIDGE_BACKFILL_ON_RECONNECT")
@@ -365,6 +380,17 @@ func validate(cfg *Config) error {
 	}
 	if cfg.Bridge.ControlPort == cfg.Bridge.Port {
 		return fmt.Errorf("Bridge.ControlPort (%d) must differ from Bridge.Port (%d) — the split exists so the control plane can be bound to loopback only", cfg.Bridge.ControlPort, cfg.Bridge.Port)
+	}
+	// Stage instances must run in shadow mode. The pair is the runtime
+	// invariant that makes a same-machine staging deployment safe: stage
+	// connects to the same UniFi WebSocket and Redpoint org as prod, and
+	// shadow mode is what stops it from issuing real door unlocks or
+	// Redpoint writes. Refusing to boot a "stage" instance without shadow
+	// mode is the binary-side belt that backs up stage-update.sh's
+	// .env-precheck suspenders. Empty / "prod" / any other label has no
+	// behavioural effect.
+	if cfg.Bridge.InstanceName == "stage" && !cfg.Bridge.ShadowMode {
+		return fmt.Errorf("BRIDGE_INSTANCE_NAME=stage requires BRIDGE_SHADOW_MODE=true (refusing to boot a non-shadow stage instance — it would issue real door unlocks against prod's UniFi WebSocket)")
 	}
 	return nil
 }

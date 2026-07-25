@@ -72,3 +72,9 @@ Thumbs.db
 # Go
 # ═══════════════════════════════════════════════════════════
 vendor/
+
+# ═══════════════════════════════════════════════════════════
+# AI assistant scratch — agent worktrees, session caches.
+# Not project content; the agent recreates these on demand.
+# ═══════════════════════════════════════════════════════════
+.claude/
