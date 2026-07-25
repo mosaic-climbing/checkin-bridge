@@ -1,0 +1,47 @@
+<div class="page-header">
+    <h2>Add a New Member</h2>
+    <p>Create a UA-Hub user, bind a Redpoint customer, and enroll their NFC card — all in one flow. The email field is live-validated against Redpoint as you type, so submission is gated on a clean match.</p>
+</div>
+
+<div class="card">
+    <h3>Member details</h3>
+    <form id="members-new-form"
+          hx-post="/ui/members/new"
+          hx-target="#members-new-result"
+          hx-swap="outerHTML"
+          hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>
+        <div class="form-row">
+            <div class="form-group">
+                <label>First name</label>
+                <input type="text" name="first_name" required placeholder="Jane">
+            </div>
+            <div class="form-group">
+                <label>Last name</label>
+                <input type="text" name="last_name" required placeholder="Smith">
+            </div>
+        </div>
+        <div class="form-row">
+            <div class="form-group" style="flex: 2">
+                <label>Email (must match a Redpoint customer)</label>
+                <input type="email" name="email" required placeholder="jane@example.com"
+                       hx-get="/ui/members/new/lookup"
+                       hx-trigger="keyup changed delay:400ms, change"
+                       hx-target="#members-new-lookup"
+                       hx-include="closest form"
+                       hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>
+            </div>
+        </div>
+        <div id="members-new-lookup" style="margin: 8px 0"></div>
+        <div class="form-row" style="margin-top: 12px">
+            <button type="submit" class="btn btn-primary">Create UA-Hub user</button>
+        </div>
+    </form>
+</div>
+
+<!--
+  Result panel. POST /ui/members/new replaces the inner div with the
+  PostCreateFragment (reader picker → "Start enrollment"); from there
+  the same slot cycles through EnrollmentPollingFragment → either
+  EnrollmentCompleteFragment or EnrollmentFailedFragment.
+-->
+<div id="members-new-result" style="margin-top: 16px"></div>

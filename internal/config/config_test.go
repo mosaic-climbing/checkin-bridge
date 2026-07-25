@@ -116,22 +116,22 @@ func TestGraphQLURL(t *testing.T) {
 
 func TestParseHHMM(t *testing.T) {
 	cases := []struct {
-		in       string
-		wantH    int
-		wantM    int
-		wantErr  bool
+		in      string
+		wantH   int
+		wantM   int
+		wantErr bool
 	}{
 		{in: "03:00", wantH: 3, wantM: 0},
 		{in: "00:00", wantH: 0, wantM: 0},
 		{in: "23:59", wantH: 23, wantM: 59},
 		{in: " 09:30 ", wantH: 9, wantM: 30}, // trim
-		{in: "24:00", wantErr: true},          // hour out of range
-		{in: "12:60", wantErr: true},          // minute out of range
-		{in: "-1:00", wantErr: true},          // negative
-		{in: "abc", wantErr: true},            // not numeric
-		{in: "12", wantErr: true},             // missing colon
-		{in: "12:34:56", wantErr: true},       // extra colon
-		{in: "", wantErr: true},               // empty
+		{in: "24:00", wantErr: true},         // hour out of range
+		{in: "12:60", wantErr: true},         // minute out of range
+		{in: "-1:00", wantErr: true},         // negative
+		{in: "abc", wantErr: true},           // not numeric
+		{in: "12", wantErr: true},            // missing colon
+		{in: "12:34:56", wantErr: true},      // extra colon
+		{in: "", wantErr: true},              // empty
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
@@ -200,6 +200,40 @@ func TestValidation_UnmatchedGraceDaysNegative(t *testing.T) {
 	cfg.Bridge.UnmatchedGraceDays = 0
 	if err := validate(cfg); err != nil {
 		t.Errorf("validate(UnmatchedGraceDays=0) returned %v, want nil", err)
+	}
+}
+
+func TestValidation_AllowNewMembersRequiresPolicies(t *testing.T) {
+	// Every `cfg.Bridge.AllowNewMembers=true` bridge that boots must have
+	// at least one default access policy ID set. Without it, a freshly-
+	// created user has no access group attached and every tap denies —
+	// the single most confusing failure mode for staff ("I created the
+	// user, why can't they get in?").
+	cfg := defaults()
+	cfg.UniFi.APIToken = "tok"
+	cfg.Redpoint.APIKey = "key"
+	cfg.Redpoint.FacilityCode = "Mosaic"
+	cfg.Bridge.StaffPassword = "pass"
+	cfg.Bridge.AdminAPIKey = "adminkey"
+	cfg.Bridge.ControlPort = cfg.Bridge.Port + 1
+
+	cfg.Bridge.AllowNewMembers = true
+	// DefaultAccessPolicyIDs still empty — must refuse.
+	if err := validate(cfg); err == nil {
+		t.Fatal("expected validation error when AllowNewMembers=true and policy list empty")
+	}
+
+	cfg.Bridge.DefaultAccessPolicyIDs = []string{"pol-members"}
+	if err := validate(cfg); err != nil {
+		t.Errorf("validate(AllowNewMembers=true + policy) returned %v", err)
+	}
+
+	// With AllowNewMembers=false the policy list is unused and its emptiness
+	// must not block boot.
+	cfg.Bridge.AllowNewMembers = false
+	cfg.Bridge.DefaultAccessPolicyIDs = nil
+	if err := validate(cfg); err != nil {
+		t.Errorf("validate(AllowNewMembers=false) returned %v (should not care about policy list)", err)
 	}
 }
 

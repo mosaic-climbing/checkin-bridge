@@ -65,6 +65,22 @@ type Server struct {
 	// to prod still won't expose the route unless EnableTestHooks=true.
 	// See S5 in docs/architecture-review.md.
 	enableTestHooks bool
+	// allowNewMembers gates the /ui/members/new provisioning routes (C2
+	// Layer 4d). Mirrors cfg.Bridge.AllowNewMembers. When false the routes
+	// are still registered but every handler short-circuits with a 403 +
+	// "feature disabled" alert fragment — same defence-in-depth shape as
+	// enableTestHooks. The boot-time config validator in internal/config
+	// already refuses to start with AllowNewMembers=true and an empty
+	// DefaultAccessPolicyIDs list, so by the time this field is true we
+	// know defaultAccessPolicyIDs is non-empty.
+	allowNewMembers bool
+	// defaultAccessPolicyIDs is the list of UA-Hub access-policy IDs the
+	// /ui/members/new flow attaches to every freshly-created user (§3.6
+	// of the UA-Hub API). UA-Hub creates users with no policies attached
+	// by default, so this is mandatory — without it the user exists but
+	// every tap denies. Boot validation enforces non-empty when
+	// AllowNewMembers=true, see config.validate().
+	defaultAccessPolicyIDs []string
 	// htmlCache caches rendered HTML fragments with TTL invalidation.
 	// See P1 in docs/architecture-review.md.
 	htmlCache *htmlCache
@@ -159,28 +175,36 @@ type UAHubRefreshStats struct {
 // dependencies are required too — none of them have meaningful zero
 // values for production.
 type ServerDeps struct {
-	Handler             *checkin.Handler
-	Unifi               *unifi.Client
-	Redpoint            *redpoint.Client
-	CardMapper          *cardmap.Mapper
-	Syncer              *cache.Syncer
-	StatusSyncer        *statusync.Syncer
-	Ingester            *ingest.Ingester
-	Sessions            *SessionManager
-	Audit               *auditlog.Logger
-	GateID              string
-	Logger              *slog.Logger
-	Store               *store.Store
-	UI                  *ui.Handler
-	Metrics             *metrics.Registry
-	TrustedProxies      []*net.IPNet
-	BG                  *bg.Group
-	EnableTestHooks     bool
-	InstanceName        string
-	ShadowMode          bool
-	BreakerResetter     func() (wasOpen bool)
-	MirrorWalker        func(ctx context.Context) error
-	UAHubMirrorRefresher func(ctx context.Context, progress func(phase string)) (UAHubRefreshStats, error)
+	Handler         *checkin.Handler
+	Unifi           *unifi.Client
+	Redpoint        *redpoint.Client
+	CardMapper      *cardmap.Mapper
+	Syncer          *cache.Syncer
+	StatusSyncer    *statusync.Syncer
+	Ingester        *ingest.Ingester
+	Sessions        *SessionManager
+	Audit           *auditlog.Logger
+	GateID          string
+	Logger          *slog.Logger
+	Store           *store.Store
+	UI              *ui.Handler
+	Metrics         *metrics.Registry
+	TrustedProxies  []*net.IPNet
+	BG              *bg.Group
+	EnableTestHooks bool
+	// AllowNewMembers + DefaultAccessPolicyIDs configure the
+	// /ui/members/new provisioning flow (see the Server field docs).
+	// Optional: the zero values disable the flow, matching the config
+	// default. When AllowNewMembers is true the caller is responsible
+	// for passing a non-empty policy list — config.validate() enforces
+	// this at boot for the production wiring in internal/app.
+	AllowNewMembers        bool
+	DefaultAccessPolicyIDs []string
+	InstanceName           string
+	ShadowMode             bool
+	BreakerResetter        func() (wasOpen bool)
+	MirrorWalker           func(ctx context.Context) error
+	UAHubMirrorRefresher   func(ctx context.Context, progress func(phase string)) (UAHubRefreshStats, error)
 }
 
 // NewServer constructs the api.Server. Panics on a missing required
@@ -197,31 +221,33 @@ func NewServer(deps ServerDeps) *Server {
 		panic("api.NewServer: UAHubMirrorRefresher is required (POST /ua-hub/sync depends on it)")
 	}
 	s := &Server{
-		handler:            deps.Handler,
-		unifi:              deps.Unifi,
-		redpoint:           deps.Redpoint,
-		cardMapper:         deps.CardMapper,
-		syncer:             deps.Syncer,
-		statusSyncer:       deps.StatusSyncer,
-		ingester:           deps.Ingester,
-		sessions:           deps.Sessions,
-		audit:              deps.Audit,
-		gateID:             deps.GateID,
-		logger:             deps.Logger,
-		mux:                http.NewServeMux(),
-		controlMux:         http.NewServeMux(),
-		store:              deps.Store,
-		ui:                 deps.UI,
-		metrics:            deps.Metrics,
-		trustedProxies:     deps.TrustedProxies,
-		bg:                 deps.BG,
-		enableTestHooks:    deps.EnableTestHooks,
-		htmlCache:          newHTMLCache(),
-		breakerResetter:    deps.BreakerResetter,
-		mirrorWalk:         deps.MirrorWalker,
-		uaHubMirrorRefresh: deps.UAHubMirrorRefresher,
-		instanceName:       deps.InstanceName,
-		shadowMode:         deps.ShadowMode,
+		handler:                deps.Handler,
+		unifi:                  deps.Unifi,
+		redpoint:               deps.Redpoint,
+		cardMapper:             deps.CardMapper,
+		syncer:                 deps.Syncer,
+		statusSyncer:           deps.StatusSyncer,
+		ingester:               deps.Ingester,
+		sessions:               deps.Sessions,
+		audit:                  deps.Audit,
+		gateID:                 deps.GateID,
+		logger:                 deps.Logger,
+		mux:                    http.NewServeMux(),
+		controlMux:             http.NewServeMux(),
+		store:                  deps.Store,
+		ui:                     deps.UI,
+		metrics:                deps.Metrics,
+		trustedProxies:         deps.TrustedProxies,
+		bg:                     deps.BG,
+		enableTestHooks:        deps.EnableTestHooks,
+		allowNewMembers:        deps.AllowNewMembers,
+		defaultAccessPolicyIDs: deps.DefaultAccessPolicyIDs,
+		htmlCache:              newHTMLCache(),
+		breakerResetter:        deps.BreakerResetter,
+		mirrorWalk:             deps.MirrorWalker,
+		uaHubMirrorRefresh:     deps.UAHubMirrorRefresher,
+		instanceName:           deps.InstanceName,
+		shadowMode:             deps.ShadowMode,
 	}
 	s.routes()
 	return s
@@ -289,14 +315,36 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /directory/status", withTimeout(shortTimeout, s.handleDirectoryStatus))
 	s.mux.HandleFunc("GET /directory/search", withTimeout(shortTimeout, s.handleDirectorySearch))
 
-	// Member management. The bridge-side "create a UA-Hub user" flow
-	// (v0.4.x–v0.5.8 /ui/members/new + POST /members) was removed in
-	// v0.5.9: UA-Hub is the source of truth for user identity, so staff
-	// create users there and the bridge auto-binds on sync (or the row
-	// lands in Needs Match for manual pairing). DELETE /members stays
-	// as the "drop from bridge cache" action and is shared by the
-	// member-table row button and the member detail panel.
+	// Member management. DELETE /members is the "drop from bridge cache"
+	// action shared by the member-table row button and the member detail
+	// panel.
 	s.mux.HandleFunc("DELETE /members/{externalId}", withTimeout(shortTimeout, s.handleRemoveMember))
+
+	// New-member provisioning (C2 Layer 4d, restored in Phase 2b).
+	// v0.5.9 deleted this flow and made "create users in the UniFi
+	// console" the doctrine — which is exactly what kept refilling the
+	// Needs Match queue, because console-created users carry no Redpoint
+	// binding. The flow below is the intended member-creation path: it
+	// live-validates the email against Redpoint, creates the UA-Hub user,
+	// attaches the default access policies, writes the ua_user_mappings
+	// row at creation time, and walks staff through the NFC enrollment
+	// tap — so the user never lands in Needs Match at all.
+	//
+	//   GET    /ui/members/new                         — form page
+	//   GET    /ui/members/new/lookup?email=…          — live email validation
+	//   POST   /ui/members/new                         — §3.2 + §3.6 + map + audit
+	//   POST   /ui/members/new/{id}/enroll             — §6.2 start enrollment
+	//   GET    /ui/members/new/{id}/enroll/{sid}/poll  — §6.3 + §6.7 + §3.7
+	//   DELETE /ui/members/new/{id}/enroll/{sid}       — §6.4 cleanup
+	//
+	// All six are gated by requireProvisioning() (AllowNewMembers=false →
+	// 403 + friendly fragment). Handlers live in members_new.go.
+	s.mux.HandleFunc("GET /ui/members/new", s.handleMembersNewPage)
+	s.mux.HandleFunc("GET /ui/members/new/lookup", withTimeout(shortTimeout, s.handleMembersNewLookup))
+	s.mux.HandleFunc("POST /ui/members/new", withTimeout(shortTimeout, s.handleMembersNewCreate))
+	s.mux.HandleFunc("POST /ui/members/new/{uaUserId}/enroll", withTimeout(shortTimeout, s.handleMembersNewEnrollStart))
+	s.mux.HandleFunc("GET /ui/members/new/{uaUserId}/enroll/{sessionId}/poll", withTimeout(shortTimeout, s.handleMembersNewEnrollPoll))
+	s.mux.HandleFunc("DELETE /ui/members/new/{uaUserId}/enroll/{sessionId}", withTimeout(shortTimeout, s.handleMembersNewEnrollCancel))
 
 	// Staff UI (auth handled by session cookies, not admin API key)
 	s.mux.HandleFunc("GET /ui", s.handleUI)
@@ -449,8 +497,6 @@ func (s *Server) routes() {
 }
 
 // ─── Health & Stats ──────────────────────────────────────────
-
-
 
 var startTime = time.Now()
 
