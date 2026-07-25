@@ -56,75 +56,60 @@ func seedExpired(t *testing.T, db *store.Store, uaUserID, reason string) {
 	}
 }
 
-// TestRunExpiryPhase_Live_DeactivatesAndAudits — the canonical path:
-// pending row expires, UA-Hub gets a PUT status=DEACTIVATED, audit row
-// appears, pending row is gone.
-func TestRunExpiryPhase_Live_DeactivatesAndAudits(t *testing.T) {
-	s, fakeUA, db := buildExpiryTestSyncer(t, false)
+// TestRunExpiryPhase_AlertOnly_NeverDeactivates — the ratified policy:
+// an overdue unmatched user is surfaced (Expired count → digest push)
+// but NEVER auto-deactivated. No UA-Hub write, no audit row, and the
+// pending row stays for staff to resolve in the Needs Match panel. A
+// wrong auto-deactivation is member-facing and not self-healing (the
+// denied-tap recheck cannot resolve an unmapped user), which is why
+// this is a hard contract in LIVE mode, not just shadow.
+func TestRunExpiryPhase_AlertOnly_NeverDeactivates(t *testing.T) {
+	s, fakeUA, db := buildExpiryTestSyncer(t, false /* live mode */)
 	seedExpired(t, db, "ua-expired", store.PendingReasonNoMatch)
 
 	r := &SyncResult{}
 	s.runExpiryPhase(context.Background(), r)
 
 	if r.Expired != 1 {
-		t.Errorf("Expired = %d, want 1", r.Expired)
+		t.Errorf("Expired = %d, want 1 (overdue count for the digest)", r.Expired)
 	}
-	if r.Deactivated != 1 {
-		t.Errorf("Deactivated = %d, want 1 (expired rollup)", r.Deactivated)
+	if r.Deactivated != 0 {
+		t.Errorf("Deactivated = %d, want 0 — expiry must never deactivate", r.Deactivated)
 	}
 	if r.Errors != 0 {
 		t.Errorf("Errors = %d, want 0", r.Errors)
 	}
-	// One UA-Hub status update should have landed.
-	if got := fakeUA.StatusUpdateCount(); got != 1 {
-		t.Errorf("UA status update count = %d, want 1", got)
+	if got := fakeUA.StatusUpdateCount(); got != 0 {
+		t.Errorf("UA status update count = %d, want 0 (alert-only)", got)
 	}
-	// Pending row gone.
-	if p, _ := db.GetPending(context.Background(), "ua-expired"); p != nil {
-		t.Errorf("pending row still present after live expiry: %+v", p)
+	if p, _ := db.GetPending(context.Background(), "ua-expired"); p == nil {
+		t.Error("pending row was removed; must stay for staff to resolve")
 	}
-	// Audit row written with the expected shape.
 	audits, _ := db.ListMatchAudit(context.Background(), "ua-expired", 0)
-	if len(audits) != 1 {
-		t.Fatalf("audits = %d, want 1", len(audits))
-	}
-	a := audits[0]
-	if a.Field != "user_status" || a.BeforeVal != "ACTIVE" || a.AfterVal != "DEACTIVATED" {
-		t.Errorf("audit = %+v", a)
-	}
-	if a.Source != MatchSourceBridgeExpiry {
-		t.Errorf("audit.Source = %q, want %q", a.Source, MatchSourceBridgeExpiry)
+	if len(audits) != 0 {
+		t.Errorf("audits = %d, want 0 (no mutation happened)", len(audits))
 	}
 }
 
-// TestRunExpiryPhase_Shadow_NoSideEffects — in shadow mode the decision
-// counter still increments (so dashboards show what live would do) but
-// UA-Hub is never touched, the pending row stays, and no audit row is
-// written. This is what lets an operator flip shadow off and have the
-// next sync re-find the row and actually execute the deactivation.
-func TestRunExpiryPhase_Shadow_NoSideEffects(t *testing.T) {
+// TestRunExpiryPhase_Shadow_SameAsLive — alert-only expiry behaves
+// identically in shadow and live mode (there is no mutation for shadow
+// to suppress); this pins that flipping modes can't change expiry
+// behaviour.
+func TestRunExpiryPhase_Shadow_SameAsLive(t *testing.T) {
 	s, fakeUA, db := buildExpiryTestSyncer(t, true)
 	seedExpired(t, db, "ua-shadow", store.PendingReasonAmbiguousEmail)
 
 	r := &SyncResult{}
 	s.runExpiryPhase(context.Background(), r)
 
-	if r.Expired != 1 || r.Deactivated != 1 {
-		t.Errorf("counters = Expired %d / Deactivated %d; want 1/1", r.Expired, r.Deactivated)
+	if r.Expired != 1 || r.Deactivated != 0 {
+		t.Errorf("counters = Expired %d / Deactivated %d; want 1/0", r.Expired, r.Deactivated)
 	}
-	if r.Errors != 0 {
-		t.Errorf("Errors = %d, want 0", r.Errors)
-	}
-	// Shadow contract invariants:
 	if got := fakeUA.StatusUpdateCount(); got != 0 {
 		t.Errorf("shadow mode sent %d UniFi update(s); want 0", got)
 	}
 	if p, _ := db.GetPending(context.Background(), "ua-shadow"); p == nil {
-		t.Error("shadow mode deleted the pending row; must be preserved for flip-to-live")
-	}
-	audits, _ := db.ListMatchAudit(context.Background(), "ua-shadow", 0)
-	if len(audits) != 0 {
-		t.Errorf("shadow mode wrote %d audit row(s); want 0 (no mutation landed)", len(audits))
+		t.Error("pending row must be preserved")
 	}
 }
 
@@ -154,8 +139,8 @@ func TestRunExpiryPhase_NotYetExpired_Ignored(t *testing.T) {
 	}
 }
 
-// TestRunExpiryPhase_MultipleRows — two rows expire, both get processed,
-// counters reflect the batch.
+// TestRunExpiryPhase_MultipleRows — two overdue rows both surface in the
+// count; neither is touched.
 func TestRunExpiryPhase_MultipleRows(t *testing.T) {
 	s, fakeUA, db := buildExpiryTestSyncer(t, false)
 	seedExpired(t, db, "ua-A", store.PendingReasonNoEmail)
@@ -164,11 +149,11 @@ func TestRunExpiryPhase_MultipleRows(t *testing.T) {
 	r := &SyncResult{}
 	s.runExpiryPhase(context.Background(), r)
 
-	if r.Expired != 2 || r.Deactivated != 2 {
-		t.Errorf("counters = Expired %d / Deactivated %d; want 2/2", r.Expired, r.Deactivated)
+	if r.Expired != 2 || r.Deactivated != 0 {
+		t.Errorf("counters = Expired %d / Deactivated %d; want 2/0", r.Expired, r.Deactivated)
 	}
-	if got := fakeUA.StatusUpdateCount(); got != 2 {
-		t.Errorf("UA updates = %d, want 2", got)
+	if got := fakeUA.StatusUpdateCount(); got != 0 {
+		t.Errorf("UA updates = %d, want 0 (alert-only)", got)
 	}
 }
 

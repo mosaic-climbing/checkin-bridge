@@ -375,22 +375,26 @@ func TestRunSync_LegacyNFCStatusLoopDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunSync: %v", err)
 	}
+	// With the legacy loop disabled the mapping-driven pass runs instead.
+	// This UA user has a members row keyed by NFC token but NO mapping
+	// row, so the mapping pass has no opinion on them: counted Unmatched,
+	// nothing written. The legacy pass would have Matched + Deactivated
+	// via the token — the exact half-populated-cache noise the gate
+	// exists to silence.
 	if result.Matched != 0 {
-		t.Errorf("Matched = %d, want 0 when legacy loop disabled", result.Matched)
+		t.Errorf("Matched = %d, want 0 (no mapping row exists)", result.Matched)
 	}
 	if result.Deactivated != 0 {
-		t.Errorf("Deactivated = %d, want 0 when legacy loop disabled", result.Deactivated)
+		t.Errorf("Deactivated = %d, want 0 (unmapped user must be left alone)", result.Deactivated)
 	}
 	if result.Activated != 0 {
-		t.Errorf("Activated = %d, want 0 when legacy loop disabled", result.Activated)
+		t.Errorf("Activated = %d, want 0", result.Activated)
 	}
 	if result.Unchanged != 0 {
-		t.Errorf("Unchanged = %d, want 0 when legacy loop disabled", result.Unchanged)
+		t.Errorf("Unchanged = %d, want 0", result.Unchanged)
 	}
-	if result.Unmatched != 0 {
-		// Step 2 is the only contributor to Unmatched today. With the
-		// gate tripped, this counter must stay at zero.
-		t.Errorf("Unmatched = %d, want 0 when legacy loop disabled", result.Unmatched)
+	if result.Unmatched != 1 {
+		t.Errorf("Unmatched = %d, want 1 (the unmapped UA user)", result.Unmatched)
 	}
 	if got := fakeUnifi.StatusUpdateCount(); got != 0 {
 		t.Errorf("legacy-disabled sync sent %d UniFi status update(s); want 0", got)

@@ -114,15 +114,22 @@ func logBootBanner(logger *slog.Logger, cfg *config.Config) {
 		logger.Warn("╚══════════════════════════════════════════════╝")
 	}
 
-	if cfg.Bridge.ShadowMode {
+	// Per-capability live/shadow report — the go-live trust ladder means
+	// "shadow" is no longer all-or-nothing, so the banner states each
+	// capability's resolved mode explicitly. The old single SHADOW box
+	// implied all three were coupled; these lines are what an operator
+	// greps to confirm which rung the deployment is on.
+	recording := cfg.Bridge.CheckinRecordingLive()
+	statusWrites := cfg.Bridge.StatusWritesMode()
+	recheckUnlock := cfg.Bridge.RecheckUnlockLive()
+	if !recording || statusWrites != "full" || !recheckUnlock {
 		logger.Warn("╔══════════════════════════════════════════════╗")
-		logger.Warn("║  SHADOW MODE ACTIVE                          ║")
-		logger.Warn("║  • No door unlocks will be sent to UniFi     ║")
-		logger.Warn("║  • No check-ins will be recorded in Redpoint ║")
-		logger.Warn("║  • No UniFi user status changes will be made ║")
-		logger.Warn("║  All decisions are logged only.              ║")
+		logger.Warn("║  NOT FULLY LIVE — capability report below    ║")
 		logger.Warn("╚══════════════════════════════════════════════╝")
 	}
+	logger.Warn("capability: redpoint check-in recording", "live", recording)
+	logger.Warn("capability: UA-Hub status writes", "mode", statusWrites)
+	logger.Warn("capability: recheck-reactivation unlock", "live", recheckUnlock)
 
 	logger.Info("config loaded",
 		"unifiHost", cfg.UniFi.Host,

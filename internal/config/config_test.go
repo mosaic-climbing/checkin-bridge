@@ -475,3 +475,131 @@ func TestNonSecretHash_IgnoresNotifyCapabilities(t *testing.T) {
 		t.Error("NonSecretHash should vary with NtfyURL (non-secret)")
 	}
 }
+
+func TestCapabilityFlags_ResolutionFromShadowMode(t *testing.T) {
+	// Empty overrides inherit from ShadowMode so every pre-split .env is
+	// behavior-identical: shadow=true → everything held, shadow=false →
+	// everything live.
+	b := BridgeConfig{ShadowMode: true}
+	if b.CheckinRecordingLive() || b.RecheckUnlockLive() {
+		t.Error("shadow=true must hold recording + recheck-unlock by default")
+	}
+	if got := b.StatusWritesMode(); got != "off" {
+		t.Errorf("StatusWritesMode = %q, want off", got)
+	}
+
+	b = BridgeConfig{ShadowMode: false}
+	if !b.CheckinRecordingLive() || !b.RecheckUnlockLive() {
+		t.Error("shadow=false must default recording + recheck-unlock live")
+	}
+	if got := b.StatusWritesMode(); got != "full" {
+		t.Errorf("StatusWritesMode = %q, want full", got)
+	}
+}
+
+func TestCapabilityFlags_ExplicitOverridesBeatShadow(t *testing.T) {
+	// The trust ladder: master shadow stays on, capabilities flip live
+	// one at a time.
+	b := BridgeConfig{
+		ShadowMode:           true,
+		LiveCheckinRecording: "true",
+		LiveStatusWrites:     "activate-only",
+	}
+	if !b.CheckinRecordingLive() {
+		t.Error("explicit LiveCheckinRecording=true must override shadow")
+	}
+	if got := b.StatusWritesMode(); got != "activate-only" {
+		t.Errorf("StatusWritesMode = %q, want activate-only", got)
+	}
+	if b.RecheckUnlockLive() {
+		t.Error("recheck-unlock has no override here; must inherit held from shadow")
+	}
+
+	// And the inverse: explicit "false"/"off" can hold a capability even
+	// with shadow off (e.g. permanently retiring a capability).
+	b = BridgeConfig{ShadowMode: false, LiveRecheckUnlock: "false", LiveStatusWrites: "off"}
+	if b.RecheckUnlockLive() {
+		t.Error("explicit LiveRecheckUnlock=false must override live default")
+	}
+	if got := b.StatusWritesMode(); got != "off" {
+		t.Errorf("StatusWritesMode = %q, want off", got)
+	}
+}
+
+func TestValidation_CapabilityFlagValues(t *testing.T) {
+	base := func() *Config {
+		cfg := defaults()
+		cfg.UniFi.APIToken = "tok"
+		cfg.Redpoint.APIKey = "key"
+		cfg.Bridge.StaffPassword = "pass"
+		cfg.Bridge.AdminAPIKey = "adminkey"
+		cfg.Bridge.ControlPort = cfg.Bridge.Port + 1
+		return cfg
+	}
+
+	// Valid values all pass.
+	cfg := base()
+	cfg.Bridge.LiveCheckinRecording = "true"
+	cfg.Bridge.LiveStatusWrites = "activate-only"
+	cfg.Bridge.LiveRecheckUnlock = "false"
+	if err := validate(cfg); err != nil {
+		t.Errorf("validate(valid capability values) = %v, want nil", err)
+	}
+
+	// Typos fail loud at boot.
+	cfg = base()
+	cfg.Bridge.LiveStatusWrites = "activateonly"
+	if err := validate(cfg); err == nil {
+		t.Error("validate accepted a typo'd BRIDGE_LIVE_STATUS_WRITES")
+	}
+	cfg = base()
+	cfg.Bridge.LiveCheckinRecording = "yes"
+	if err := validate(cfg); err == nil {
+		t.Error("validate accepted a typo'd BRIDGE_LIVE_CHECKIN_RECORDING")
+	}
+	cfg = base()
+	cfg.Bridge.LiveRecheckUnlock = "1"
+	if err := validate(cfg); err == nil {
+		t.Error("validate accepted a typo'd BRIDGE_LIVE_RECHECK_UNLOCK")
+	}
+}
+
+func TestValidation_StageCannotEnableLiveCapabilities(t *testing.T) {
+	// The staging invariant, per-capability edition: stage observes,
+	// prod acts. A stage .env that overrides any capability to live must
+	// refuse to boot.
+	base := func() *Config {
+		cfg := defaults()
+		cfg.UniFi.APIToken = "tok"
+		cfg.Redpoint.APIKey = "key"
+		cfg.Bridge.StaffPassword = "pass"
+		cfg.Bridge.AdminAPIKey = "adminkey"
+		cfg.Bridge.ControlPort = cfg.Bridge.Port + 1
+		cfg.Bridge.InstanceName = "stage"
+		cfg.Bridge.ShadowMode = true
+		return cfg
+	}
+
+	if err := validate(base()); err != nil {
+		t.Fatalf("plain stage config should validate, got %v", err)
+	}
+	for _, mutate := range []func(*Config){
+		func(c *Config) { c.Bridge.LiveCheckinRecording = "true" },
+		func(c *Config) { c.Bridge.LiveStatusWrites = "activate-only" },
+		func(c *Config) { c.Bridge.LiveStatusWrites = "full" },
+		func(c *Config) { c.Bridge.LiveRecheckUnlock = "true" },
+	} {
+		cfg := base()
+		mutate(cfg)
+		if err := validate(cfg); err == nil {
+			t.Errorf("stage instance with a live capability override validated; must refuse")
+		}
+	}
+	// Explicit holds are fine on stage.
+	cfg := base()
+	cfg.Bridge.LiveStatusWrites = "off"
+	cfg.Bridge.LiveCheckinRecording = "false"
+	if err := validate(cfg); err != nil {
+		t.Errorf("stage with explicit holds should validate, got %v", err)
+	}
+}

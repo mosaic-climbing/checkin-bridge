@@ -87,14 +87,17 @@ func TestFullCheckInFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create check-in handler
+	// Create check-in handler. CheckinRecordingLive matches the
+	// pre-capability-split live default — this test asserts the Redpoint
+	// write actually lands.
 	handler := checkin.NewHandler(checkin.HandlerDeps{
-		UniFi:      unifiClient,
-		Redpoint:   redpointClient,
-		CardMapper: cardMapper,
-		Store:      db,
-		GateID:     "gate-1",
-		Logger:     logger,
+		UniFi:                unifiClient,
+		Redpoint:             redpointClient,
+		CardMapper:           cardMapper,
+		Store:                db,
+		GateID:               "gate-1",
+		CheckinRecordingLive: true,
+		Logger:               logger,
 	})
 
 	// Verify initial state

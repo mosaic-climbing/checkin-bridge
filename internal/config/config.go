@@ -98,6 +98,36 @@ type BridgeConfig struct {
 	ControlBindAddr  string `json:"controlBindAddr"`  // default: "127.0.0.1"; set "" to mirror BindAddr
 	ShadowMode       bool   `json:"shadowMode"`       // if true: no door unlocks, no Redpoint writes, no UniFi status writes
 
+	// ── Per-capability live flags (the go-live trust ladder) ─────
+	//
+	// ShadowMode above is the master switch, but going live is not one
+	// jump: the ladder flips capabilities on one at a time, each gated on
+	// shadow evidence, each rolled back with one .env line. The three
+	// flags below override the master per capability. Empty string means
+	// "inherit from ShadowMode" (live when shadow is off, held when
+	// shadow is on) so every existing .env is behavior-identical.
+	//
+	// The intended live-flip sequence, per docs/architecture-review.md
+	// and the revival plan:
+	//   1. LIVE_CHECKIN_RECORDING=true  — taps land in Redpoint. Zero
+	//      member-facing risk.
+	//   2. LIVE_STATUS_WRITES=activate-only — renewals regain UA-Hub
+	//      access automatically; can't lock anyone out.
+	//   3. LIVE_STATUS_WRITES=full — lapsed members lose access within a
+	//      sync cycle (mass-deactivation guard applies).
+	//   4. LIVE_RECHECK_UNLOCK=true — the only door-touching capability:
+	//      denied tap + live Redpoint confirm → reactivate + unlock.
+	//
+	// Staff-UI mutations (manual unlock, reactivate, reassign, skip)
+	// remain governed by the master ShadowMode.
+
+	// LiveCheckinRecording: ""|"true"|"false". Env: BRIDGE_LIVE_CHECKIN_RECORDING.
+	LiveCheckinRecording string `json:"liveCheckinRecording"`
+	// LiveStatusWrites: ""|"off"|"activate-only"|"full". Env: BRIDGE_LIVE_STATUS_WRITES.
+	LiveStatusWrites string `json:"liveStatusWrites"`
+	// LiveRecheckUnlock: ""|"true"|"false". Env: BRIDGE_LIVE_RECHECK_UNLOCK.
+	LiveRecheckUnlock string `json:"liveRecheckUnlock"`
+
 	// InstanceName tags this process as "prod" (the default) or "stage". The
 	// value is surfaced in /health so an operator can tell at a glance which
 	// instance they've reached, and it acts as a runtime guard against
@@ -340,6 +370,9 @@ func applyEnvOverrides(cfg *Config) {
 	envInt(&cfg.Bridge.ControlPort, "BRIDGE_CONTROL_PORT")
 	envStr(&cfg.Bridge.ControlBindAddr, "BRIDGE_CONTROL_BIND_ADDR")
 	envBool(&cfg.Bridge.ShadowMode, "BRIDGE_SHADOW_MODE")
+	envStr(&cfg.Bridge.LiveCheckinRecording, "BRIDGE_LIVE_CHECKIN_RECORDING")
+	envStr(&cfg.Bridge.LiveStatusWrites, "BRIDGE_LIVE_STATUS_WRITES")
+	envStr(&cfg.Bridge.LiveRecheckUnlock, "BRIDGE_LIVE_RECHECK_UNLOCK")
 	envStr(&cfg.Bridge.InstanceName, "BRIDGE_INSTANCE_NAME")
 	envBool(&cfg.Bridge.LegacyNFCStatusLoop, "BRIDGE_LEGACY_NFC_STATUS_LOOP")
 	envDuration(&cfg.Bridge.RecheckMaxStaleness, "BRIDGE_RECHECK_MAX_STALENESS")
@@ -426,7 +459,68 @@ func validate(cfg *Config) error {
 	if cfg.Bridge.InstanceName == "stage" && !cfg.Bridge.ShadowMode {
 		return fmt.Errorf("BRIDGE_INSTANCE_NAME=stage requires BRIDGE_SHADOW_MODE=true (refusing to boot a non-shadow stage instance — it would issue real door unlocks against prod's UniFi WebSocket)")
 	}
+	// Stage must also not override capabilities to live — same invariant,
+	// per-capability edition. A typo'd value fails loud at boot rather
+	// than silently inheriting.
+	switch cfg.Bridge.LiveCheckinRecording {
+	case "", "true", "false":
+	default:
+		return fmt.Errorf("BRIDGE_LIVE_CHECKIN_RECORDING must be \"\", \"true\", or \"false\" (got %q)", cfg.Bridge.LiveCheckinRecording)
+	}
+	switch cfg.Bridge.LiveStatusWrites {
+	case "", "off", "activate-only", "full":
+	default:
+		return fmt.Errorf("BRIDGE_LIVE_STATUS_WRITES must be \"\", \"off\", \"activate-only\", or \"full\" (got %q)", cfg.Bridge.LiveStatusWrites)
+	}
+	switch cfg.Bridge.LiveRecheckUnlock {
+	case "", "true", "false":
+	default:
+		return fmt.Errorf("BRIDGE_LIVE_RECHECK_UNLOCK must be \"\", \"true\", or \"false\" (got %q)", cfg.Bridge.LiveRecheckUnlock)
+	}
+	if cfg.Bridge.InstanceName == "stage" {
+		if cfg.Bridge.LiveCheckinRecording == "true" || cfg.Bridge.LiveRecheckUnlock == "true" ||
+			cfg.Bridge.LiveStatusWrites == "activate-only" || cfg.Bridge.LiveStatusWrites == "full" {
+			return fmt.Errorf("BRIDGE_INSTANCE_NAME=stage cannot enable live capabilities (found a live BRIDGE_LIVE_* override) — stage observes, prod acts")
+		}
+	}
 	return nil
+}
+
+// CheckinRecordingLive resolves the check-in-recording capability:
+// explicit override wins, otherwise inherit liveness from !ShadowMode.
+func (b BridgeConfig) CheckinRecordingLive() bool {
+	switch b.LiveCheckinRecording {
+	case "true":
+		return true
+	case "false":
+		return false
+	}
+	return !b.ShadowMode
+}
+
+// StatusWritesMode resolves the UA-Hub status-write capability to one of
+// "off", "activate-only", or "full".
+func (b BridgeConfig) StatusWritesMode() string {
+	if b.LiveStatusWrites != "" {
+		return b.LiveStatusWrites
+	}
+	if b.ShadowMode {
+		return "off"
+	}
+	return "full"
+}
+
+// RecheckUnlockLive resolves the recheck-reactivation capability (the
+// only door-touching one): explicit override wins, otherwise inherit
+// from !ShadowMode.
+func (b BridgeConfig) RecheckUnlockLive() bool {
+	switch b.LiveRecheckUnlock {
+	case "true":
+		return true
+	case "false":
+		return false
+	}
+	return !b.ShadowMode
 }
 
 // ParseHHMM parses a "HH:MM" string into hour (0-23) and minute (0-59).

@@ -164,8 +164,9 @@ func Build(ctx context.Context, opts BuildOptions) (*App, error) {
 			SyncTimeLocal:       cfg.Sync.TimeLocal,
 			UnmatchedGraceDays:  cfg.Bridge.UnmatchedGraceDays,
 			LegacyNFCStatusLoop: cfg.Bridge.LegacyNFCStatusLoop,
+			StatusWrites:        cfg.Bridge.StatusWritesMode(),
 			OnRunComplete: syncDigest(notifier, opts.Version, cfg.NonSecretHash(),
-				cfg.Bridge.ShadowMode),
+				cfg.Bridge.StatusWritesMode()),
 		},
 		cfg.Bridge.ShadowMode,
 		met,
@@ -174,7 +175,11 @@ func Build(ctx context.Context, opts BuildOptions) (*App, error) {
 
 	rechecker := recheck.New(db, redpointClient, unifiClient, recheck.Config{
 		MaxStaleness: cfg.Bridge.RecheckMaxStaleness,
-		ShadowMode:   cfg.Bridge.ShadowMode,
+		// The recheck-reactivation unlock is rung 4 of the go-live ladder
+		// — the only capability that physically opens the door. Its
+		// shadow gate resolves from BRIDGE_LIVE_RECHECK_UNLOCK, falling
+		// back to the master shadow flag.
+		ShadowMode: !cfg.Bridge.RecheckUnlockLive(),
 		// Breaker transitions fire on the tap-time path; the hook contract
 		// requires a prompt return, so the notification POST is dispatched
 		// to a short-lived goroutine. Not routed through bg.Group: a 10s
@@ -194,15 +199,16 @@ func Build(ctx context.Context, opts BuildOptions) (*App, error) {
 	}, logger.With("component", "recheck"))
 
 	handler := checkin.NewHandler(checkin.HandlerDeps{
-		UniFi:      unifiClient,
-		Redpoint:   redpointClient,
-		CardMapper: cardMapper,
-		Store:      db,
-		Rechecker:  rechecker,
-		Metrics:    met,
-		GateID:     cfg.Redpoint.GateID,
-		ShadowMode: cfg.Bridge.ShadowMode,
-		Logger:     logger.With("component", "checkin"),
+		UniFi:                unifiClient,
+		Redpoint:             redpointClient,
+		CardMapper:           cardMapper,
+		Store:                db,
+		Rechecker:            rechecker,
+		Metrics:              met,
+		GateID:               cfg.Redpoint.GateID,
+		ShadowMode:           cfg.Bridge.ShadowMode,
+		CheckinRecordingLive: cfg.Bridge.CheckinRecordingLive(),
+		Logger:               logger.With("component", "checkin"),
 	})
 
 	// ── Session manager ──────────────────────────────────────
@@ -562,20 +568,19 @@ func startOfTodayLocal() time.Time {
 // the operator's routine touchpoint — with 1-3 runs/day it doubles as
 // the "daily digest" the alerting design calls for, and its absence
 // (caught by the watchdog's staleness check) is itself a signal.
-func syncDigest(notifier *notify.Notifier, version, configHash string, shadowMode bool) func(*statusync.SyncResult, error) {
+//
+// statusWrites is the resolved capability mode ("off"/"activate-only"/
+// "full") so the digest states what the counters MEANT: in "off",
+// activated/deactivated are decisions only.
+func syncDigest(notifier *notify.Notifier, version, configHash, statusWrites string) func(*statusync.SyncResult, error) {
 	return func(res *statusync.SyncResult, err error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 
-		mode := "live"
-		if shadowMode {
-			mode = "shadow"
-		}
-
 		if err != nil {
 			_ = notifier.Send(ctx, notify.Event{
 				Title:    "Status sync FAILED",
-				Body:     fmt.Sprintf("error: %v\nmode: %s · %s (%s)", err, mode, version, configHash),
+				Body:     fmt.Sprintf("error: %v\nstatus-writes: %s · %s (%s)", err, statusWrites, version, configHash),
 				Priority: notify.PriorityHigh,
 				Tags:     []string{"rotating_light", "arrows_counterclockwise"},
 			})
@@ -585,16 +590,24 @@ func syncDigest(notifier *notify.Notifier, version, configHash string, shadowMod
 		priority := notify.PriorityDefault
 		tags := []string{"arrows_counterclockwise"}
 		title := "Status sync complete"
-		if res.Errors > 0 {
+		switch {
+		case res.GuardTripped:
+			// The single scariest signal this digest can carry: the run
+			// wanted to deactivate more users than the cap and held all
+			// of them. Usually a bad/partial directory sync.
+			priority = notify.PriorityUrgent
+			tags = []string{"rotating_light", "no_entry"}
+			title = fmt.Sprintf("Status sync HELD %d deactivations (mass-deactivation guard)", res.HeldDeactivations)
+		case res.Errors > 0:
 			priority = notify.PriorityHigh
 			tags = []string{"warning", "arrows_counterclockwise"}
 			title = fmt.Sprintf("Status sync completed with %d errors", res.Errors)
 		}
 		body := fmt.Sprintf(
-			"UA users: %d · activated: %d · deactivated: %d · unchanged: %d\nmatched now: %d · newly pending: %d · expired: %d · errors: %d\nmode: %s · took %s · %s (%s)",
-			res.UniFiUsers, res.Activated, res.Deactivated, res.Unchanged,
-			res.NewlyMatched, res.NewlyPending, res.Expired, res.Errors,
-			mode, res.Duration, version, configHash,
+			"UA users: %d · activated: %d · deactivated: %d (held: %d) · unchanged: %d\nmatched: %d · newly pending: %d · past-grace unmatched: %d · no-cache: %d · errors: %d\nstatus-writes: %s · took %s · %s (%s)",
+			res.UniFiUsers, res.Activated, res.Deactivated, res.HeldDeactivations, res.Unchanged,
+			res.Matched, res.NewlyPending, res.Expired, res.MappedNoCache, res.Errors,
+			statusWrites, res.Duration, version, configHash,
 		)
 		_ = notifier.Send(ctx, notify.Event{Title: title, Body: body, Priority: priority, Tags: tags})
 	}

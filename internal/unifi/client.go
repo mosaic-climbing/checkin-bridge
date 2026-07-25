@@ -92,13 +92,28 @@ type AccessEvent struct {
 	CredentialID string `json:"credentialId"`
 	AuthType     string `json:"authType"` // NFC, PIN_CODE, MOBILE, etc.
 	Result       string `json:"result"`   // ACCESS, BLOCKED
-	// IsBackfill is true when the event was fetched from the REST access
-	// log during a reconnect-time replay OR by the steady-state poller
-	// rather than streamed live. The check-in handler still records it
-	// for audit purposes but must NOT unlock the door or create a new
+	// IsBackfill is true when the event is a REPLAY of the past: fetched
+	// during a reconnect-time catch-up, the poller's boot sweep, or a
+	// poller fetch whose event timestamp is older than the freshness
+	// window. The check-in handler still records backfill events for
+	// audit purposes but must NOT unlock the door or create a new
 	// Redpoint record — the door already had its chance at tap time and
 	// the member is either inside or long gone.
+	//
+	// A poller event within the freshness window (a tap seconds ago) has
+	// IsBackfill=false: it is the live tap stream on firmware where the
+	// WebSocket no longer carries taps, and live-mode Redpoint recording
+	// and the denied-tap recheck depend on it being marked live.
 	IsBackfill bool `json:"isBackfill,omitempty"`
+
+	// ViaPoller is true for every event delivered by the REST system-log
+	// poller, fresh or backfill. UA-Hub has already made its own
+	// allow/deny decision (and opened the door on ACCESS) by the time a
+	// polled event reaches the bridge, so the handler's main-path door
+	// unlock is always redundant for these — it keys on this flag rather
+	// than IsBackfill. The deliberate recheck-reactivation unlock is a
+	// separate path and ignores this flag.
+	ViaPoller bool `json:"viaPoller,omitempty"`
 }
 
 // Door represents a door configured in UniFi Access.
@@ -1240,13 +1255,21 @@ func parseAccessLogEntry(hit map[string]any) AccessEvent {
 // This method is a supervised blocking loop: it returns when ctx is
 // cancelled. Start it under bg.Group.Go so shutdown drains cleanly.
 //
-// Why IsBackfill for every poller event, not just the initial catch-up:
+// Flag semantics per event: every polled event carries ViaPoller=true —
 // the physical door has already opened (or been denied) by the UA-Hub
-// at the moment the tap happened — otherwise the event wouldn't be in
-// the system log at all. Issuing a downstream UnlockDoor from the
-// bridge would at best be a no-op and at worst double-open the door
-// at a time the member has already left. Handlers use IsBackfill as
-// the "record-only, no side-effects" gate.
+// at the moment the tap happened, so the bridge's main-path unlock is
+// always redundant for these and handlers suppress it on ViaPoller.
+// IsBackfill is per-event freshness: events younger than
+// pollFreshnessWindow are live (Redpoint recording + denied-tap recheck
+// apply in live mode), older ones (the boot sweep, outage catch-up) are
+// record-only replays.
+// pollFreshnessWindow is how old a polled event may be and still count
+// as live (IsBackfill=false). Sized to cover the 5s poll interval plus
+// the 30s cursor lookback plus clock skew between the bridge and the
+// UA-Hub: a tap the member just made always lands inside it, while the
+// boot sweep's since-midnight replay always falls outside.
+const pollFreshnessWindow = 45 * time.Second
+
 func (c *Client) StartEventPoller(ctx context.Context, since time.Time, interval time.Duration) error {
 	if interval <= 0 {
 		interval = 5 * time.Second
@@ -1331,8 +1354,22 @@ func (c *Client) pollOnce(ctx context.Context, cursorTime *time.Time, maxLogID *
 
 		// Track cursor in time as a secondary index in case LogID is
 		// absent. Parse the RFC3339 timestamp; tolerate parse failure.
-		if t, perr := time.Parse(time.RFC3339, ev.Timestamp); perr == nil && t.After(*cursorTime) {
-			*cursorTime = t
+		eventTime, terr := time.Parse(time.RFC3339, ev.Timestamp)
+		if terr == nil && eventTime.After(*cursorTime) {
+			*cursorTime = eventTime
+		}
+
+		// Freshness: FetchAccessLogsSince marks everything IsBackfill;
+		// re-mark events younger than the freshness window as live. On
+		// tap-carrying-poller firmware this IS the live tap stream —
+		// leaving it all-backfill would permanently disable Redpoint
+		// check-in recording and the denied-tap recheck. An unparseable
+		// timestamp stays backfill (conservative: replaying is safe,
+		// treating stale as live is not). The boot sweep's since-midnight
+		// events fall outside the window and stay backfill.
+		ev.ViaPoller = true
+		if terr == nil && time.Since(eventTime) <= pollFreshnessWindow {
+			ev.IsBackfill = false
 		}
 
 		c.lastEventAt.Store(time.Now())
