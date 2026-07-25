@@ -101,7 +101,7 @@ Branch name prefixes (loose, not enforced):
 - `chore/` — deps, tooling, CI, non-code
 - `docs/` — docs only
 
-**Small/urgent fixes** (one-line typo, trivial doc fix) can go straight to `main`. Use judgment.
+**Everything goes through a PR** — even one-line typo fixes. Never push to `main` directly; branch protection enforces this, and the squash-merge history is worth the extra minute.
 
 **Squash-merge on PR merge.** Keeps the `main` log linear and revert-friendly — one commit per logical change, so `git revert <sha>` rolls back cleanly without untangling a chain of WIP commits.
 
@@ -191,9 +191,11 @@ Don't remove shadow mode without replacing it with an equivalent safety. It's th
 
 ---
 
-## Staging
+## Staging (optional escape hatch — no soak rule)
 
-Staging is a second bridge instance that runs side-by-side with prod on the gym MacBook, observing the same UA-Hub WebSocket and the same Redpoint org but with `BRIDGE_SHADOW_MODE=true` so it never issues a real door unlock or Redpoint write. Its purpose is to catch behavioural regressions — bugs that compile, pass `go test`, and survive the post-deploy `/health` probe but make the wrong decision on a real tap. The auto-rollback in `update.sh` doesn't catch that class; staging does.
+Staging is a second bridge instance that can run side-by-side with prod on the gym MacBook, observing the same UA-Hub feed and the same Redpoint org but with `BRIDGE_SHADOW_MODE=true` so it never issues a real door unlock or Redpoint write. Use it **only** when a change is scary enough to want a dress rehearsal — e.g. rewiring the tap-decision path or the status-sync writes.
+
+**There is no mandatory soak.** The normal path for every change is: PR → CI green → squash-merge → `make release-tag` → the prod auto-updater installs it hands-free (SHA256 verify, `/health` probe, automatic rollback to `.prev` on failure). Behavioural safety comes from the capability-flag rungs (shadow-by-default writes, staged go-live) and push alerting, not from a human watching staging logs for 24 hours. That rule existed before alerting did, and in practice it stalled every iteration; it is retired.
 
 ### Layout
 
@@ -212,42 +214,16 @@ The pair `(BRIDGE_INSTANCE_NAME=stage, BRIDGE_SHADOW_MODE=true)` is the staging 
 2. `stage-update.sh` — the installer fails preflight if the pair is broken in `.env.stage`.
 3. The deployed plist points at `/usr/local/mosaic-bridge-stage/mosaic-bridge`, so prod's binary can't accidentally serve the stage label.
 
-### Per-PR workflow (24h soak rule)
-
-Non-trivial changes — anything bigger than a docs tweak or a typo fix — must soak on staging for **at least 24 hours** before merging to `main`. The 24h window must include at least one peak-hours session at the gym, since that's when real tap traffic exercises the WebSocket and Redpoint paths.
+### Using staging (when you opt in)
 
 ```bash
-git checkout -b feat/something
-# ... commits ...
-git push -u origin feat/something
-gh pr create --fill                  # CI runs
-
-# After CI green:
-make deploy-stage GYM=$GYM           # pulls the CI artifact, deploys to stage
-
-# During the soak:
+# After the PR's CI is green:
+make deploy-stage GYM=$GYM           # pulls the CI artifact for the branch, deploys to stage
 make stage-status GYM=$GYM           # /health + tail of bridge.log
-ssh $GYM 'tail -F /usr/local/mosaic-bridge-stage/bridge.log'
-
-# If clean after 24h + a peak window:
-gh pr merge --squash --delete-branch
-make release-tag VERSION=vX.Y.Z
-make deploy GYM=$GYM TAG=vX.Y.Z
+make stage-rollback GYM=$GYM         # revert stage to its .prev binary
 ```
 
-`make deploy-stage` uses `gh run download` to fetch the CI-built `mosaic-bridge-darwin-arm64` artifact for the current branch. CI must have completed successfully for the branch (the workflow runs on PRs against `main`, so open the PR first). `make deploy-stage-local` is the escape hatch for hot debugging — it builds locally and ships, bypassing CI. Use sparingly; the whole point of `deploy-stage` is that staging runs *exactly* what prod will eventually run.
-
-### Trivial changes that can skip the soak
-
-- Pure docs/comment edits with no code behavior change.
-- Test-only changes that don't ship in the binary (e.g. adding a unit test).
-- Build/CI tooling changes that don't alter the bridge binary (`Makefile` non-deploy targets, workflow tweaks unrelated to building).
-
-Everything else — including changes that "should" be safe — soaks. The whole point of having staging is to catch the changes that should have been safe.
-
-### Recovering a broken stage
-
-`make stage-rollback` reverts the staging install dir to its `.prev` binary. Use this when a deploy lands but you immediately notice the staging logs showing wrong decisions; rolling back gives you a known-good staging environment to re-soak the next attempt against. It's symmetric with `update.sh rollback` for prod.
+`make deploy-stage` uses `gh run download` to fetch the CI-built `mosaic-bridge-darwin-arm64` artifact for the current branch (open the PR first — the workflow runs on PRs against `main`). `make deploy-stage-local` builds locally and ships, bypassing CI, for hot debugging only. Watch it as long as you actually need to — minutes for most changes — then merge.
 
 ---
 
