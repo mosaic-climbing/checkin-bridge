@@ -586,49 +586,24 @@ For offsite copy, add a follow-up step that `rsync`s `backups/` to a NAS, to iCl
 
 ---
 
-### Minimal health monitoring
+### Health monitoring + push alerting
 
-With only one box, the failure mode you care about most is "the service stopped and nobody noticed." A plain cron-like health check is enough for now — you can graduate to a real alerting tool later.
+Alerting is layered so each layer catches what the one below it can't:
+
+1. **In-process watchdog** (ships in the binary): checks sync staleness and tap-poller staleness every 5 minutes, pushes to your phone via [ntfy](https://ntfy.sh), and pings a healthchecks.io dead-man URL. Configure `NTFY_TOPIC` (and optionally `HEARTBEAT_URL`) in `.env` — see `.env.shadow.example` for the details. Sync digests, breaker trips, and deploy results all go to the same topic.
+2. **External /health probe** (`deploy/macbook/healthcheck.sh`, committed): catches a dead or wedged bridge *process* — which the in-process watchdog obviously can't report. Reads the same `NTFY_*` values from `.env`.
+3. **healthchecks.io dead-man**: catches a dead *MacBook* or dead network — which neither on-machine layer can report. Create a free check with a ~15-minute grace period and put its ping URL in `HEARTBEAT_URL`.
+
+Install the probe layer:
 
 ```
-# Write an alerter that hits /health and nags if it's down
-sudo tee /usr/local/mosaic-bridge/healthcheck.sh > /dev/null <<'EOF'
-#!/bin/bash
-# Fire a notification channel (email, Pushover, Slack webhook, etc.) if the bridge
-# isn't answering /health. Runs from launchd every 5 minutes.
-set -u
-URL="http://127.0.0.1:3500/health"
-if ! curl -fsS --max-time 5 "$URL" > /dev/null; then
-  # Replace this with whatever channel you actually check:
-  logger -t mosaic-bridge "HEALTH FAIL: bridge not responding on $URL"
-  # Example Pushover:
-  # curl -fsS --data-urlencode "token=$PUSHOVER_TOKEN" \
-  #          --data-urlencode "user=$PUSHOVER_USER" \
-  #          --data-urlencode "message=Mosaic bridge DOWN" \
-  #          https://api.pushover.net/1/messages.json
-fi
-EOF
-sudo chmod +x /usr/local/mosaic-bridge/healthcheck.sh
-sudo chown mosaic:staff /usr/local/mosaic-bridge/healthcheck.sh
-
-sudo tee /Library/LaunchDaemons/com.mosaic.bridge-health.plist > /dev/null <<'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.mosaic.bridge-health</string>
-  <key>ProgramArguments</key>
-  <array><string>/usr/local/mosaic-bridge/healthcheck.sh</string></array>
-  <key>UserName</key><string>mosaic</string>
-  <key>StartInterval</key><integer>300</integer>
-  <key>StandardErrorPath</key><string>/usr/local/mosaic-bridge/health.err</string>
-</dict>
-</plist>
-EOF
-sudo chown root:wheel /Library/LaunchDaemons/com.mosaic.bridge-health.plist
-sudo chmod 644        /Library/LaunchDaemons/com.mosaic.bridge-health.plist
-sudo launchctl load -w /Library/LaunchDaemons/com.mosaic.bridge-health.plist
+sudo install -m 0755 deploy/macbook/healthcheck.sh /usr/local/mosaic-bridge/healthcheck.sh
+sudo install -m 0644 -o root -g wheel deploy/macbook/com.mosaic.bridge-healthcheck.plist \
+    /Library/LaunchDaemons/com.mosaic.bridge-healthcheck.plist
+sudo launchctl load -w /Library/LaunchDaemons/com.mosaic.bridge-healthcheck.plist
 ```
+
+Verify the whole chain end to end: `kill -9` the bridge process — launchd restarts it, but the probe's next tick (≤5 min) should push "Bridge /health FAILING" then "recovered" to your phone. Then unplug the ethernet cable for 20 minutes — healthchecks.io should email/push you.
 
 If you already scrape Prometheus metrics somewhere, the bridge exposes `/metrics` on the same port — point your existing alerting at `http://<macbook>:3500/metrics` and add a rule on `up == 0` or a sentinel metric like `bridge_websocket_connected`.
 

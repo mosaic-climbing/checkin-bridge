@@ -630,3 +630,104 @@ func TestRunMatchingPhase_SkipsDeactivatedUsers(t *testing.T) {
 		t.Error("pending row created for a DEACTIVATED UA user; matcher must skip them")
 	}
 }
+
+// TestTrackedRunSync_FiresOnRunComplete pins the Phase-1 alerting hook:
+// every scheduled run (which goes through trackedRunSync) must invoke
+// Config.OnRunComplete with the result, so app.Build's digest
+// notification sees exactly what the jobs table saw.
+func TestTrackedRunSync_FiresOnRunComplete(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	fakeUnifi := testutil.NewFakeUniFi()
+	defer fakeUnifi.Close()
+	fakeUnifi.Users = []map[string]any{}
+	fakeRedpoint := testutil.NewFakeRedpoint()
+	defer fakeRedpoint.Close()
+
+	unifiClient := unifi.NewClient("wss://unused", fakeUnifi.BaseURL(), "test-token", 500, "", logger)
+	rpClient := redpoint.NewClient(fakeRedpoint.GraphQLURL(), "test-api-key", "TEST", logger)
+
+	db, err := store.Open(t.TempDir(), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var gotResult *SyncResult
+	var gotErr error
+	calls := 0
+	syncer := New(unifiClient, rpClient, db, Config{
+		SyncInterval:   time.Hour,
+		RateLimitDelay: time.Millisecond,
+		OnRunComplete: func(res *SyncResult, err error) {
+			calls++
+			gotResult, gotErr = res, err
+		},
+	}, false, nil, logger)
+
+	if _, err := syncer.trackedRunSync(context.Background()); err != nil {
+		t.Fatalf("trackedRunSync: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("OnRunComplete calls = %d, want 1", calls)
+	}
+	if gotErr != nil {
+		t.Errorf("hook err = %v, want nil", gotErr)
+	}
+	if gotResult == nil {
+		t.Fatal("hook result = nil, want the SyncResult")
+	}
+
+	// Direct RunSync (the manual /status-sync path) must NOT fire the hook.
+	if _, err := syncer.RunSync(context.Background()); err != nil {
+		t.Fatalf("RunSync: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("OnRunComplete calls after direct RunSync = %d, want still 1", calls)
+	}
+}
+
+// TestTrackedRunSync_FiresOnRunCompleteOnError pins the failure side:
+// the hook receives (nil, err) when the run fails, so the operator gets
+// a "sync failed" push rather than silence.
+func TestTrackedRunSync_FiresOnRunCompleteOnError(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// Point the unifi client at a closed server so ListUsers fails and
+	// RunSync errors out early.
+	fakeUnifi := testutil.NewFakeUniFi()
+	deadURL := fakeUnifi.BaseURL()
+	fakeUnifi.Close()
+	fakeRedpoint := testutil.NewFakeRedpoint()
+	defer fakeRedpoint.Close()
+
+	unifiClient := unifi.NewClient("wss://unused", deadURL, "test-token", 500, "", logger)
+	rpClient := redpoint.NewClient(fakeRedpoint.GraphQLURL(), "test-api-key", "TEST", logger)
+
+	db, err := store.Open(t.TempDir(), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	calls := 0
+	var gotErr error
+	syncer := New(unifiClient, rpClient, db, Config{
+		SyncInterval:   time.Hour,
+		RateLimitDelay: time.Millisecond,
+		OnRunComplete: func(res *SyncResult, err error) {
+			calls++
+			gotErr = err
+		},
+	}, false, nil, logger)
+
+	if _, err := syncer.trackedRunSync(context.Background()); err == nil {
+		t.Fatal("trackedRunSync succeeded against a dead UA-Hub, want error")
+	}
+	if calls != 1 {
+		t.Fatalf("OnRunComplete calls = %d, want 1", calls)
+	}
+	if gotErr == nil {
+		t.Error("hook err = nil, want the run error")
+	}
+}

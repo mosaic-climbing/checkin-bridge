@@ -20,6 +20,7 @@ import (
 	"github.com/mosaic-climbing/checkin-bridge/internal/jobs"
 	"github.com/mosaic-climbing/checkin-bridge/internal/metrics"
 	"github.com/mosaic-climbing/checkin-bridge/internal/mirror"
+	"github.com/mosaic-climbing/checkin-bridge/internal/notify"
 	"github.com/mosaic-climbing/checkin-bridge/internal/recheck"
 	"github.com/mosaic-climbing/checkin-bridge/internal/redpoint"
 	"github.com/mosaic-climbing/checkin-bridge/internal/statusync"
@@ -27,6 +28,7 @@ import (
 	"github.com/mosaic-climbing/checkin-bridge/internal/ui"
 	"github.com/mosaic-climbing/checkin-bridge/internal/unifi"
 	"github.com/mosaic-climbing/checkin-bridge/internal/unifimirror"
+	"github.com/mosaic-climbing/checkin-bridge/internal/watchdog"
 )
 
 // BuildOptions are the inputs Build needs from cmd/bridge. Logger and
@@ -87,6 +89,19 @@ func Build(ctx context.Context, opts BuildOptions) (*App, error) {
 	}
 
 	met := metrics.New()
+
+	// ── Push notifications (Phase 1 alerting) ────────────────
+	// nil when NTFY_TOPIC is unset — every Send below no-ops. Logged
+	// loudly either way: silent-failure-by-default is the disease this
+	// wiring treats, so the operator should see at boot whether they'd
+	// actually hear about a 3am problem.
+	notifier := notify.New(cfg.Notify.NtfyURL, cfg.Notify.NtfyTopic, cfg.Notify.NtfyToken,
+		logger.With("component", "notify"))
+	if notifier.Enabled() {
+		logger.Info("push alerting enabled", "server", cfg.Notify.NtfyURL)
+	} else {
+		logger.Warn("push alerting DISABLED — set NTFY_TOPIC to hear about failures")
+	}
 
 	// ── Clients ──────────────────────────────────────────────
 	unifiClient := unifi.NewClient(
@@ -149,6 +164,8 @@ func Build(ctx context.Context, opts BuildOptions) (*App, error) {
 			SyncTimeLocal:       cfg.Sync.TimeLocal,
 			UnmatchedGraceDays:  cfg.Bridge.UnmatchedGraceDays,
 			LegacyNFCStatusLoop: cfg.Bridge.LegacyNFCStatusLoop,
+			OnRunComplete: syncDigest(notifier, opts.Version, cfg.NonSecretHash(),
+				cfg.Bridge.ShadowMode),
 		},
 		cfg.Bridge.ShadowMode,
 		met,
@@ -158,6 +175,22 @@ func Build(ctx context.Context, opts BuildOptions) (*App, error) {
 	rechecker := recheck.New(db, redpointClient, unifiClient, recheck.Config{
 		MaxStaleness: cfg.Bridge.RecheckMaxStaleness,
 		ShadowMode:   cfg.Bridge.ShadowMode,
+		// Breaker transitions fire on the tap-time path; the hook contract
+		// requires a prompt return, so the notification POST is dispatched
+		// to a short-lived goroutine. Not routed through bg.Group: a 10s
+		// bounded fire-and-forget alert is not worth a supervised slot, and
+		// losing one during shutdown is harmless (the log line survives).
+		OnBreakerTransition: func(transition, reason string) {
+			ev, notable := breakerEvent(transition, reason)
+			if !notable {
+				return
+			}
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				_ = notifier.Send(ctx, ev)
+			}()
+		},
 	}, logger.With("component", "recheck"))
 
 	handler := checkin.NewHandler(checkin.HandlerDeps{
@@ -365,6 +398,20 @@ func Build(ctx context.Context, opts BuildOptions) (*App, error) {
 	schedulers := buildSchedulers(cfg, db, logger, syncer, statusSyncer, uaHubMirror,
 		ingester, apiServer, unifiClient)
 
+	// Watchdog: the self-monitoring loop (sync staleness, poller
+	// staleness, external dead-man heartbeat). Runs as a supervised
+	// scheduler like everything else so shutdown drains it and the
+	// bg_goroutines_running gauge sees it.
+	dog := watchdog.New(watchdog.Config{
+		HeartbeatURL: cfg.Notify.HeartbeatURL,
+	}, watchdog.Deps{
+		Metrics:         met,
+		Notifier:        notifier,
+		LastPollSuccess: unifiClient.LastPollSuccessAt,
+		Logger:          logger.With("component", "watchdog"),
+	})
+	schedulers = append(schedulers, scheduledTask{name: "watchdog", fn: dog.Run})
+
 	logger.Info("starting mosaic checkin bridge v2",
 		"port", cfg.Bridge.Port,
 		"dataDir", cfg.Bridge.DataDir,
@@ -508,4 +555,76 @@ func startOfTodayLocal() time.Time {
 	now := time.Now()
 	y, m, d := now.Date()
 	return time.Date(y, m, d, 0, 0, 0, 0, now.Location())
+}
+
+// syncDigest returns the statusync OnRunComplete hook: a per-run push
+// notification summarising what the sync did (or why it failed). This is
+// the operator's routine touchpoint — with 1-3 runs/day it doubles as
+// the "daily digest" the alerting design calls for, and its absence
+// (caught by the watchdog's staleness check) is itself a signal.
+func syncDigest(notifier *notify.Notifier, version, configHash string, shadowMode bool) func(*statusync.SyncResult, error) {
+	return func(res *statusync.SyncResult, err error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		mode := "live"
+		if shadowMode {
+			mode = "shadow"
+		}
+
+		if err != nil {
+			_ = notifier.Send(ctx, notify.Event{
+				Title:    "Status sync FAILED",
+				Body:     fmt.Sprintf("error: %v\nmode: %s · %s (%s)", err, mode, version, configHash),
+				Priority: notify.PriorityHigh,
+				Tags:     []string{"rotating_light", "arrows_counterclockwise"},
+			})
+			return
+		}
+
+		priority := notify.PriorityDefault
+		tags := []string{"arrows_counterclockwise"}
+		title := "Status sync complete"
+		if res.Errors > 0 {
+			priority = notify.PriorityHigh
+			tags = []string{"warning", "arrows_counterclockwise"}
+			title = fmt.Sprintf("Status sync completed with %d errors", res.Errors)
+		}
+		body := fmt.Sprintf(
+			"UA users: %d · activated: %d · deactivated: %d · unchanged: %d\nmatched now: %d · newly pending: %d · expired: %d · errors: %d\nmode: %s · took %s · %s (%s)",
+			res.UniFiUsers, res.Activated, res.Deactivated, res.Unchanged,
+			res.NewlyMatched, res.NewlyPending, res.Expired, res.Errors,
+			mode, res.Duration, version, configHash,
+		)
+		_ = notifier.Send(ctx, notify.Event{Title: title, Body: body, Priority: priority, Tags: tags})
+	}
+}
+
+// breakerEvent maps a recheck-breaker transition to a push notification.
+// notable=false means "don't push" — probe admissions are operational
+// noise (the slog line still records them); trips and recoveries are
+// what the operator needs on their phone.
+func breakerEvent(transition, reason string) (ev notify.Event, notable bool) {
+	switch transition {
+	case "closed_to_open", "closed_to_open_after_probe":
+		still := ""
+		if transition == "closed_to_open_after_probe" {
+			still = " (still down — probe window re-trip)"
+		}
+		return notify.Event{
+			Title:    "Redpoint circuit breaker tripped" + still,
+			Body:     "Denied-tap rechecks are short-circuiting until Redpoint recovers. Reason: " + reason,
+			Priority: notify.PriorityHigh,
+			Tags:     []string{"rotating_light", "electric_plug"},
+		}, true
+	case "probe_succeeded":
+		return notify.Event{
+			Title:    "Redpoint circuit breaker recovered",
+			Body:     "Probe call succeeded; rechecks are live again.",
+			Priority: notify.PriorityDefault,
+			Tags:     []string{"white_check_mark", "electric_plug"},
+		}, true
+	default: // open_to_closed (probe admitted), manual_reset
+		return notify.Event{}, false
+	}
 }

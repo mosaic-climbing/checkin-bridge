@@ -25,6 +25,7 @@ type Config struct {
 	Redpoint RedpointConfig `json:"redpoint"`
 	Bridge   BridgeConfig   `json:"bridge"`
 	Sync     SyncConfig     `json:"sync"`
+	Notify   NotifyConfig   `json:"notify"`
 }
 
 // UniFiConfig holds UniFi Access connection settings.
@@ -200,6 +201,30 @@ type SyncConfig struct {
 	TimeLocal string `json:"timeLocal"`
 }
 
+// NotifyConfig holds push-alerting settings. Everything here is
+// optional: an empty NtfyTopic disables ntfy pushes, an empty
+// HeartbeatURL disables the external dead-man ping. The bridge runs
+// fine without either — it just fails silently again, which is exactly
+// the failure mode this section exists to end.
+type NotifyConfig struct {
+	// NtfyURL is the ntfy server base URL. Default "https://ntfy.sh";
+	// point at a self-hosted instance to keep alert traffic on-LAN.
+	NtfyURL string `json:"ntfyUrl"`
+	// NtfyTopic is the topic pushes go to. ntfy topics are bearer
+	// capabilities — anyone who knows the name can read and write — so
+	// use a long random value (e.g. `openssl rand -hex 12` prefixed with
+	// something recognisable) and treat it like a password.
+	NtfyTopic string `json:"ntfyTopic"`
+	// NtfyToken is an optional access token for reserved topics or
+	// self-hosted servers with auth enabled.
+	NtfyToken string `json:"ntfyToken"`
+	// HeartbeatURL is a healthchecks.io-style ping URL the watchdog GETs
+	// every check interval. The external service alerts when pings STOP —
+	// the one failure (dead process, dead MacBook, dead network) that
+	// in-process alerting structurally cannot report.
+	HeartbeatURL string `json:"heartbeatUrl"`
+}
+
 // Load reads configuration from file + env vars.
 // Order: defaults → config file → env vars.
 func Load() (*Config, error) {
@@ -275,6 +300,9 @@ func defaults() *Config {
 			IntervalHours: 24,
 			PageSize:      100,
 		},
+		Notify: NotifyConfig{
+			NtfyURL: "https://ntfy.sh",
+		},
 	}
 }
 
@@ -324,6 +352,12 @@ func applyEnvOverrides(cfg *Config) {
 	envInt(&cfg.Sync.IntervalHours, "SYNC_INTERVAL_HOURS")
 	envInt(&cfg.Sync.PageSize, "SYNC_PAGE_SIZE")
 	envStr(&cfg.Sync.TimeLocal, "SYNC_TIME_LOCAL")
+
+	// Notify
+	envStr(&cfg.Notify.NtfyURL, "NTFY_URL")
+	envStr(&cfg.Notify.NtfyTopic, "NTFY_TOPIC")
+	envStr(&cfg.Notify.NtfyToken, "NTFY_TOKEN")
+	envStr(&cfg.Notify.HeartbeatURL, "HEARTBEAT_URL")
 }
 
 func validate(cfg *Config) error {
@@ -433,6 +467,12 @@ func (c *Config) NonSecretHash() string {
 	redacted.Redpoint.APIKey = ""
 	redacted.Bridge.AdminAPIKey = ""
 	redacted.Bridge.StaffPassword = ""
+	// Notify values are all bearer capabilities: the topic name grants
+	// read/write on the alert channel, the token is an explicit secret,
+	// and a healthchecks.io ping URL contains its check UUID.
+	redacted.Notify.NtfyTopic = ""
+	redacted.Notify.NtfyToken = ""
+	redacted.Notify.HeartbeatURL = ""
 
 	// time.Duration doesn't JSON-marshal as a number consistently across
 	// versions, and is derived anyway — zero it so we hash only inputs.

@@ -192,3 +192,87 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
+
+// ─── onTransition hook (Phase 1 alerting) ────────────────────
+
+// hookRecorder collects (transition, reason) pairs the hook receives.
+type hookRecord struct{ transition, reason string }
+
+func newHookedBreaker(threshold int, cooldown time.Duration) (*breaker, *[]hookRecord) {
+	b := newBreaker(threshold, cooldown)
+	var records []hookRecord
+	b.onTransition = func(transition, reason string) {
+		records = append(records, hookRecord{transition, reason})
+	}
+	return b, &records
+}
+
+func TestBreakerHook_FiresOnTrip(t *testing.T) {
+	b, records := newHookedBreaker(2, time.Minute)
+	b.failure()
+	if len(*records) != 0 {
+		t.Fatalf("hook fired before threshold: %+v", *records)
+	}
+	b.failure() // trips
+	if len(*records) != 1 {
+		t.Fatalf("records = %+v, want exactly the trip", *records)
+	}
+	if (*records)[0] != (hookRecord{"closed_to_open", "consecutive_failures_exceeded_threshold"}) {
+		t.Errorf("trip record = %+v", (*records)[0])
+	}
+}
+
+func TestBreakerHook_FullRecoveryCycle(t *testing.T) {
+	b, records := newHookedBreaker(1, time.Minute)
+	current := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	b.now = func() time.Time { return current }
+
+	b.failure() // trip
+	current = current.Add(2 * time.Minute)
+	if !b.allow() { // probe admitted
+		t.Fatal("probe not admitted after cooldown")
+	}
+	b.success() // probe succeeded
+
+	want := []hookRecord{
+		{"closed_to_open", "consecutive_failures_exceeded_threshold"},
+		{"open_to_closed", "cooldown_elapsed"},
+		{"probe_succeeded", "probe_call_succeeded"},
+	}
+	if len(*records) != len(want) {
+		t.Fatalf("records = %+v, want %+v", *records, want)
+	}
+	for i := range want {
+		if (*records)[i] != want[i] {
+			t.Errorf("record[%d] = %+v, want %+v", i, (*records)[i], want[i])
+		}
+	}
+}
+
+func TestBreakerHook_SilentOnOrdinarySuccess(t *testing.T) {
+	b, records := newHookedBreaker(5, time.Minute)
+	b.success()
+	b.allow()
+	b.success()
+	if len(*records) != 0 {
+		t.Errorf("hook fired on ordinary traffic: %+v", *records)
+	}
+}
+
+func TestBreakerHook_ManualReset(t *testing.T) {
+	b, records := newHookedBreaker(1, time.Minute)
+	b.failure() // trip
+	b.forceReset()
+	if len(*records) != 2 {
+		t.Fatalf("records = %+v, want trip + manual_reset", *records)
+	}
+	if (*records)[1] != (hookRecord{"manual_reset", "operator_reset"}) {
+		t.Errorf("reset record = %+v", (*records)[1])
+	}
+}
+
+func TestBreakerHook_NilHookSafe(t *testing.T) {
+	b := newBreaker(1, time.Minute)
+	b.failure() // trips; must not panic with nil hook
+	b.forceReset()
+}

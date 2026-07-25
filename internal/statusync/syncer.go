@@ -108,6 +108,18 @@ type Config struct {
 	// noisy "name=Unknown, would DEACTIVATE" decisions against a
 	// half-populated cache. Mirrors config.Bridge.LegacyNFCStatusLoop.
 	LegacyNFCStatusLoop bool
+
+	// OnRunComplete, when non-nil, is invoked after every scheduled sync
+	// run with the result and error (exactly one of which is meaningful:
+	// result is nil on error). Wired by app.Build to push the operator's
+	// per-run digest notification. Called synchronously on the sync
+	// goroutine — the sync loop is not latency-sensitive, and a bounded
+	// notification POST (10s) is an acceptable tail on a minutes-long run.
+	//
+	// Only scheduled runs (the Run loop) fire this hook; operator-
+	// triggered runs via POST /status-sync report their result in the
+	// HTTP response and don't need a push.
+	OnRunComplete func(result *SyncResult, err error)
 }
 
 // Syncer manages the daily Redpoint → UniFi status synchronisation.
@@ -320,6 +332,9 @@ func (s *Syncer) trackedRunSync(ctx context.Context) (*SyncResult, error) {
 				"duration":     result.Duration,
 			}, nil
 		})
+	if s.config.OnRunComplete != nil {
+		s.config.OnRunComplete(captured, err)
+	}
 	return captured, err
 }
 
