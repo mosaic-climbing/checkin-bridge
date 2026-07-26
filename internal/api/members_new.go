@@ -356,7 +356,14 @@ func (s *Server) handleMembersNewCreate(w http.ResponseWriter, r *http.Request) 
 	}
 
 	displayName := strings.TrimSpace(first + " " + last)
-	ui.RenderFragment(w, ui.PostCreateFragment(uaUserID, displayName, resolved.ID, s.listReaderOptions(r)))
+	// Primary swap: the reader-picker panel into #members-new-result.
+	// OOB swap: replace the create-form card with a compact locked stub
+	// so the stale filled form can't be double-submitted while the
+	// enrollment steps run (pre-fix, a second Create click was only
+	// stopped by the scary mapping-collision error).
+	ui.RenderFragment(w,
+		ui.PostCreateFragment(uaUserID, displayName, resolved.ID, s.listReaderOptions(r))+
+			ui.MembersNewFormLockedFragment(displayName))
 }
 
 // resolveDisplayName returns a printable name for the UA-Hub user. The

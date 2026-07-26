@@ -999,20 +999,44 @@ func ShadowDecisionsFragment(
 	return sb.String()
 }
 
-// MetricsSummaryFragment renders the metrics overview.
-func MetricsSummaryFragment(uptime string, counters map[string]int64, gauges map[string]float64) string {
-	var sb strings.Builder
+// NeedsMatchBadgeFragment renders the sidebar count pill next to the
+// Needs Match nav entry. The response is the SAME self-polling span the
+// layout ships (outerHTML self-swap), minus the "load" trigger — a
+// swapped-in "load" would re-fire immediately on every swap and turn
+// the 60s poll into a tight loop. Zero pending renders the empty span
+// (invisible) so the poller element survives.
+//
+// hx-target="this" + hx-push-url="false" are load-bearing: the span
+// lives inside the Needs Match nav anchor and would otherwise INHERIT
+// the anchor's hx-target="#content" and hx-push-url="true" — the poll
+// would then swap the badge over the whole page body and rewrite the
+// URL bar to the fragment path.
+func NeedsMatchBadgeFragment(count int) string {
+	inner := ""
+	if count > 0 {
+		inner = fmt.Sprintf(`<span class="badge badge-pending" style="margin-left: 6px">%d</span>`, count)
+	}
+	return fmt.Sprintf(
+		`<span id="needs-match-badge"`+
+			` hx-get="/ui/frag/needs-match-badge"`+
+			` hx-trigger="every 60s [document.visibilityState === 'visible']"`+
+			` hx-target="this" hx-push-url="false"`+
+			` hx-swap="outerHTML">%s</span>`,
+		inner)
+}
 
-	sb.WriteString(`<div class="stats-grid">`)
-	sb.WriteString(fmt.Sprintf(`<div class="stat-card"><div class="stat-value" style="font-size:18px">%s</div><div class="stat-label">Uptime</div></div>`, HTMLEscape(uptime)))
-	for name, val := range counters {
-		sb.WriteString(fmt.Sprintf(`<div class="stat-card"><div class="stat-value">%d</div><div class="stat-label">%s</div></div>`, val, HTMLEscape(name)))
-	}
-	for name, val := range gauges {
-		sb.WriteString(fmt.Sprintf(`<div class="stat-card"><div class="stat-value">%.0f</div><div class="stat-label">%s</div></div>`, val, HTMLEscape(name)))
-	}
-	sb.WriteString(`</div>`)
-	return sb.String()
+// MembersNewFormLockedFragment is the OOB stub that replaces the create
+// form after a successful POST /ui/members/new. Without it the filled
+// form stayed live above the enrollment panel — a second Create click
+// was only stopped by the scary mapping-collision error.
+func MembersNewFormLockedFragment(displayName string) string {
+	return fmt.Sprintf(
+		`<div class="card" id="members-new-form-card" hx-swap-oob="true">`+
+			`<p style="margin: 0; color: var(--text-muted)">`+
+			`Creating card for <strong>%s</strong> — finish the enrollment below, or `+
+			`<a href="/ui/members/new">start over</a> with a different member.`+
+			`</p></div>`,
+		HTMLEscape(displayName))
 }
 
 // ─── "Needs Match" staff UI (C2) ──────────────────────────────────────

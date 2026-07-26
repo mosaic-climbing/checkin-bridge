@@ -131,6 +131,19 @@ type Server struct {
 	// no UniFi status writes. Pre-fix, those four handlers wrote to
 	// UA-Hub unconditionally — see PR splitting them out for context.
 	shadowMode bool
+
+	// ── /ui/health capability-ladder state (construction-only) ──────
+	//
+	// The three capability fields carry the RESOLVED values from
+	// config.Bridge.CheckinRecordingLive() / StatusWritesMode() /
+	// RecheckUnlockLive() — effect, not raw override strings — so the
+	// Health page renders exactly what the tap/sync paths will do.
+	// alertingConfigured is "is an ntfy topic set"; the topic itself is
+	// a bearer capability and never crosses into this package.
+	checkinRecordingLive bool
+	statusWritesMode     string
+	recheckUnlockLive    bool
+	alertingConfigured   bool
 }
 
 // UAHubRefreshStats is the result payload the UA-Hub mirror refresh
@@ -202,9 +215,21 @@ type ServerDeps struct {
 	DefaultAccessPolicyIDs []string
 	InstanceName           string
 	ShadowMode             bool
-	BreakerResetter        func() (wasOpen bool)
-	MirrorWalker           func(ctx context.Context) error
-	UAHubMirrorRefresher   func(ctx context.Context, progress func(phase string)) (UAHubRefreshStats, error)
+	// CheckinRecordingLive / StatusWritesMode / RecheckUnlockLive feed
+	// the /ui/health capability ladder. Pass the RESOLVED values —
+	// cfg.Bridge.CheckinRecordingLive(), cfg.Bridge.StatusWritesMode(),
+	// cfg.Bridge.RecheckUnlockLive() — not the raw override strings.
+	// Zero values (false/"") render as the fully-held shadow posture,
+	// which is the safe default for tests that don't care.
+	CheckinRecordingLive bool
+	StatusWritesMode     string
+	RecheckUnlockLive    bool
+	// AlertingConfigured is true when a push-alert topic is set
+	// (cfg.Notify.NtfyTopic != ""). Boolean only — never the topic.
+	AlertingConfigured   bool
+	BreakerResetter      func() (wasOpen bool)
+	MirrorWalker         func(ctx context.Context) error
+	UAHubMirrorRefresher func(ctx context.Context, progress func(phase string)) (UAHubRefreshStats, error)
 }
 
 // NewServer constructs the api.Server. Panics on a missing required
@@ -248,6 +273,10 @@ func NewServer(deps ServerDeps) *Server {
 		uaHubMirrorRefresh:     deps.UAHubMirrorRefresher,
 		instanceName:           deps.InstanceName,
 		shadowMode:             deps.ShadowMode,
+		checkinRecordingLive:   deps.CheckinRecordingLive,
+		statusWritesMode:       deps.StatusWritesMode,
+		recheckUnlockLive:      deps.RecheckUnlockLive,
+		alertingConfigured:     deps.AlertingConfigured,
 	}
 	s.routes()
 	return s
@@ -372,7 +401,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /ui/frag/checkin-table", withTimeout(shortTimeout, s.handleFragCheckinTable))
 	s.mux.HandleFunc("GET /ui/frag/job-table", withTimeout(shortTimeout, s.handleFragJobTable))
 	s.mux.HandleFunc("GET /ui/frag/policy-table", withTimeout(shortTimeout, s.handleFragPolicyTable))
-	s.mux.HandleFunc("GET /ui/frag/metrics-summary", withTimeout(shortTimeout, s.handleFragMetricsSummary))
+	// /ui/health body: capability ladder + connection/alerting state +
+	// last runs + headline numbers. Replaces the raw metrics dump
+	// (/ui/frag/metrics-summary died with the Metrics page).
+	s.mux.HandleFunc("GET /ui/frag/health-summary", withTimeout(shortTimeout, s.handleFragHealthSummary))
+	// Sidebar Needs Match count pill (60s self-poll, visibility-gated).
+	s.mux.HandleFunc("GET /ui/frag/needs-match-badge", withTimeout(shortTimeout, s.handleFragNeedsMatchBadge))
 	s.mux.HandleFunc("GET /ui/frag/shadow-decisions", withTimeout(shortTimeout, s.handleFragShadowDecisions))
 	// Pending-count chip on the Sync page (replaces the removed
 	// /ui/frag/unmatched-table dry-run-ingest panel).

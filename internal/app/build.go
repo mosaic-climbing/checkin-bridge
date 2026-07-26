@@ -339,9 +339,17 @@ func Build(ctx context.Context, opts BuildOptions) (*App, error) {
 		DefaultAccessPolicyIDs: cfg.Bridge.DefaultAccessPolicyIDs,
 		ShadowMode:             cfg.Bridge.ShadowMode,
 		InstanceName:           cfg.Bridge.InstanceName,
-		BreakerResetter:        rechecker.ResetBreaker,
-		MirrorWalker:           mirrorWalker.Walk,
-		UAHubMirrorRefresher:   uaHubRefresher,
+		// Resolved capability values for the /ui/health go-live ladder —
+		// effect (what the tap/sync paths will actually do), not the raw
+		// BRIDGE_LIVE_* override strings.
+		CheckinRecordingLive: cfg.Bridge.CheckinRecordingLive(),
+		StatusWritesMode:     cfg.Bridge.StatusWritesMode(),
+		RecheckUnlockLive:    cfg.Bridge.RecheckUnlockLive(),
+		// Boolean only — the topic value is a bearer capability.
+		AlertingConfigured:   cfg.Notify.NtfyTopic != "",
+		BreakerResetter:      rechecker.ResetBreaker,
+		MirrorWalker:         mirrorWalker.Walk,
+		UAHubMirrorRefresher: uaHubRefresher,
 	})
 
 	// ── HTTP handler chains ────────────────────────────────

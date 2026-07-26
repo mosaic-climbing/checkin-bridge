@@ -3,7 +3,10 @@
     <p>Create a UA-Hub user, bind a Redpoint customer, and enroll their NFC card — all in one flow. The email field is live-validated against Redpoint as you type, so submission is gated on a clean match.</p>
 </div>
 
-<div class="card">
+<!-- The whole card is an OOB target: a successful create swaps it for
+     the compact MembersNewFormLockedFragment stub, so the stale filled
+     form can't be double-submitted while enrollment runs below. -->
+<div class="card" id="members-new-form-card">
     <h3>Member details</h3>
     <form id="members-new-form"
           hx-post="/ui/members/new"
