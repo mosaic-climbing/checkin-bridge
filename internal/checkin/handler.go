@@ -637,13 +637,25 @@ func (h *Handler) recordInRedpoint(ctx context.Context, member *store.Member, ev
 	}
 }
 
+// eventTimestamp returns the UA-Hub event's own timestamp, normalized to
+// UTC RFC3339, for stamping checkins rows. Backfilled/replayed events (the
+// boot sweep, reconnect catch-up) can reach us minutes or hours after the
+// tap; stamping wall-clock "now" would misdate the audit trail, so the
+// current time is only a fallback for events with no parseable timestamp.
+func eventTimestamp(event unifi.AccessEvent) string {
+	if t, err := time.Parse(time.RFC3339, event.Timestamp); err == nil {
+		return t.UTC().Format(time.RFC3339)
+	}
+	return time.Now().UTC().Format(time.RFC3339)
+}
+
 // recordAllowedEvent records a successful check-in event in the store.
 // We also capture the UA-Hub's own verdict (event.Result: ACCESS/BLOCKED) so
 // the shadow-decisions panel can flag disagreements — a BLOCKED here means
 // UniFi's rules would have stopped this tap even though the bridge allowed it.
 func (h *Handler) recordAllowedEvent(ctx context.Context, event unifi.AccessEvent, member *store.Member) {
 	evt := &store.CheckInEvent{
-		Timestamp:    time.Now().UTC().Format(time.RFC3339),
+		Timestamp:    eventTimestamp(event),
 		NfcUID:       member.NfcUID,
 		CustomerID:   member.CustomerID,
 		CustomerName: member.FullName(),
@@ -681,7 +693,7 @@ func (h *Handler) recordAllowedEvent(ctx context.Context, event unifi.AccessEven
 func (h *Handler) recordDeniedEvent(ctx context.Context, event unifi.AccessEvent, result, denyReason string) {
 	// For denied events, we may not have member info, so use minimal details
 	evt := &store.CheckInEvent{
-		Timestamp:    time.Now().UTC().Format(time.RFC3339),
+		Timestamp:    eventTimestamp(event),
 		NfcUID:       event.CredentialID, // Use credential ID as NFC UID
 		CustomerID:   "",
 		CustomerName: "Unknown",
