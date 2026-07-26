@@ -386,6 +386,112 @@ func TestHandleEvent_WithCardOverride(t *testing.T) {
 	}
 }
 
+// TestHandleEvent_RecordedTimestampIsEventTime pins the checkins-row
+// timestamp to the UA-Hub event's own time, not the bridge's wall clock.
+// The boot sweep replays since-midnight events and the reconnect catch-up
+// replays outage-window events — both arrive long after the tap, and
+// stamping "now" would misdate the audit trail (checkins table,
+// shadow-decision stats). The wall clock is only a fallback for events
+// with no parseable timestamp.
+func TestHandleEvent_RecordedTimestampIsEventTime(t *testing.T) {
+	// A tap time far enough in the past that a wall-clock stamp can't be
+	// confused with it.
+	tapTime := time.Now().UTC().Add(-6 * time.Hour).Truncate(time.Second)
+
+	tests := []struct {
+		name       string
+		eventTS    string
+		credential string // AABB1122 resolves to a member; anything else denies
+		wantResult string
+		wantTS     string // exact expected stored timestamp; "" = expect ~now fallback
+	}{
+		{
+			name:       "backfilled allowed event keeps tap time",
+			eventTS:    tapTime.Format(time.RFC3339),
+			credential: "AABB1122",
+			wantResult: "allowed",
+			wantTS:     tapTime.Format(time.RFC3339),
+		},
+		{
+			name:       "backfilled denied event keeps tap time",
+			eventTS:    tapTime.Format(time.RFC3339),
+			credential: "UNKNOWN_TAG",
+			wantResult: "not_found",
+			wantTS:     tapTime.Format(time.RFC3339),
+		},
+		{
+			name:       "offset timestamp normalized to UTC",
+			eventTS:    tapTime.In(time.FixedZone("PDT", -7*3600)).Format(time.RFC3339),
+			credential: "AABB1122",
+			wantResult: "allowed",
+			wantTS:     tapTime.Format(time.RFC3339),
+		},
+		{
+			name:       "unparseable timestamp falls back to now",
+			eventTS:    "not-a-timestamp",
+			credential: "AABB1122",
+			wantResult: "allowed",
+			wantTS:     "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, db, _ := setupHandler(t)
+			ctx := context.Background()
+
+			db.UpsertMember(ctx, &store.Member{
+				NfcUID:      "AABB1122",
+				CustomerID:  "cust-1",
+				FirstName:   "Alice",
+				LastName:    "Smith",
+				BadgeStatus: "ACTIVE",
+				Active:      true,
+			})
+
+			before := time.Now().UTC().Add(-time.Second)
+			h.HandleEvent(ctx, unifi.AccessEvent{
+				EventType:    "access.logs.add",
+				CredentialID: tt.credential,
+				DoorName:     "Front Door",
+				AuthType:     "NFC",
+				Timestamp:    tt.eventTS,
+				IsBackfill:   true,
+				ViaPoller:    true,
+			})
+			after := time.Now().UTC().Add(time.Second)
+
+			rows, err := db.RecentCheckIns(ctx, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != 1 {
+				t.Fatalf("RecentCheckIns returned %d rows, want 1", len(rows))
+			}
+			if rows[0].Result != tt.wantResult {
+				t.Errorf("Result = %q, want %q", rows[0].Result, tt.wantResult)
+			}
+
+			if tt.wantTS != "" {
+				if rows[0].Timestamp != tt.wantTS {
+					t.Errorf("Timestamp = %q, want event time %q", rows[0].Timestamp, tt.wantTS)
+				}
+				return
+			}
+
+			// Fallback case: stored timestamp should be the wall clock at
+			// record time, bracketed by before/after.
+			got, err := time.Parse(time.RFC3339, rows[0].Timestamp)
+			if err != nil {
+				t.Fatalf("stored fallback timestamp %q not RFC3339: %v", rows[0].Timestamp, err)
+			}
+			if got.Before(before) || got.After(after) {
+				t.Errorf("fallback Timestamp = %v, want within [%v, %v]", got, before, after)
+			}
+		})
+	}
+}
+
 func TestHandleEvent_ConcurrentEvents(t *testing.T) {
 	h, db, _ := setupHandler(t)
 
