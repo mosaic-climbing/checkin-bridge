@@ -78,3 +78,6 @@ vendor/
 # Not project content; the agent recreates these on demand.
 # ═══════════════════════════════════════════════════════════
 .claude/
+
+# Local build output
+bin/
