@@ -1,6 +1,10 @@
 <div class="page-header">
     <h2>Needs Match</h2>
-    <p>UA-Hub users the bridge couldn't auto-bind to a Redpoint customer. Each row is a pending ticket that will default-deactivate when its grace window closes. Pick a Redpoint customer to match, skip (deactivate now), or defer (extend grace).</p>
+    <p>UA-Hub users the bridge couldn't auto-bind to a Redpoint customer.
+    Nothing is deactivated automatically — rows past their grace date are
+    flagged in the daily digest until you resolve them. Match each row to
+    the right Redpoint customer, Skip (deactivate now), or Snooze the
+    alerts for 7 days.</p>
 </div>
 
 <!--
@@ -20,7 +24,7 @@
 <div class="card">
     <div id="needs-match-list"
          hx-get="/ui/frag/unmatched-list"
-         hx-trigger="load, every 30s"
+         hx-trigger="load, every 30s [document.visibilityState === 'visible']"
          hx-swap="innerHTML"
          hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>
         <p style="color: var(--text-muted)">Loading unmatched users…</p>

@@ -102,21 +102,23 @@ func TestSyncLastRunPillFull_RunningStuckShowsUnstickLink(t *testing.T) {
 
 func TestSyncLastRunPillFull_RunningWithoutProgress(t *testing.T) {
 	// A brand-new running row, before any phase has been written.
-	// Should still render the running badge but without a phase
-	// segment.
+	// Should still render the running badge without a phase segment,
+	// but WITH the expected-duration hint: "⟳ Running · started just
+	// now · usually <5 min". Assert the separator count so a
+	// regression that emits an empty "· ·" sequence is caught.
 	ts := time.Now().UTC().Format(time.RFC3339)
 	got := SyncLastRunPillFull("ua_hub_sync", "running", ts, "", "")
 
 	if !strings.Contains(got, "Running") {
 		t.Errorf("pill = %q, want it to say Running", got)
 	}
-	// No phase segment — just ⟳ Running · started Xm ago.
-	// Assert the separator count so a regression that emits an
-	// empty "· ·" sequence is caught.
+	if !strings.Contains(got, "usually") {
+		t.Errorf("pill = %q, want the expected-duration hint", got)
+	}
 	body := strings.SplitN(got, ">", 2)[1] // strip leading span tag
 	sep := strings.Count(body, "·")
-	if sep < 1 || sep > 1 {
-		t.Errorf("pill body = %q, want exactly one '·' separator (got %d)", body, sep)
+	if sep != 2 { // started X ago · usually <N min
+		t.Errorf("pill body = %q, want exactly two '·' separators (got %d)", body, sep)
 	}
 }
 

@@ -25,6 +25,9 @@ func StatsFragment(membersActive, membersTotal, checkinsToday, deniedToday int, 
 }
 
 // CheckInTableFragment renders a table of recent check-in events.
+// Time carries the RAW store timestamp; the fragment renders it via
+// FormatRecent (local wall-clock) with the raw stamp in a title
+// attribute — callers must not pre-slice or pre-format it.
 type CheckInRow struct {
 	Time       string
 	Name       string
@@ -50,8 +53,8 @@ func CheckInTableFragment(rows []CheckInRow) string {
 		if r.DenyReason != "" {
 			resultText += ": " + HTMLEscape(r.DenyReason)
 		}
-		sb.WriteString(fmt.Sprintf(`<tr><td>%s</td><td>%s</td><td><code>%s</code></td><td>%s</td><td><span class="badge %s">%s</span></td></tr>`,
-			HTMLEscape(r.Time), HTMLEscape(r.Name), HTMLEscape(r.NfcUID), HTMLEscape(r.Door), badgeClass, HTMLEscape(resultText)))
+		sb.WriteString(fmt.Sprintf(`<tr><td style="white-space:nowrap" title="%s">%s</td><td>%s</td><td><code>%s</code></td><td>%s</td><td><span class="badge %s">%s</span></td></tr>`,
+			HTMLEscape(r.Time), HTMLEscape(FormatRecent(r.Time)), HTMLEscape(r.Name), HTMLEscape(r.NfcUID), HTMLEscape(r.Door), badgeClass, HTMLEscape(resultText)))
 	}
 	sb.WriteString(`</tbody></table>`)
 	return sb.String()
@@ -67,9 +70,14 @@ type MemberRow struct {
 	CustomerID  string
 }
 
+// memberTableEmptyState is shared by the plain and paged renderers.
+// Points at the New Member flow — the UniFi-console path this copy used
+// to recommend is exactly what kept refilling the Needs Match queue.
+const memberTableEmptyState = `<p style="color: var(--text-muted); padding: 12px 0">No members enrolled yet. Use the <a href="/ui/members/new">New Member</a> flow to create and enroll one.</p>`
+
 func MemberTableFragment(rows []MemberRow) string {
 	if len(rows) == 0 {
-		return `<p style="color: var(--text-muted); padding: 12px 0">No members enrolled. Add users in UniFi Access and run an ingest.</p>`
+		return memberTableEmptyState
 	}
 
 	var sb strings.Builder
@@ -81,39 +89,72 @@ func MemberTableFragment(rows []MemberRow) string {
 	return sb.String()
 }
 
+// statusLabel maps an internal badge-status enum to the staff-readable
+// label. Render-time only — stored values are untouched. ACTIVE / FROZEN
+// / EXPIRED read fine as-is; the two internal states get plain English.
+func statusLabel(status string) string {
+	switch status {
+	case "DELETED":
+		return "Not in Redpoint"
+	case "PENDING_SYNC":
+		return "Awaiting first sync"
+	}
+	return status
+}
+
+// statusBadge renders the badge-status pill: staff-readable label,
+// class keyed on the raw enum, raw value preserved in the title so
+// debugging keeps the ground truth one hover away. Unknown statuses
+// render muted, not green — pre-overhaul the default was badge-active,
+// so a wall of DELETED members showed as a wall of green pills.
+func statusBadge(status string) string {
+	class := "badge-muted"
+	switch status {
+	case "ACTIVE":
+		class = "badge-active"
+	case "FROZEN":
+		class = "badge-frozen"
+	case "EXPIRED":
+		class = "badge-expired"
+	case "PENDING_SYNC":
+		class = "badge-pending"
+	case "DELETED":
+		class = "badge-denied"
+	}
+	return fmt.Sprintf(`<span class="badge %s" title="%s">%s</span>`,
+		class, HTMLEscape(status), HTMLEscape(statusLabel(status)))
+}
+
 // memberRow renders one <tr> shared by MemberTableFragment and
 // MemberTableFragmentPaged. Extracted so the Details + Remove button
 // wiring stays consistent across the two render paths.
 func memberRow(r MemberRow) string {
-	badgeClass := "badge-active"
-	switch r.BadgeStatus {
-	case "FROZEN":
-		badgeClass = "badge-frozen"
-	case "EXPIRED":
-		badgeClass = "badge-expired"
-	case "PENDING_SYNC":
-		badgeClass = "badge-pending"
+	lastCI := "Never"
+	if r.LastCheckIn != "" {
+		lastCI = FormatRecent(r.LastCheckIn)
 	}
-	lastCI := r.LastCheckIn
-	if lastCI == "" {
-		lastCI = "Never"
+	membership := HTMLEscape(r.BadgeName)
+	if r.BadgeName == "" {
+		membership = `<span style="color: var(--text-muted)" title="Populates on next status refresh">—</span>`
 	}
 	// The Details button opens the v0.5.9 recovery panel (hx-target
 	// "#member-detail"). The Remove button stays on the row because
 	// the swap:0.3s row-removal animation is the cheapest UX for the
 	// common case; clicking Remove from inside the detail panel works
-	// too (that button targets "#member-detail" instead).
+	// too (that button targets "#member-detail" instead). It renders
+	// in the quiet outline style — one solid red button per row read
+	// as a wall of danger.
 	return fmt.Sprintf(`<tr>
-            <td>%s</td><td><code>%s</code></td>
-            <td><span class="badge %s">%s</span></td>
-            <td>%s</td><td>%s</td>
+            <td>%s</td><td><code style="font-size:11px; color: var(--text-muted)">%s</code></td>
+            <td>%s</td>
+            <td>%s</td><td title="%s">%s</td>
             <td style="white-space: nowrap">
                 <button class="btn btn-primary btn-sm"
                     hx-get="/ui/frag/member/%s/detail"
                     hx-target="#member-detail"
-                    hx-swap="innerHTML"
+                    hx-swap="innerHTML show:window:top"
                     hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>Details</button>
-                <button class="btn btn-danger btn-sm"
+                <button class="btn btn-outline-danger btn-sm"
                     hx-delete="/members/%s"
                     hx-target="closest tr"
                     hx-swap="outerHTML swap:0.3s"
@@ -122,8 +163,8 @@ func memberRow(r MemberRow) string {
             </td>
         </tr>`,
 		HTMLEscape(r.Name), HTMLEscape(r.NfcUID),
-		badgeClass, HTMLEscape(r.BadgeStatus),
-		HTMLEscape(r.BadgeName), HTMLEscape(lastCI),
+		statusBadge(r.BadgeStatus),
+		membership, HTMLEscape(r.LastCheckIn), HTMLEscape(lastCI),
 		HTMLEscape(r.NfcUID),
 		HTMLEscape(r.NfcUID), HTMLEscape(r.Name))
 }
@@ -138,7 +179,7 @@ func memberRow(r MemberRow) string {
 // is emitted.
 func MemberTableFragmentPaged(rows []MemberRow, offset, total int) string {
 	if len(rows) == 0 && offset == 0 {
-		return `<p style="color: var(--text-muted); padding: 12px 0">No members enrolled. Add users in UniFi Access and run an ingest.</p>`
+		return memberTableEmptyState
 	}
 
 	var sb strings.Builder
@@ -190,20 +231,16 @@ func SearchResultsFragment(results []SearchResult) string {
 		return `<p style="color: var(--text-muted); padding: 8px 0">No results found.</p>`
 	}
 
-	// v0.5.9: the search is now read-only. Before this release the
-	// trailing column held a "Select" button that populated the inline
-	// Add Member form. The form is gone (members are provisioned in
-	// UniFi Access, not the bridge), so the button went with it. For
-	// enrolled rows we render a "View details" action that hx-get's the
+	// Enrolled rows render a "View details" action that hx-get's the
 	// member detail panel so staff can jump from a name/email search
-	// into the recovery toolkit. For non-enrolled rows we render a
-	// hint that tells the operator to add the user in UniFi Access
-	// first (which will then surface in Needs Match on next sync).
+	// into the recovery toolkit. Non-enrolled rows link to the New
+	// Member flow — the intended enrollment path (console-created
+	// users are what kept refilling the Needs Match queue).
 	var sb strings.Builder
 	sb.WriteString(`<table><thead><tr><th>Name</th><th>Email</th><th>Status</th><th></th></tr></thead><tbody>`)
 	for _, r := range results {
 		status := `<span class="badge badge-denied">Not enrolled</span>`
-		action := `<span style="color: var(--text-muted); font-size: 12px">Add in UniFi Access</span>`
+		action := `<a href="/ui/members/new" style="font-size: 12px">Enroll via New Member →</a>`
 		if r.InCache {
 			status = fmt.Sprintf(`<span class="badge badge-active">Enrolled (%s)</span>`, HTMLEscape(r.NfcUID))
 			// Jump into the detail panel; hx-target is the sticky
@@ -211,7 +248,7 @@ func SearchResultsFragment(results []SearchResult) string {
 			action = fmt.Sprintf(
 				`<button type="button" class="btn btn-primary btn-sm"`+
 					` hx-get="/ui/frag/member/%s/detail"`+
-					` hx-target="#member-detail" hx-swap="innerHTML"`+
+					` hx-target="#member-detail" hx-swap="innerHTML show:window:top"`+
 					` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>View details</button>`,
 				HTMLEscape(r.NfcUID))
 		}
@@ -248,8 +285,8 @@ func JobTableFragment(rows []JobRow) string {
 		case "failed":
 			badgeClass = "badge-failed"
 		}
-		sb.WriteString(fmt.Sprintf(`<tr><td><code>%s</code></td><td>%s</td><td><span class="badge %s">%s</span></td><td>%s</td><td>%s</td></tr>`,
-			HTMLEscape(r.ID), HTMLEscape(r.Type), badgeClass, HTMLEscape(r.Status), HTMLEscape(r.CreatedAt), HTMLEscape(r.Error)))
+		sb.WriteString(fmt.Sprintf(`<tr><td><code>%s</code></td><td>%s</td><td><span class="badge %s">%s</span></td><td style="white-space:nowrap" title="%s">%s</td><td>%s</td></tr>`,
+			HTMLEscape(r.ID), HTMLEscape(r.Type), badgeClass, HTMLEscape(r.Status), HTMLEscape(r.CreatedAt), HTMLEscape(FormatRecent(r.CreatedAt)), HTMLEscape(r.Error)))
 	}
 	sb.WriteString(`</tbody></table>`)
 	return sb.String()
@@ -391,15 +428,64 @@ func SyncLastRunPill(jobType, status, createdAt, errMsg string) string {
 	return SyncLastRunPillFull(jobType, status, createdAt, errMsg, "")
 }
 
-// unstickAgeThreshold is how long a job has to have been "running"
-// before SyncLastRunPillFull renders the "Clear stuck" affordance.
-// Picked to comfortably exceed the longest legitimate refresh
-// observed at LEF (UA-Hub mirror walk: ~4-5min for ~1.6k users +
-// 75ms hydrate spacing). A row that's still 'running' beyond this
-// is overwhelmingly likely to be wedged. The link is non-destructive
-// — staff click it, the row flips to 'failed' with a clear note,
-// and they can click Run again.
+// unstickAgeThreshold is the fallback for how long a job has to have
+// been "running" before SyncLastRunPillFull renders the "Clear stuck"
+// affordance. Per-type thresholds below override it: a wedged
+// cache_sync (normally seconds) used to show a bare Running pill for
+// a flat 10 minutes, which staff read as "no unstick exists". The
+// link is non-destructive — staff click it, the row flips to 'failed'
+// with a clear note, and they can click Run again.
 const unstickAgeThreshold = 10 * time.Minute
+
+// unstickThresholds tunes the stuck-detection window per job type to
+// comfortably exceed that job's longest legitimate run:
+//   - cache_sync: per-member Redpoint status refresh, seconds at gym scale
+//   - unifi_ingest: UA-Hub NFC-user walk + match, well under a minute
+//   - ua_hub_sync: full UA-Hub mirror walk, ~4-5min at ~1.6k users
+//   - directory_sync: full Redpoint directory pull, a few minutes
+//   - status_sync: mapping-driven status pass, minutes
+var unstickThresholds = map[string]time.Duration{
+	"cache_sync":     2 * time.Minute,
+	"unifi_ingest":   2 * time.Minute,
+	"status_sync":    10 * time.Minute,
+	"directory_sync": 15 * time.Minute,
+	"ua_hub_sync":    15 * time.Minute,
+}
+
+// runningHints is the "usually finishes in <X" copy appended to a
+// fresh (not-yet-stuck) running pill so staff know how long a normal
+// run takes before reaching for Clear stuck.
+var runningHints = map[string]string{
+	"cache_sync":     "usually <1 min",
+	"unifi_ingest":   "usually <1 min",
+	"status_sync":    "usually <5 min",
+	"directory_sync": "usually <10 min",
+	"ua_hub_sync":    "usually <5 min",
+}
+
+// unstickThresholdFor resolves the per-type stuck window, falling back
+// to the global default for unknown types.
+func unstickThresholdFor(jobType string) time.Duration {
+	if d, ok := unstickThresholds[jobType]; ok {
+		return d
+	}
+	return unstickAgeThreshold
+}
+
+// pillErrMaxLen bounds the inline error excerpt on a failed pill.
+// The full error stays in the title attribute; the excerpt exists
+// because tooltip-only errors are invisible on touch devices and
+// easy to miss on hover.
+const pillErrMaxLen = 60
+
+// truncateErr shortens an error message for inline pill display.
+func truncateErr(msg string) string {
+	msg = strings.TrimSpace(msg)
+	if len(msg) <= pillErrMaxLen {
+		return msg
+	}
+	return strings.TrimSpace(msg[:pillErrMaxLen]) + "…"
+}
 
 // SyncLastRunPillFull is the full-fat renderer; SyncLastRunPill
 // preserves the old four-arg signature for legacy callers. progress
@@ -425,12 +511,11 @@ func SyncLastRunPillFull(jobType, status, createdAt, errMsg, progress string) st
 	case "running":
 		// Progress and unstick are independent: a fresh refresh
 		// shows "⟳ Running · hydrating 450/1500 · started just
-		// now"; a wedged refresh shows "⟳ Running · started 47m
-		// ago · Clear stuck" (with progress dropped because
-		// stale phase strings tend to mislead more than help).
-		// A fresh refresh with no progress yet just shows "⟳
-		// Running · started just now".
-		stuck := isStuckRunning(createdAt)
+		// now · usually <5 min"; a wedged refresh shows "⟳ Running
+		// · started 47m ago · Clear stuck" (with progress and the
+		// duration hint dropped because stale phase strings tend
+		// to mislead more than help).
+		stuck := isStuckRunning(jobType, createdAt)
 		var phase string
 		if !stuck {
 			phase = trimPhase(progress)
@@ -443,6 +528,11 @@ func SyncLastRunPillFull(jobType, status, createdAt, errMsg, progress string) st
 			fmt.Fprintf(&sb, ` · %s`, HTMLEscape(phase))
 		}
 		fmt.Fprintf(&sb, ` · started %s`, HTMLEscape(rel))
+		if !stuck {
+			if hint, ok := runningHints[jobType]; ok {
+				fmt.Fprintf(&sb, ` · %s`, HTMLEscape(hint))
+			}
+		}
 		if stuck {
 			// Render the unstick link as part of the same pill
 			// so the OOB swap target stays unique. hx-target
@@ -461,13 +551,18 @@ func SyncLastRunPillFull(jobType, status, createdAt, errMsg, progress string) st
 		sb.WriteString(`</span>`)
 		return sb.String()
 	case "failed":
+		// The first ~60 chars of the error render inline — tooltip-
+		// only errors are invisible on touch and easy to miss. Full
+		// message stays in the title.
 		tooltip := "Failed"
+		inlineErr := ""
 		if errMsg != "" {
 			tooltip = "Failed: " + errMsg
+			inlineErr = ` · ` + HTMLEscape(truncateErr(errMsg))
 		}
 		return fmt.Sprintf(
-			`<span id="%s" class="badge badge-failed" title="%s">✗ Failed · %s</span>`,
-			id, HTMLEscape(tooltip), HTMLEscape(rel))
+			`<span id="%s" class="badge badge-failed" title="%s">✗ Failed · %s%s</span>`,
+			id, HTMLEscape(tooltip), HTMLEscape(rel), inlineErr)
 	case "completed":
 		return fmt.Sprintf(
 			`<span id="%s" class="badge badge-completed" title="Completed %s">✓ %s</span>`,
@@ -480,15 +575,15 @@ func SyncLastRunPillFull(jobType, status, createdAt, errMsg, progress string) st
 }
 
 // isStuckRunning returns true when the running job's created_at is
-// older than unstickAgeThreshold. Falls back to "not stuck" on
-// unparseable input so a fresh row with a malformed timestamp
-// doesn't immediately surface the unstick link.
-func isStuckRunning(createdAt string) bool {
+// older than the job type's unstick threshold. Falls back to "not
+// stuck" on unparseable input so a fresh row with a malformed
+// timestamp doesn't immediately surface the unstick link.
+func isStuckRunning(jobType, createdAt string) bool {
 	t, ok := parseStoreTimestamp(createdAt)
 	if !ok {
 		return false
 	}
-	return time.Since(t) >= unstickAgeThreshold
+	return time.Since(t) >= unstickThresholdFor(jobType)
 }
 
 // trimPhase strips the JSON quoting around a progress payload
@@ -788,100 +883,22 @@ func EnrollmentFailedFragment(uaUserID, displayName, message string, readers []D
 	return sb.String()
 }
 
-// UnmatchedRow is a single UniFi user that the ingest couldn't pair with a
-// Redpoint customer (either zero hits or multiple ambiguous hits). Surfaced
-// in the Sync page so staff can eyeball each one and either fix it in
-// Redpoint (correct the name/email) or add them manually via Members.
-type UnmatchedRow struct {
-	UniFiUserID string
-	UniFiName   string
-	UniFiEmail  string
-	NfcTokens   []string
-	Category    string // "no_match" or "multiple_match"
-	Warning     string
-}
-
-// UnmatchedTableFragment renders the list of unresolvable UniFi users with
-// the info needed to fix each one (name, email, the NFC tokens on record)
-// plus a jump-link into the Members search prefilled with their name.
-func UnmatchedTableFragment(totalUnifi, matched, unmatched int, rows []UnmatchedRow) string {
-	var sb strings.Builder
-
-	// Counter strip — lets staff see at a glance how much work is left.
-	sb.WriteString(`<div class="stats-grid" style="margin-bottom: 16px">`)
-	sb.WriteString(fmt.Sprintf(
-		`<div class="stat-card"><div class="stat-value">%d</div><div class="stat-label">UniFi Users</div></div>`,
-		totalUnifi))
-	sb.WriteString(fmt.Sprintf(
-		`<div class="stat-card"><div class="stat-value" style="color:var(--success, #00b894)">%d</div><div class="stat-label">Matched</div></div>`,
-		matched))
-	sb.WriteString(fmt.Sprintf(
-		`<div class="stat-card"><div class="stat-value" style="color:var(--danger, #d63031)">%d</div><div class="stat-label">Unmatched</div></div>`,
-		unmatched))
-	sb.WriteString(`</div>`)
-
-	if len(rows) == 0 {
-		sb.WriteString(`<p style="color: var(--text-muted); padding: 12px 0">` +
-			`No unmatched users. Every UniFi account with an NFC tag has a Redpoint match.` +
-			`</p>`)
-		return sb.String()
+// PendingSummaryFragment renders the one-line "N users pending manual
+// match" chip the Sync page shows under the UniFi Ingest card. It
+// replaces the old "Unmatched UniFi Users" panel, which duplicated the
+// Needs Match queue and whose per-row Open buttons targeted a div that
+// only exists on the Needs Match page (a silent htmx targetError).
+func PendingSummaryFragment(count int) string {
+	if count == 0 {
+		return `<p style="color: var(--text-muted); margin: 0">No users pending manual match. Every UA-Hub user is bound to a Redpoint customer.</p>`
 	}
-
-	sb.WriteString(`<table><thead><tr>`)
-	sb.WriteString(`<th>UniFi Name</th><th>Email</th><th>NFC Tokens</th><th>Why</th><th>Fix</th>`)
-	sb.WriteString(`</tr></thead><tbody>`)
-	for _, r := range rows {
-		catClass := "badge-denied"
-		catText := "No match"
-		if r.Category == "multiple_match" {
-			catClass = "badge-pending"
-			catText = "Ambiguous"
-		}
-		email := r.UniFiEmail
-		if email == "" {
-			email = `<span style="color: var(--text-muted)">(no email)</span>`
-		} else {
-			email = HTMLEscape(email)
-		}
-		tokens := `<span style="color: var(--text-muted)">(none)</span>`
-		if len(r.NfcTokens) > 0 {
-			parts := make([]string, len(r.NfcTokens))
-			for i, t := range r.NfcTokens {
-				parts[i] = `<code>` + HTMLEscape(t) + `</code>`
-			}
-			tokens = strings.Join(parts, " ")
-		}
-		warning := r.Warning
-		if warning == "" {
-			warning = "no Redpoint customer with matching name/email"
-		}
-		// Jump to Members page with search prefilled. The Members search box
-		// hits /ui/frag/search-results against the local Redpoint directory
-		// cache, so the staffer can scan likely hits and use the Select
-		// button → Add Member form to enroll the NFC token shown above.
-		searchQuery := r.UniFiEmail
-		if searchQuery == "" {
-			searchQuery = r.UniFiName
-		}
-		fixHref := fmt.Sprintf(`/ui/members?q=%s`, HTMLEscape(searchQuery))
-		sb.WriteString(fmt.Sprintf(
-			`<tr>`+
-				`<td>%s</td>`+
-				`<td>%s</td>`+
-				`<td>%s</td>`+
-				`<td><span class="badge %s">%s</span><br><span style="color: var(--text-muted); font-size: 12px">%s</span></td>`+
-				`<td><a class="btn btn-primary btn-sm" href="%s">Search Redpoint →</a></td>`+
-				`</tr>`,
-			HTMLEscape(r.UniFiName),
-			email,
-			tokens,
-			catClass, HTMLEscape(catText),
-			HTMLEscape(warning),
-			fixHref,
-		))
+	noun := "users"
+	if count == 1 {
+		noun = "user"
 	}
-	sb.WriteString(`</tbody></table>`)
-	return sb.String()
+	return fmt.Sprintf(
+		`<p style="margin: 0"><span class="badge badge-pending">%d</span> %s pending manual match — <a href="/ui/needs-match">resolve in Needs Match →</a></p>`,
+		count, noun)
 }
 
 // ShadowDecisionRow is a single UA-Hub-vs-bridge comparison row.
@@ -966,12 +983,12 @@ func ShadowDecisionsFragment(
 		}
 		sb.WriteString(fmt.Sprintf(
 			`<tr>`+
-				`<td>%s</td><td>%s</td><td><code>%s</code></td><td>%s</td>`+
+				`<td style="white-space:nowrap" title="%s">%s</td><td>%s</td><td><code>%s</code></td><td>%s</td>`+
 				`<td><span class="badge %s">%s</span></td>`+
 				`<td><span class="badge %s">%s</span></td>`+
 				`<td>%s</td><td>%s</td>`+
 				`</tr>`,
-			HTMLEscape(r.Time), HTMLEscape(r.Name), HTMLEscape(r.NfcUID), HTMLEscape(r.Door),
+			HTMLEscape(r.Time), HTMLEscape(FormatRecent(r.Time)), HTMLEscape(r.Name), HTMLEscape(r.NfcUID), HTMLEscape(r.Door),
 			unifiClass, HTMLEscape(r.UnifiResult),
 			bridgeClass, HTMLEscape(r.OurResult),
 			HTMLEscape(r.Kind()),
@@ -1039,7 +1056,7 @@ func NeedsMatchListFragment(rows []NeedsMatchRow) string {
 
 	sb.WriteString(`<table><thead><tr>`)
 	sb.WriteString(`<th>UA-Hub User</th><th>Email</th><th>Reason</th>` +
-		`<th>First Seen</th><th>Deactivates</th><th></th>`)
+		`<th>First Seen</th><th>Grace Ends</th><th></th>`)
 	sb.WriteString(`</tr></thead><tbody>`)
 
 	for _, r := range rows {
@@ -1076,7 +1093,7 @@ func NeedsMatchListFragment(rows []NeedsMatchRow) string {
 				`<td>%s<br><code style="font-size:11px; color: var(--text-muted)">%s</code></td>`+
 				`<td>%s</td>`+
 				`<td><span class="badge %s">%s</span></td>`+
-				`<td>%s</td><td>%s</td>`+
+				`<td style="white-space:nowrap" title="%s">%s</td><td style="white-space:nowrap">%s</td>`+
 				`<td><button class="btn btn-primary btn-sm"`+
 				` hx-get="/ui/frag/unmatched/%s/detail"`+
 				` hx-target="#needs-match-detail"`+
@@ -1086,12 +1103,44 @@ func NeedsMatchListFragment(rows []NeedsMatchRow) string {
 			name, HTMLEscape(r.UAUserID),
 			email,
 			reasonClass, HTMLEscape(reasonText),
-			HTMLEscape(r.FirstSeen), HTMLEscape(r.GraceUntil),
+			HTMLEscape(r.FirstSeen), HTMLEscape(FormatLocal(r.FirstSeen)), graceCell(r.GraceUntil),
 			HTMLEscape(r.UAUserID),
 		))
 	}
 	sb.WriteString(`</tbody></table>`)
 	return sb.String()
+}
+
+// graceCell renders the "Grace Ends" cell. Grace expiry is ALERT-ONLY:
+// an unmatched user is never auto-deactivated — statusync.runExpiryPhase
+// just flags overdue rows in the daily digest until staff resolve them.
+// Overdue rows get a warning badge so the ticket reads as "needs
+// attention", never as a deactivation countdown.
+func graceCell(graceUntil string) string {
+	t, ok := parseStoreTimestamp(graceUntil)
+	if !ok {
+		return HTMLEscape(graceUntil)
+	}
+	if over := time.Since(t); over > 0 {
+		return fmt.Sprintf(
+			`<span class="badge badge-failed" title="Grace ended %s. Nothing is deactivated automatically — resolve this row manually.">Past grace (%s) — resolve manually</span>`,
+			HTMLEscape(graceUntil), HTMLEscape(compactDuration(over)))
+	}
+	return fmt.Sprintf(`<span title="%s">%s</span>`,
+		HTMLEscape(graceUntil), HTMLEscape(FormatLocal(graceUntil)))
+}
+
+// compactDuration renders a duration as its single largest unit
+// ("3d", "5h", "20m") for the overdue badge.
+func compactDuration(d time.Duration) string {
+	switch {
+	case d >= 24*time.Hour:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	case d >= time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
 }
 
 // NeedsMatchCandidate is a Redpoint customer that the bridge wants to
@@ -1135,13 +1184,13 @@ func NeedsMatchDetailFragment(
 	sb.WriteString(fmt.Sprintf(
 		`<h3>%s</h3>`+
 			`<p style="color: var(--text-muted); margin-bottom: 8px">`+
-			`UA-Hub ID: <code>%s</code> · Email: %s · Reason: <code>%s</code> · First seen: %s · Grace until: %s`+
+			`UA-Hub ID: <code>%s</code> · Email: %s · Reason: <code>%s</code> · First seen: <span title="%s">%s</span> · Grace ends: %s`+
 			`</p>`,
 		HTMLEscape(displayName),
 		HTMLEscape(uaUserID),
 		HTMLEscape(displayEmail),
 		HTMLEscape(reason),
-		HTMLEscape(firstSeen), HTMLEscape(graceUntil),
+		HTMLEscape(firstSeen), HTMLEscape(FormatLocal(firstSeen)), graceCell(graceUntil),
 	))
 
 	// Inline search box — POSTs (CSRF-protected) to the candidate
@@ -1217,11 +1266,13 @@ func NeedsMatchDetailFragment(
 			` hx-confirm="Skip = immediately deactivate this UA-Hub user. Continue?">Skip (deactivate now)</button>`,
 		HTMLEscape(uaUserID),
 	))
+	// "Snooze", not "Defer the deactivation": grace expiry is alert-
+	// only, so extending the window just quiets the daily-digest flag.
 	sb.WriteString(fmt.Sprintf(
 		`<button class="btn btn-primary btn-sm"`+
 			` hx-post="/ui/frag/unmatched/%s/defer"`+
 			` hx-target="#needs-match-detail" hx-swap="innerHTML"`+
-			` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>Defer 7 days</button>`,
+			` hx-headers='{"X-Requested-With":"XMLHttpRequest"}'>Snooze alerts 7 days</button>`,
 		HTMLEscape(uaUserID),
 	))
 	sb.WriteString(`</div></div>`)
@@ -1308,13 +1359,13 @@ func MemberDetailFragment(d MemberDetailData) string {
 	if d.Member.Active {
 		activeBadge = `<span class="badge badge-active">active</span>`
 	}
-	badgeStatusChip := HTMLEscape(d.Member.BadgeStatus)
+	badgeStatusChip := statusBadge(d.Member.BadgeStatus)
 	if d.Member.BadgeStatus == "" {
 		badgeStatusChip = `<span style="color: var(--text-muted)">—</span>`
 	}
-	lastCI := d.Member.LastCheckIn
-	if lastCI == "" {
-		lastCI = "Never"
+	lastCI := "Never"
+	if d.Member.LastCheckIn != "" {
+		lastCI = FormatRecent(d.Member.LastCheckIn)
 	}
 
 	sb.WriteString(fmt.Sprintf(
@@ -1377,7 +1428,8 @@ func MemberDetailFragment(d MemberDetailData) string {
 			uaName, HTMLEscape(d.Mapping.UAUserID),
 			uaEmail,
 			uaStatus,
-			HTMLEscape(d.Mapping.MatchedAt),
+			fmt.Sprintf(`<span title="%s">%s</span>`,
+				HTMLEscape(d.Mapping.MatchedAt), HTMLEscape(FormatLocal(d.Mapping.MatchedAt))),
 			HTMLEscape(d.Mapping.MatchedBy),
 		))
 	}
@@ -1482,8 +1534,9 @@ func MemberDetailFragment(d MemberDetailData) string {
 				afterVal = `<span style="color: var(--text-muted)">—</span>`
 			}
 			sb.WriteString(fmt.Sprintf(
-				`<tr><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td><td><code>%s</code></td></tr>`,
+				`<tr><td style="white-space:nowrap" title="%s">%s</td><td><code>%s</code></td><td>%s</td><td>%s</td><td><code>%s</code></td></tr>`,
 				HTMLEscape(a.Timestamp),
+				HTMLEscape(FormatLocal(a.Timestamp)),
 				HTMLEscape(a.Field),
 				beforeVal,
 				afterVal,

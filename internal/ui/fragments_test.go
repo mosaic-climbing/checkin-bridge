@@ -31,13 +31,15 @@ func TestSearchResultsFragment_NotEnrolledHasNoSelectButton(t *testing.T) {
 		InCache:    false,
 	}})
 
-	// The Select button is gone — provisioning happens in UniFi Access.
+	// The Select button is gone — provisioning happens via /ui/members/new.
 	if strings.Contains(out, ">Select</button>") {
 		t.Errorf("not-enrolled row should not render a Select button; output:\n%s", out)
 	}
-	// And the row tells the operator where to go next.
-	if !strings.Contains(out, "Add in UniFi Access") {
-		t.Errorf("not-enrolled row should hint operator to add in UniFi; output:\n%s", out)
+	// And the row points the operator at the New Member flow (the old
+	// "Add in UniFi Access" hint predated the restored provisioning flow
+	// — console-created users are what refill the Needs Match queue).
+	if !strings.Contains(out, `href="/ui/members/new"`) {
+		t.Errorf("not-enrolled row should link to the New Member flow; output:\n%s", out)
 	}
 	// Status badge still says "Not enrolled".
 	if !strings.Contains(out, "Not enrolled") {

@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -268,74 +267,10 @@ func TestFragMemberTable_Pagination_LimitCapped(t *testing.T) {
 	}
 }
 
-func TestFragUnmatchedTable_ServedFromCacheOnSecondCall(t *testing.T) {
-	srv, _, _ := setupTestServer(t)
-
-	// First call
-	req1 := httptest.NewRequest("GET", "/ui/frag/unmatched-table", nil)
-	w1 := httptest.NewRecorder()
-	srv.handleFragUnmatchedTable(w1, req1)
-	body1, _ := io.ReadAll(w1.Body)
-
-	// Second call—should be identical (from cache)
-	req2 := httptest.NewRequest("GET", "/ui/frag/unmatched-table", nil)
-	w2 := httptest.NewRecorder()
-	srv.handleFragUnmatchedTable(w2, req2)
-	body2, _ := io.ReadAll(w2.Body)
-
-	if !bytes.Equal(body1, body2) {
-		t.Errorf("Expected identical content from cache")
-	}
-}
-
-func TestFragUnmatchedTable_CacheControlHeader(t *testing.T) {
-	srv, _, _ := setupTestServer(t)
-
-	req := httptest.NewRequest("GET", "/ui/frag/unmatched-table", nil)
-	w := httptest.NewRecorder()
-	srv.handleFragUnmatchedTable(w, req)
-
-	cc := w.Header().Get("Cache-Control")
-	if cc != "private, max-age=5" {
-		t.Errorf("Expected Cache-Control header 'private, max-age=5', got %q", cc)
-	}
-}
-
-func TestFragUnmatchedTable_InvalidatedByMemberMutation(t *testing.T) {
-	srv, db, _ := setupTestServer(t)
-	ctx := context.Background()
-
-	// Add a member
-	err := db.UpsertMember(ctx, &store.Member{
-		NfcUID:      "NFC001",
-		CustomerID:  "c1",
-		FirstName:   "Test",
-		LastName:    "Member",
-		Active:      true,
-		BadgeStatus: "ACTIVE",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// First call—cache the table
-	req1 := httptest.NewRequest("GET", "/ui/frag/unmatched-table", nil)
-	w1 := httptest.NewRecorder()
-	srv.handleFragUnmatchedTable(w1, req1)
-
-	// Simulate member mutation
-	srv.htmlCache.Invalidate()
-
-	// Second call—cache should be invalidated (will re-run ingester)
-	req2 := httptest.NewRequest("GET", "/ui/frag/unmatched-table", nil)
-	w2 := httptest.NewRecorder()
-	srv.handleFragUnmatchedTable(w2, req2)
-
-	// Both should return content (no assertion on content, just that it doesn't panic)
-	if w1.Code != http.StatusOK || w2.Code != http.StatusOK {
-		t.Errorf("Expected 200 OK from both calls")
-	}
-}
+// The /ui/frag/unmatched-table endpoint (dry-run-ingest panel) was
+// removed with the Sync page's "Unmatched UniFi Users" card; its cache
+// tests went with it. The replacement chip is a cheap PendingCount read
+// with no caching — see TestFragPendingSummary.
 
 func TestHTMLCache_Concurrency(t *testing.T) {
 	// This test ensures the htmlCache works correctly under concurrent access

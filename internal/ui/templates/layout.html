@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Mosaic Bridge</title>
+    <!-- Inline data-URI favicon: works offline, no extra request. -->
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%236c5ce7'/%3E%3Ctext x='8' y='12' font-family='sans-serif' font-size='10' font-weight='700' text-anchor='middle' fill='%23fff'%3EM%3C/text%3E%3C/svg%3E">
     <!-- Vendored (not CDN): the UI must work — login included — when the
          gym's internet is down, which is exactly when staff reach for it. -->
     <script src="/ui/static/htmx-2.0.4.min.js"></script>
@@ -18,8 +20,8 @@
         }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); display: flex; min-height: 100vh; }
 
-        /* Sidebar */
-        .sidebar { width: 220px; background: var(--sidebar); color: var(--text); padding: 20px 0; flex-shrink: 0; position: fixed; top: 0; bottom: 0; overflow-y: auto; border-right: 1px solid var(--border); }
+        /* Sidebar — flex column so the logout link pins to the bottom. */
+        .sidebar { width: 220px; background: var(--sidebar); color: var(--text); padding: 20px 0; flex-shrink: 0; position: fixed; top: 0; bottom: 0; overflow-y: auto; border-right: 1px solid var(--border); display: flex; flex-direction: column; }
         .sidebar h1 { font-size: 18px; padding: 0 20px 20px; border-bottom: 1px solid var(--border); margin-bottom: 10px; }
         .sidebar h1 span { color: var(--accent); }
         .nav-section { padding: 8px 20px 4px; font-size: 11px; text-transform: uppercase; color: var(--text-muted); letter-spacing: 1px; }
@@ -32,8 +34,9 @@
         .page-header h2 { font-size: 22px; font-weight: 600; }
         .page-header p { color: var(--text-muted); margin-top: 4px; }
 
-        /* Cards */
-        .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+        /* Cards. overflow-x lets wide tables scroll inside their card
+           instead of forcing horizontal body scroll. */
+        .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 16px; overflow-x: auto; }
         .card h3 { font-size: 15px; font-weight: 600; margin-bottom: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
 
         /* Stats grid */
@@ -75,6 +78,10 @@
         .btn-danger:hover { background: #c0392b; }
         .btn-success { background: var(--success); color: #fff; }
         .btn-success:hover { background: #00a382; }
+        /* Quiet destructive button: outline until hovered. A solid red
+           button on every table row read as a wall of danger. */
+        .btn-outline-danger { background: transparent; color: var(--danger); border: 1px solid var(--border); }
+        .btn-outline-danger:hover { border-color: var(--danger); background: #fdf1f1; }
         .btn-sm { padding: 5px 10px; font-size: 12px; }
 
         /* HTMX indicator */
@@ -97,13 +104,14 @@
         .status-dot.connected { background: var(--success); }
         .status-dot.disconnected { background: var(--danger); }
 
-        /* Responsive */
-        @media (max-width: 768px) {
-            .sidebar { width: 60px; }
-            .sidebar h1, .nav-section { display: none; }
-            .nav-link { text-align: center; padding: 12px; font-size: 0; }
-            .main { margin-left: 60px; }
-        }
+        /* Logout: quiet text link pinned to the sidebar bottom. */
+        .logout-link { display: block; padding: 10px 20px; margin-top: auto; color: var(--text-muted); background: none; border: none; font-size: 13px; text-align: left; width: 100%; cursor: pointer; }
+        .logout-link:hover { color: var(--danger); }
+
+        /* No sub-768px rules: the old block collapsed the sidebar to a
+           60px rail of zero-font-size nav links with no icons — literally
+           invisible navigation, and iPad portrait is exactly 768px. The
+           front desk uses a desktop; wide tables scroll in-card. */
     </style>
 </head>
 <body hx-headers='{"X-Requested-With":"XMLHttpRequest","X-CSRF-Token":"{{CSRF_TOKEN}}"}'>
@@ -122,12 +130,10 @@
         <a class="nav-link" href="/ui/sync" hx-get="/ui/sync" hx-target="#content" hx-push-url="true">Sync &amp; Jobs</a>
         <a class="nav-link" href="/ui/doors" hx-get="/ui/doors" hx-target="#content" hx-push-url="true">Door Policies</a>
         <a class="nav-link" href="/ui/metrics" hx-get="/ui/metrics" hx-target="#content" hx-push-url="true">Metrics</a>
-        <div style="margin-top:auto; padding:20px;">
-            <button class="btn btn-danger btn-sm" style="width:100%"
-                hx-post="/ui/logout"
-                hx-swap="none"
-                hx-on::after-request="window.location='/ui/'">Logout</button>
-        </div>
+        <button class="logout-link"
+            hx-post="/ui/logout"
+            hx-swap="none"
+            hx-on::after-request="window.location='/ui/'">Log out</button>
     </nav>
     <main class="main">
         <div id="content">{{CONTENT}}</div>
@@ -161,6 +167,30 @@
         document.body.addEventListener('htmx:sendError', function () {
             toast('Can’t reach the bridge — is the service running?');
         });
+    })();
+
+    // Active-nav highlight + per-page document.title. Server templates
+    // are static strings (no per-page substitution pass), so the sidebar
+    // link whose href matches location.pathname is the cheapest source
+    // of truth — on initial load AND after every hx-push-url navigation.
+    (function () {
+        function syncNav() {
+            var path = location.pathname.replace(/\/+$/, '') || '/ui';
+            var links = document.querySelectorAll('.sidebar .nav-link');
+            var title = 'Mosaic Bridge';
+            links.forEach(function (a) {
+                var href = a.getAttribute('href').replace(/\/+$/, '') || '/ui';
+                var active = href === path;
+                a.classList.toggle('active', active);
+                if (active && href !== '/ui') {
+                    title = a.textContent.trim() + ' — Mosaic Bridge';
+                }
+            });
+            document.title = title;
+        }
+        syncNav();
+        document.body.addEventListener('htmx:pushedIntoHistory', syncNav);
+        window.addEventListener('popstate', syncNav);
     })();
     </script>
 </body>
