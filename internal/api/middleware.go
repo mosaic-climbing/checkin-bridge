@@ -87,17 +87,20 @@ func SecurityMiddleware(cfg SecurityConfig, next http.Handler) http.Handler {
 		// ── Auth: determine which routes are public ──────────
 		path := r.URL.Path
 
-		// Login endpoint and the login page itself are public.
-		// The staff UI app (/ui, /ui/) redirects to login if no session — that redirect
-		// happens client-side in the JS, so we serve the HTML publicly but the
-		// API endpoints behind it are all authenticated.
-		if path == "/ui/login" || path == "/ui/logout" {
+		// Login endpoint and the login page itself are public. Static
+		// assets (vendored htmx) must be public too — the login page
+		// loads them before any session exists.
+		if path == "/ui/login" || path == "/ui/logout" || strings.HasPrefix(path, "/ui/static/") {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// Staff UI pages and fragments: require session cookie
-		if path == "/ui" || path == "/ui/" || strings.HasPrefix(path, "/ui/page/") || strings.HasPrefix(path, "/ui/frag/") {
+		// Everything else under /ui is the staff UI: pages, fragments,
+		// and page-specific actions (members/new, sync/unstick, …).
+		// Pre-fix this matched only four literal shapes, so a logged-out
+		// deep link to /ui/members fell through to the generic branch
+		// and rendered raw JSON {"error":"unauthorized"} in the browser.
+		if path == "/ui" || strings.HasPrefix(path, "/ui/") {
 			if cfg.Sessions != nil && cfg.Sessions.GetSessionFromRequest(r) {
 				// Mutating /ui/frag/* routes (door-policy add/delete,
 				// unmatched-queue match/skip/defer) need the same CSRF
@@ -145,6 +148,15 @@ func SecurityMiddleware(cfg SecurityConfig, next http.Handler) http.Handler {
 		hasSession := cfg.Sessions != nil && cfg.Sessions.GetSessionFromRequest(r)
 
 		if !hasAPIKey && !hasSession {
+			// HTMX callers on non-/ui paths (the sync page's POST
+			// /cache/sync etc., the members table's DELETE /members/{id})
+			// get bounced to login when the session expires — without
+			// this, the button spinner stops and nothing visibly happens.
+			if r.Header.Get("HX-Request") == "true" {
+				w.Header().Set("HX-Redirect", "/ui/")
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
 			w.Header().Set("WWW-Authenticate", `Bearer realm="mosaic-bridge"`)
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
@@ -194,11 +206,11 @@ func SecurityMiddleware(cfg SecurityConfig, next http.Handler) http.Handler {
 // has no /ui paths, no session auth, and no CSRF. Admin API key is the
 // only supported credential.
 type ControlSecurityConfig struct {
-	AdminAPIKey    string
+	AdminAPIKey     string
 	AllowedNetworks []*net.IPNet
-	TrustedProxies []*net.IPNet
-	Logger         *slog.Logger
-	HTTPS          bool
+	TrustedProxies  []*net.IPNet
+	Logger          *slog.Logger
+	HTTPS           bool
 }
 
 // ControlSecurityMiddleware is the security stack for the control-plane

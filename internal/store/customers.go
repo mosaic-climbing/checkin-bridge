@@ -101,6 +101,12 @@ func (s *Store) SearchCustomersByLastName(ctx context.Context, lastName string) 
 }
 
 // SearchCustomersByEmail searches by exact email (case-insensitive).
+//
+// CAUTION: returns the FIRST matching row when several customers share
+// the email (households). Callers making binding decisions must use
+// SearchAllCustomersByEmail and handle the collision; this single-row
+// form is only safe for display/lookup contexts where "a" match is
+// acceptable.
 func (s *Store) SearchCustomersByEmail(ctx context.Context, email string) (*Customer, error) {
 	var c Customer
 	err := s.db.GetContext(ctx, &c, `SELECT * FROM customers WHERE lower(email) = ?`, strings.ToLower(email))
@@ -108,6 +114,18 @@ func (s *Store) SearchCustomersByEmail(ctx context.Context, email string) (*Cust
 		return nil, nil
 	}
 	return &c, err
+}
+
+// SearchAllCustomersByEmail returns every customer with the exact email
+// (case-insensitive), ordered stably by redpoint_id. Household members
+// commonly share one email, so binding decisions must see the whole
+// collision set — not an arbitrary first row.
+func (s *Store) SearchAllCustomersByEmail(ctx context.Context, email string) ([]Customer, error) {
+	var cs []Customer
+	err := s.db.SelectContext(ctx, &cs,
+		`SELECT * FROM customers WHERE lower(email) = ? ORDER BY redpoint_id`,
+		strings.ToLower(email))
+	return cs, err
 }
 
 // buildFTSQuery turns a free-text search box into an FTS5 MATCH expression.

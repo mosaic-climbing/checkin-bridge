@@ -22,6 +22,7 @@ import (
 	"github.com/mosaic-climbing/checkin-bridge/internal/store"
 	"github.com/mosaic-climbing/checkin-bridge/internal/ui"
 )
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	var totalMembers, activeMembers int
 	if s.store != nil {
@@ -166,10 +167,11 @@ func (s *Server) handleCheckins(w http.ResponseWriter, r *http.Request) {
 // decisions, and the UniFi result column that live in our store only.
 //
 // Query params:
-//   from=YYYY-MM-DD or RFC3339    (optional — unbounded if empty)
-//   to=YYYY-MM-DD or RFC3339      (optional — unbounded if empty, bare dates
-//                                  are expanded to end-of-day inside the store)
-//   format=csv|json               (default: csv)
+//
+//	from=YYYY-MM-DD or RFC3339    (optional — unbounded if empty)
+//	to=YYYY-MM-DD or RFC3339      (optional — unbounded if empty, bare dates
+//	                               are expanded to end-of-day inside the store)
+//	format=csv|json               (default: csv)
 //
 // Admin-auth only: this route is not in the public middleware allowlist, so
 // the security middleware requires admin API key or a staff session.
@@ -853,14 +855,14 @@ func (s *Server) handleIngestUniFi(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		writeJSON(w, map[string]any{
-			"timestamp":  result.Timestamp,
-			"dryRun":     result.DryRun,
-			"unifiUsers": result.UniFiUsers,
-			"withNfc":    result.WithNFC,
-			"matched":    result.Matched,
-			"unmatched":  result.Unmatched,
-			"skipped":    result.Skipped,
-			"applied":    result.Applied,
+			"timestamp":      result.Timestamp,
+			"dryRun":         result.DryRun,
+			"unifiUsers":     result.UniFiUsers,
+			"withNfc":        result.WithNFC,
+			"matched":        result.Matched,
+			"unmatched":      result.Unmatched,
+			"skipped":        result.Skipped,
+			"applied":        result.Applied,
 			"unmatchedUsers": unmatched,
 			"warningUsers":   warnings,
 		})

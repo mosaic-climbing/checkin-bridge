@@ -98,10 +98,10 @@ func TestValidateSession_RejectsEmptyAndMalformed(t *testing.T) {
 	sm := NewSessionManager("test-pass")
 
 	cases := []string{
-		"",                     // empty
-		"v2|",                  // prefix only
-		"v2|raw-only-no-dot",   // missing signature half
-		"v2|.onlysigno-raw",    // missing raw half
+		"",                   // empty
+		"v2|",                // prefix only
+		"v2|raw-only-no-dot", // missing signature half
+		"v2|.onlysigno-raw",  // missing raw half
 		sessionTokenPrefix + "extra|dots|in|raw.sig", // sig section looks ok but raw is garbage
 	}
 	for _, c := range cases {

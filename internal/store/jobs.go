@@ -11,10 +11,10 @@ import (
 // Job represents a background task (ingest, sync, etc.)
 type Job struct {
 	ID        string `db:"id"         json:"id"`
-	Type      string `db:"type"       json:"type"`       // "ingest", "cache_sync", "status_sync", "directory_sync"
-	Status    string `db:"status"     json:"status"`     // "pending", "running", "completed", "failed"
-	Progress  string `db:"progress"   json:"progress"`   // JSON progress data
-	Result    string `db:"result"     json:"result"`     // JSON result data
+	Type      string `db:"type"       json:"type"`     // "ingest", "cache_sync", "status_sync", "directory_sync"
+	Status    string `db:"status"     json:"status"`   // "pending", "running", "completed", "failed"
+	Progress  string `db:"progress"   json:"progress"` // JSON progress data
+	Result    string `db:"result"     json:"result"`   // JSON result data
 	Error     string `db:"error"      json:"error"`
 	CreatedAt string `db:"created_at" json:"createdAt"`
 	UpdatedAt string `db:"updated_at" json:"updatedAt"`

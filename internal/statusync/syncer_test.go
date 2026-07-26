@@ -560,11 +560,11 @@ func TestSupervisedLoop_RestartsOnPanic(t *testing.T) {
 // that lets staff-skipped users actually stay skipped.
 //
 // Before this guard, the skip flow looked like:
-//   1. Staff hits "Skip" → UA-Hub user → DEACTIVATED, pending row deleted.
-//   2. Next nightly: runMatchingPhase walks ALL UA users (DEACTIVATED
-//      included, because ListAllUsersWithStatus has no status filter)
-//      and re-creates a pending row for anyone without a mapping.
-//   3. The skipped user re-appears in Needs Match every night.
+//  1. Staff hits "Skip" → UA-Hub user → DEACTIVATED, pending row deleted.
+//  2. Next nightly: runMatchingPhase walks ALL UA users (DEACTIVATED
+//     included, because ListAllUsersWithStatus has no status filter)
+//     and re-creates a pending row for anyone without a mapping.
+//  3. The skipped user re-appears in Needs Match every night.
 //
 // The fix is a one-line status filter in runMatchingPhase. This test
 // drives a single DEACTIVATED, unmapped UA user through a full

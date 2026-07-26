@@ -65,11 +65,11 @@ func buildLegacyBridgeDB(t *testing.T, path string) {
 	// customers must exist before members. We run them in the same
 	// order the pre-A4 code did.
 	legacyOrder := []string{
-		cacheMigration1_customers, // 1: customers + sync_state
-		cacheMigration2_members,   // 2: members (FK → customers)
-		auditMigration1_checkins,  // 3: checkins + door_policies + jobs
-		auditMigration2_unifi_result, // 4: ALTER checkins ADD unifi_result
-		auditMigration3_mappings,  // 5: ua_user_mappings + pending + match_audit
+		cacheMigration1_customers,     // 1: customers + sync_state
+		cacheMigration2_members,       // 2: members (FK → customers)
+		auditMigration1_checkins,      // 3: checkins + door_policies + jobs
+		auditMigration2_unifi_result,  // 4: ALTER checkins ADD unifi_result
+		auditMigration3_mappings,      // 5: ua_user_mappings + pending + match_audit
 		cacheMigration3_customers_fts, // 6: customers_fts + triggers
 	}
 	for i, s := range legacyOrder {

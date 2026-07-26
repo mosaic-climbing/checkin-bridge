@@ -382,7 +382,7 @@ func (f *FakeUniFi) AddCardOwner(token string, owner CardOwner) {
 	f.CardOwners[token] = owner
 }
 
-func (f *FakeUniFi) Close() { f.Server.Close() }
+func (f *FakeUniFi) Close()          { f.Server.Close() }
 func (f *FakeUniFi) BaseURL() string { return f.Server.URL + "/api/v1/developer" }
 func (f *FakeUniFi) UnlockCount() int {
 	f.mu.Lock()

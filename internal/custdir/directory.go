@@ -35,15 +35,15 @@ type Directory struct {
 
 // CustomerRecord is a row in the local customer directory.
 type CustomerRecord struct {
-	RedpointID string  `db:"redpoint_id" json:"redpointId"`
-	FirstName  string  `db:"first_name"  json:"firstName"`
-	LastName   string  `db:"last_name"   json:"lastName"`
-	Email      string  `db:"email"       json:"email"`
-	Barcode    string  `db:"barcode"     json:"barcode"`
-	ExternalID string  `db:"external_id" json:"externalId"`
-	Active     bool    `db:"active"      json:"active"`
-	CreatedAt  string  `db:"created_at"  json:"createdAt"`
-	UpdatedAt  string  `db:"updated_at"  json:"updatedAt"`
+	RedpointID string `db:"redpoint_id" json:"redpointId"`
+	FirstName  string `db:"first_name"  json:"firstName"`
+	LastName   string `db:"last_name"   json:"lastName"`
+	Email      string `db:"email"       json:"email"`
+	Barcode    string `db:"barcode"     json:"barcode"`
+	ExternalID string `db:"external_id" json:"externalId"`
+	Active     bool   `db:"active"      json:"active"`
+	CreatedAt  string `db:"created_at"  json:"createdAt"`
+	UpdatedAt  string `db:"updated_at"  json:"updatedAt"`
 }
 
 // SyncState tracks progress of the bulk Redpoint → SQLite sync.

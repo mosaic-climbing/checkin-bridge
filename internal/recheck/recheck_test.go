@@ -89,17 +89,30 @@ type fakeRedpoint struct {
 	mu        sync.Mutex
 	customers []*redpoint.Customer
 	err       error
-	calls     int
+	// failLookup simulates a per-ID upstream failure: RefreshCustomers
+	// succeeds (nil error) but reports the requested IDs in FailedIDs —
+	// the outage shape that used to masquerade as "customer not found".
+	failLookup bool
+	calls      int
 }
 
-func (f *fakeRedpoint) RefreshCustomers(ctx context.Context, customerIDs []string) ([]*redpoint.Customer, error) {
+func (f *fakeRedpoint) RefreshCustomers(ctx context.Context, customerIDs []string) (*redpoint.RefreshOutcome, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	if f.err != nil {
 		return nil, f.err
 	}
-	return f.customers, nil
+	if f.failLookup {
+		return &redpoint.RefreshOutcome{FailedIDs: customerIDs}, nil
+	}
+	out := &redpoint.RefreshOutcome{Customers: f.customers}
+	if len(f.customers) == 0 {
+		// Mirror the real client's contract: a successful query with no
+		// customer is a confirmed deletion, not a failure.
+		out.DeletedIDs = customerIDs
+	}
+	return out, nil
 }
 
 // callCount reads the call counter under the same mutex the mutator
@@ -654,4 +667,35 @@ func (c *testClock) advance(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.t = c.t.Add(d)
+}
+
+// TestRecheck_FailedLookupIsUpstreamFailureNotNotFound pins the
+// RefreshOutcome contract on the recheck path: a per-ID lookup failure
+// (Redpoint outage) must surface as an error and count against the
+// breaker — NOT as the application-level "customer not found in
+// Redpoint" answer, which is what the pre-outcome API produced and
+// which both fed the breaker false successes and told denied members
+// they'd been deleted during outages.
+func TestRecheck_FailedLookupIsUpstreamFailureNotNotFound(t *testing.T) {
+	s := &fakeStore{member: denied("")}
+	rp := &fakeRedpoint{failLookup: true}
+	ua := &fakeUnifi{}
+	svc := newService(Config{}, s, rp, ua)
+
+	result, err := svc.RecheckDeniedTap(context.Background(), "NFC123")
+	if err == nil {
+		t.Fatalf("RecheckDeniedTap returned nil error for a failed lookup; result=%+v (must be an upstream error, not an answer)", result)
+	}
+	if result != nil {
+		t.Errorf("result = %+v, want nil on upstream failure", result)
+	}
+
+	// And it must count toward the breaker: enough consecutive failures
+	// trip it open (default threshold 5).
+	for i := 0; i < 10; i++ {
+		_, _ = svc.RecheckDeniedTap(context.Background(), "NFC123")
+	}
+	if !svc.breaker.isOpen() {
+		t.Error("breaker not open after repeated failed lookups; outages must trip it")
+	}
 }

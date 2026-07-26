@@ -34,14 +34,14 @@ func bcryptCost() int {
 
 // SessionManager handles staff login sessions with signed HTTP-only cookies.
 type SessionManager struct {
-	mu            sync.RWMutex
-	sessions      map[string]sessionEntry // token → entry
-	passwordHash  []byte                  // bcrypt hash of staff password
-	signingKey    []byte                  // HMAC key for signing session tokens
-	sessionMaxAge time.Duration
-	cookieName    string
+	mu             sync.RWMutex
+	sessions       map[string]sessionEntry // token → entry
+	passwordHash   []byte                  // bcrypt hash of staff password
+	signingKey     []byte                  // HMAC key for signing session tokens
+	sessionMaxAge  time.Duration
+	cookieName     string
 	csrfCookieName string
-	secureCookies bool                    // if true, set Secure flag on all cookies
+	secureCookies  bool // if true, set Secure flag on all cookies
 
 	// Per-IP login rate limiting. The map + list pair implement a bounded LRU:
 	//   loginAttempts: ip → *list.Element (so we can O(1) locate the element).

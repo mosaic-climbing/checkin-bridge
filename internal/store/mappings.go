@@ -34,10 +34,10 @@ type Mapping struct {
 // the unmatched bucket. The UI renders different copy per reason so staff
 // can prioritise.
 const (
-	PendingReasonNoEmail        = "no_email"         // UA-Hub user has NFC tokens but no email field set
-	PendingReasonNoMatch        = "no_match"         // email search returned zero Redpoint customers
-	PendingReasonAmbiguousEmail = "ambiguous_email"  // 2+ Redpoint customers share the email AND the name check couldn't disambiguate
-	PendingReasonAmbiguousName  = "ambiguous_name"   // email missing or no match; name-scan fallback returned 2+ candidates
+	PendingReasonNoEmail        = "no_email"        // UA-Hub user has NFC tokens but no email field set
+	PendingReasonNoMatch        = "no_match"        // email search returned zero Redpoint customers
+	PendingReasonAmbiguousEmail = "ambiguous_email" // 2+ Redpoint customers share the email AND the name check couldn't disambiguate
+	PendingReasonAmbiguousName  = "ambiguous_name"  // email missing or no match; name-scan fallback returned 2+ candidates
 )
 
 // Pending represents a UA-Hub user that couldn't be auto-matched and is

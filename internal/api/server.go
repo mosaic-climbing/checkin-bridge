@@ -346,11 +346,19 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /ui/members/new/{uaUserId}/enroll/{sessionId}/poll", withTimeout(shortTimeout, s.handleMembersNewEnrollPoll))
 	s.mux.HandleFunc("DELETE /ui/members/new/{uaUserId}/enroll/{sessionId}", withTimeout(shortTimeout, s.handleMembersNewEnrollCancel))
 
-	// Staff UI (auth handled by session cookies, not admin API key)
+	// Staff UI (auth handled by session cookies, not admin API key).
+	// "GET /ui/" is a SUBTREE pattern: it serves every page shell by
+	// deriving the page name from the path (/ui/members → members), so
+	// hx-push-url deep links survive reload/bookmark. Exact routes
+	// (members/new, frag/*, static/) win over it per ServeMux precedence.
 	s.mux.HandleFunc("GET /ui", s.handleUI)
 	s.mux.HandleFunc("GET /ui/", s.handleUI)
 	s.mux.HandleFunc("POST /ui/login", withTimeout(shortTimeout, s.handleUILogin))
 	s.mux.HandleFunc("POST /ui/logout", withTimeout(shortTimeout, s.handleUILogout))
+
+	// Vendored front-end assets (htmx). Public + long-cached: the login
+	// page loads these pre-auth, and the UI must work with the WAN down.
+	s.mux.Handle("GET /ui/static/", http.StripPrefix("/ui/static/", ui.StaticHandler()))
 
 	// HTMX UI pages (session required, handled by middleware)
 	s.mux.HandleFunc("GET /ui/page/{page}", s.handleUIPage)

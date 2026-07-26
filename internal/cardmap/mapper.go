@@ -22,10 +22,10 @@ import (
 // NFC tag UID doesn't match what's stored in Redpoint (e.g., replacement
 // tags, temporary tags, etc.).
 type Mapper struct {
-	mu       sync.RWMutex
+	mu        sync.RWMutex
 	overrides map[string]string // NFC tag UID → Redpoint customer ID
-	mapFile  string
-	logger   *slog.Logger
+	mapFile   string
+	logger    *slog.Logger
 }
 
 func New(dataDir string, logger *slog.Logger) (*Mapper, error) {

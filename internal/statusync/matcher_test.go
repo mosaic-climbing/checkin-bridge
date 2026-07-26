@@ -226,7 +226,7 @@ func TestNamesMatch(t *testing.T) {
 		{"alex", "ALEX", true},
 		{" Alex ", "alex", true},
 		{"Alex", "Alexander", false}, // no prefix match
-		{"", "", false},               // empty never matches
+		{"", "", false},              // empty never matches
 		{"", "Alex", false},
 		{"Alex", "", false},
 		{"   ", "Alex", false}, // whitespace-only is effectively empty
@@ -247,7 +247,7 @@ func TestFullNamesMatch(t *testing.T) {
 	}{
 		{"Alex", "Smith", "Alex", "Smith", true},
 		{"Alex", "Smith", "alex", "smith", true},
-		{"Alex", "Smith", "Alex", "Jones", false}, // last mismatch
+		{"Alex", "Smith", "Alex", "Jones", false},  // last mismatch
 		{"Alex", "Smith", "Jamie", "Smith", false}, // first mismatch
 		{"", "Smith", "Alex", "Smith", false},      // missing first
 		{"Alex", "", "Alex", "Smith", false},       // missing last
@@ -277,8 +277,8 @@ func TestHasMatchableSignal(t *testing.T) {
 		{ua("Alex", "Smith", "alex@example.com"), true},
 		{ua("Alex", "Smith", ""), true},
 		{ua("", "", "alex@example.com"), true},
-		{ua("Alex", "", ""), false},           // only first name — not enough
-		{ua("", "Smith", ""), false},          // only last name — not enough
+		{ua("Alex", "", ""), false},  // only first name — not enough
+		{ua("", "Smith", ""), false}, // only last name — not enough
 		{ua("", "", ""), false},
 		{ua("   ", "   ", "   "), false},
 	}

@@ -645,22 +645,46 @@ func (c *Client) execWithRetry(ctx context.Context, query string, vars map[strin
 
 // ─── Targeted Customer Refresh (for daily sync) ──────────────
 
+// RefreshOutcome is the per-ID-resolved result of RefreshCustomers.
+// The three buckets are mutually exclusive and together cover every
+// requested ID:
+//
+//   - Customers:  the query succeeded and returned the customer.
+//   - DeletedIDs: the query SUCCEEDED and Redpoint answered "no such
+//     customer" — a real application-level answer.
+//   - FailedIDs:  the query failed (network, 5xx, unmarshal) — the
+//     customer's true state is UNKNOWN.
+//
+// The distinction exists because conflating the last two poisoned the
+// member cache: a Redpoint outage used to look identical to "every
+// customer was deleted", and the cache refresh marked the entire
+// membership DELETED while the sync job reported green. Callers must
+// treat FailedIDs as "no information" — never as a state change.
+type RefreshOutcome struct {
+	Customers  []*Customer
+	DeletedIDs []string
+	FailedIDs  []string
+}
+
 // RefreshCustomers fetches fresh data for a list of known customer IDs.
 // This replaces the bulk ListAllActiveCustomers for daily syncs —
 // instead of paginating through 54k+ records, we refresh only the
 // ~100 members already in our cache.
-func (c *Client) RefreshCustomers(ctx context.Context, customerIDs []string) ([]*Customer, error) {
+//
+// The error return is reserved for context cancellation; per-ID
+// failures land in RefreshOutcome.FailedIDs so partial progress is
+// never discarded and callers can tell outage from deletion.
+func (c *Client) RefreshCustomers(ctx context.Context, customerIDs []string) (*RefreshOutcome, error) {
 	c.logger.Info("refreshing cached customers", "count", len(customerIDs))
 
-	var refreshed []*Customer
-	var errors []string
+	out := &RefreshOutcome{}
 
 	for i, id := range customerIDs {
 		// Rate-limit: small delay between requests
 		if i > 0 && i%10 == 0 {
 			select {
 			case <-ctx.Done():
-				return refreshed, ctx.Err()
+				return out, ctx.Err()
 			case <-time.After(1 * time.Second):
 			}
 		}
@@ -668,7 +692,7 @@ func (c *Client) RefreshCustomers(ctx context.Context, customerIDs []string) ([]
 		data, err := c.execWithRetry(ctx, customerByIDQuery, map[string]any{"id": id})
 		if err != nil {
 			c.logger.Warn("failed to refresh customer", "id", id, "error", err)
-			errors = append(errors, id)
+			out.FailedIDs = append(out.FailedIDs, id)
 			continue
 		}
 
@@ -677,23 +701,25 @@ func (c *Client) RefreshCustomers(ctx context.Context, customerIDs []string) ([]
 		}
 		if err := json.Unmarshal(data, &result); err != nil {
 			c.logger.Warn("failed to unmarshal customer", "id", id, "error", err)
-			errors = append(errors, id)
+			out.FailedIDs = append(out.FailedIDs, id)
 			continue
 		}
 
 		if result.Customer != nil {
-			refreshed = append(refreshed, result.Customer)
+			out.Customers = append(out.Customers, result.Customer)
 		} else {
 			c.logger.Info("customer no longer exists in Redpoint", "id", id)
+			out.DeletedIDs = append(out.DeletedIDs, id)
 		}
 	}
 
 	c.logger.Info("customer refresh complete",
 		"requested", len(customerIDs),
-		"refreshed", len(refreshed),
-		"errors", len(errors),
+		"refreshed", len(out.Customers),
+		"deleted", len(out.DeletedIDs),
+		"failed", len(out.FailedIDs),
 	)
-	return refreshed, nil
+	return out, nil
 }
 
 // ─── Name-Based Customer Search (for UniFi-first ingest) ─────

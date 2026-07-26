@@ -4,7 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Mosaic Bridge</title>
-    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <!-- Vendored (not CDN): the UI must work — login included — when the
+         gym's internet is down, which is exactly when staff reach for it. -->
+    <script src="/ui/static/htmx-2.0.4.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         :root {
@@ -107,16 +109,19 @@
 <body hx-headers='{"X-Requested-With":"XMLHttpRequest","X-CSRF-Token":"{{CSRF_TOKEN}}"}'>
     <nav class="sidebar">
         <h1><span>Mosaic</span> Bridge</h1>
+        <!-- hx-get targets the SAME URL the browser shows (the shell
+             route serves fragment-vs-full-page on HX-Request), so every
+             pushed URL survives reload/bookmark/new-tab. -->
         <div class="nav-section">Dashboard</div>
-        <a class="nav-link" href="/ui/" hx-get="/ui/page/dashboard" hx-target="#content" hx-push-url="/ui/">Dashboard</a>
+        <a class="nav-link" href="/ui/" hx-get="/ui/" hx-target="#content" hx-push-url="true">Dashboard</a>
         <div class="nav-section">Members</div>
-        <a class="nav-link" href="/ui/members" hx-get="/ui/page/members" hx-target="#content" hx-push-url="/ui/members">Members</a>
-        <a class="nav-link" href="/ui/needs-match" hx-get="/ui/page/needs-match" hx-target="#content" hx-push-url="/ui/needs-match">Needs Match</a>
-        <a class="nav-link" href="/ui/checkins" hx-get="/ui/page/checkins" hx-target="#content" hx-push-url="/ui/checkins">Check-ins</a>
+        <a class="nav-link" href="/ui/members" hx-get="/ui/members" hx-target="#content" hx-push-url="true">Members</a>
+        <a class="nav-link" href="/ui/needs-match" hx-get="/ui/needs-match" hx-target="#content" hx-push-url="true">Needs Match</a>
+        <a class="nav-link" href="/ui/checkins" hx-get="/ui/checkins" hx-target="#content" hx-push-url="true">Check-ins</a>
         <div class="nav-section">System</div>
-        <a class="nav-link" href="/ui/sync" hx-get="/ui/page/sync" hx-target="#content" hx-push-url="/ui/sync">Sync &amp; Jobs</a>
-        <a class="nav-link" href="/ui/doors" hx-get="/ui/page/doors" hx-target="#content" hx-push-url="/ui/doors">Door Policies</a>
-        <a class="nav-link" href="/ui/metrics" hx-get="/ui/page/metrics" hx-target="#content" hx-push-url="/ui/metrics">Metrics</a>
+        <a class="nav-link" href="/ui/sync" hx-get="/ui/sync" hx-target="#content" hx-push-url="true">Sync &amp; Jobs</a>
+        <a class="nav-link" href="/ui/doors" hx-get="/ui/doors" hx-target="#content" hx-push-url="true">Door Policies</a>
+        <a class="nav-link" href="/ui/metrics" hx-get="/ui/metrics" hx-target="#content" hx-push-url="true">Metrics</a>
         <div style="margin-top:auto; padding:20px;">
             <button class="btn btn-danger btn-sm" style="width:100%"
                 hx-post="/ui/logout"
@@ -127,5 +132,36 @@
     <main class="main">
         <div id="content">{{CONTENT}}</div>
     </main>
+    <div id="toast" style="display:none; position:fixed; bottom:20px; right:20px; z-index:100; max-width:360px;"
+         class="alert alert-error" role="alert"></div>
+    <script>
+    // Global HTMX failure handling. Without this, a fragment error left
+    // stale data on screen with zero indication, and an expired session
+    // made buttons silently do nothing.
+    (function () {
+        var toastTimer;
+        function toast(msg) {
+            var el = document.getElementById('toast');
+            el.textContent = msg;
+            el.style.display = 'block';
+            clearTimeout(toastTimer);
+            toastTimer = setTimeout(function () { el.style.display = 'none'; }, 6000);
+        }
+        document.body.addEventListener('htmx:responseError', function (evt) {
+            var status = evt.detail.xhr ? evt.detail.xhr.status : 0;
+            if (status === 401 || status === 403) {
+                // Session expired (401) or CSRF drift (403): reload the
+                // current URL — the shell route serves login and the
+                // post-login redirect returns here.
+                window.location.reload();
+                return;
+            }
+            toast('Server error (' + status + ') — the data on screen may be stale.');
+        });
+        document.body.addEventListener('htmx:sendError', function () {
+            toast('Can’t reach the bridge — is the service running?');
+        });
+    })();
+    </script>
 </body>
 </html>

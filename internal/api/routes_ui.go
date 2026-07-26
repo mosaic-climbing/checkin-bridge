@@ -7,12 +7,14 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/mosaic-climbing/checkin-bridge/internal/ingest"
 	"github.com/mosaic-climbing/checkin-bridge/internal/store"
 	"github.com/mosaic-climbing/checkin-bridge/internal/ui"
 )
+
 func (s *Server) handleUILogin(w http.ResponseWriter, r *http.Request) {
 	peer := s.clientIP(r)
 	// Check if IP is locked out before even reading the body
@@ -70,7 +72,16 @@ func (s *Server) handleUILogin(w http.ResponseWriter, r *http.Request) {
 	s.audit.Log("login_success", peer, nil)
 
 	if r.Header.Get("HX-Request") == "true" {
-		w.Header().Set("HX-Redirect", "/ui/")
+		// Land back where the staffer was: the login page is served at
+		// whatever /ui/* URL was originally requested, so the Referer
+		// carries the intended destination. Same-host /ui-prefixed paths
+		// only — anything else falls back to the dashboard.
+		dest := "/ui/"
+		if ref, err := url.Parse(r.Referer()); err == nil && ref.Host == r.Host &&
+			strings.HasPrefix(ref.Path, "/ui") && !strings.Contains(ref.Path, "..") {
+			dest = ref.Path
+		}
+		w.Header().Set("HX-Redirect", dest)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -88,33 +99,54 @@ func (s *Server) handleUILogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"success": true})
 }
 
-// GET /ui and /ui/ — serve the staff UI dashboard or login.
+// GET /ui/ (subtree) — serve the staff UI page named by the path, or
+// login when there's no session.
+//
+// The page name is derived from the URL: /ui/ → dashboard, /ui/members
+// → members, etc. Every sidebar hx-push-url therefore round-trips: a
+// reload, bookmark, or open-in-new-tab of /ui/members renders the
+// members page server-side. (Pre-fix this handler hardcoded
+// "dashboard", so every deep link silently rendered the wrong page.)
+// Exact-match routes (/ui/members/new, /ui/sync/unstick/…) keep
+// winning over this subtree per ServeMux precedence; unknown paths 404
+// via the HasPage allowlist.
 func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
 	if s.ui == nil {
 		writeError(w, http.StatusServiceUnavailable, "UI not available")
 		return
 	}
-	// Check if user has a valid session
-	if s.sessions != nil && s.sessions.GetSessionFromRequest(r) {
-		s.ui.ServePage(w, r, "dashboard", s.sessions.CSRFTokenFromRequest(r))
+	page := strings.Trim(strings.TrimPrefix(r.URL.Path, "/ui"), "/")
+	if page == "" {
+		page = "dashboard"
+	}
+	if !s.ui.HasPage(page) {
+		http.NotFound(w, r)
 		return
 	}
-	// No session — show login
+	// Check if user has a valid session
+	if s.sessions != nil && s.sessions.GetSessionFromRequest(r) {
+		s.ui.ServePage(w, r, page, s.sessions.CSRFTokenFromRequest(r))
+		return
+	}
+	// No session — show login. Served at the requested URL, so the
+	// post-login reload lands back on the page that was asked for.
 	s.ui.ServeLogin(w)
 }
 
-// GET /ui/page/{page} — serve a specific UI page.
+// GET /ui/page/{page} — legacy alias for the path-derived shell route
+// above; kept one release so stale tabs' sidebar fragments keep
+// working. Same session gate: pre-fix this handler rendered real page
+// shells (structure + copy, no data) to unauthenticated visitors.
 func (s *Server) handleUIPage(w http.ResponseWriter, r *http.Request) {
-	page := r.PathValue("page")
-	if s.ui != nil {
-		csrf := ""
-		if s.sessions != nil {
-			csrf = s.sessions.CSRFTokenFromRequest(r)
-		}
-		s.ui.ServePage(w, r, page, csrf)
-	} else {
+	if s.ui == nil {
 		writeError(w, http.StatusServiceUnavailable, "UI not available")
+		return
 	}
+	if s.sessions == nil || !s.sessions.GetSessionFromRequest(r) {
+		s.ui.ServeLogin(w)
+		return
+	}
+	s.ui.ServePage(w, r, r.PathValue("page"), s.sessions.CSRFTokenFromRequest(r))
 }
 
 // ─── Member Management (Staff UI) ────────────────────────────
@@ -259,10 +291,10 @@ func (s *Server) handleUnmatched(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, map[string]any{
-		"totalUnifi":  result.UniFiUsers,
-		"matched":     result.Matched,
-		"unmatched":   result.Unmatched,
-		"entries":     entries,
+		"totalUnifi": result.UniFiUsers,
+		"matched":    result.Matched,
+		"unmatched":  result.Unmatched,
+		"entries":    entries,
 	})
 }
 

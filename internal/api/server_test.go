@@ -18,6 +18,7 @@ import (
 	"github.com/mosaic-climbing/checkin-bridge/internal/redpoint"
 	"github.com/mosaic-climbing/checkin-bridge/internal/statusync"
 	"github.com/mosaic-climbing/checkin-bridge/internal/store"
+	"github.com/mosaic-climbing/checkin-bridge/internal/ui"
 	"github.com/mosaic-climbing/checkin-bridge/internal/unifi"
 )
 
@@ -80,6 +81,13 @@ func setupTestServer(t *testing.T) (*Server, *store.Store, *cardmap.Mapper) {
 	})
 
 	br, mw, uahub := noopServerCallbacks()
+	// Real embedded UI handler so page-shell routes render in tests —
+	// the deep-link fixes are asserted against actual template output.
+	uiHandler, err := ui.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	srv := NewServer(ServerDeps{
 		Handler:              handler,
 		Unifi:                unifiClient,
@@ -92,6 +100,7 @@ func setupTestServer(t *testing.T) (*Server, *store.Store, *cardmap.Mapper) {
 		GateID:               "gate-1",
 		Logger:               logger,
 		Store:                db,
+		UI:                   uiHandler,
 		BG:                   bgGroup,
 		BreakerResetter:      br,
 		MirrorWalker:         mw,

@@ -389,7 +389,7 @@ CREATE INDEX IF NOT EXISTS idx_match_audit_time
 // partial index on non-empty values lets RecordCheckIn use INSERT OR
 // IGNORE for a crash-safe dedup that survives process restarts too.
 //
-// Partial (WHERE != '') because historic checkins have empty log_id
+// Partial (WHERE != ”) because historic checkins have empty log_id
 // and mustn't collide with each other.
 const auditMigration4_unifi_log_id = `
 ALTER TABLE checkins ADD COLUMN unifi_log_id TEXT NOT NULL DEFAULT '';
@@ -410,7 +410,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_checkins_unifi_log_id
 // cleanest fix is to persist ua_name + ua_email alongside the pending
 // row and stop talking to UA-Hub from the render path.
 //
-// Both columns default to '' so existing rows upgrade cleanly; the next
+// Both columns default to ” so existing rows upgrade cleanly; the next
 // statusync pass re-observes the user and refreshes them via the
 // UpsertPending ON CONFLICT refresh clause.
 //
@@ -480,7 +480,7 @@ CREATE INDEX IF NOT EXISTS idx_ua_users_status
 // Migration 7 (audit): backfill pending-row identity cache (v0.5.4).
 //
 // Migration 5 added ua_name/ua_email to ua_user_mappings_pending with a
-// default of '' so existing rows could upgrade cleanly, on the assumption
+// default of ” so existing rows could upgrade cleanly, on the assumption
 // that the next statusync pass would refresh them via the UpsertPending
 // ON CONFLICT clause. That worked for rows already in the table at the
 // time migration 5 applied. It did NOT work for rows newly written by
