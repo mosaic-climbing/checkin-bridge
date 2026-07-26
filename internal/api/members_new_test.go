@@ -316,6 +316,14 @@ func TestMembersNew_CreateHappyPath(t *testing.T) {
 	if !strings.Contains(body, "Created UA-Hub user") {
 		t.Errorf("post-create copy missing; body = %q", body)
 	}
+	// OOB swap: the create-form card is replaced by the locked stub so
+	// the stale filled form can't be double-submitted mid-enrollment.
+	if !strings.Contains(body, `id="members-new-form-card" hx-swap-oob="true"`) {
+		t.Errorf("post-create response missing the OOB form-lock stub; body = %q", body)
+	}
+	if !strings.Contains(body, "Creating card for <strong>Happy Path</strong>") {
+		t.Errorf("form-lock stub should name the member; body = %q", body)
+	}
 
 	// §3.2: exactly one user created with the form's first/last/email.
 	if got := len(fakeUA.UsersCreated); got != 1 {

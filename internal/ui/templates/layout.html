@@ -124,12 +124,27 @@
         <a class="nav-link" href="/ui/" hx-get="/ui/" hx-target="#content" hx-push-url="true">Dashboard</a>
         <div class="nav-section">Members</div>
         <a class="nav-link" href="/ui/members" hx-get="/ui/members" hx-target="#content" hx-push-url="true">Members</a>
-        <a class="nav-link" href="/ui/needs-match" hx-get="/ui/needs-match" hx-target="#content" hx-push-url="true">Needs Match</a>
+        <!-- Plain href: /ui/members/new is an exact full-page route, not a
+             shell page, so it navigates normally. Shown unconditionally —
+             with AllowNewMembers=false the page explains how to enable. -->
+        <a class="nav-link" href="/ui/members/new">New Member</a>
+        <!-- The needs-match badge polls its own count; the fragment
+             response is the same self-swapping span (without the "load"
+             trigger, which would tight-loop on every swap). Zero renders
+             an empty, invisible span. hx-target="this" + hx-push-url=
+             "false" override the ancestors the span would otherwise
+             inherit from the nav anchor (htmx attribute inheritance) —
+             without them the poll swaps the badge into #content and
+             rewrites the URL bar to the fragment path. -->
+        <a class="nav-link" href="/ui/needs-match" hx-get="/ui/needs-match" hx-target="#content" hx-push-url="true"><span class="nav-label">Needs Match</span><span id="needs-match-badge"
+            hx-get="/ui/frag/needs-match-badge"
+            hx-trigger="load, every 60s [document.visibilityState === 'visible']"
+            hx-target="this" hx-push-url="false"
+            hx-swap="outerHTML"></span></a>
         <a class="nav-link" href="/ui/checkins" hx-get="/ui/checkins" hx-target="#content" hx-push-url="true">Check-ins</a>
         <div class="nav-section">System</div>
         <a class="nav-link" href="/ui/sync" hx-get="/ui/sync" hx-target="#content" hx-push-url="true">Sync &amp; Jobs</a>
-        <a class="nav-link" href="/ui/doors" hx-get="/ui/doors" hx-target="#content" hx-push-url="true">Door Policies</a>
-        <a class="nav-link" href="/ui/metrics" hx-get="/ui/metrics" hx-target="#content" hx-push-url="true">Metrics</a>
+        <a class="nav-link" href="/ui/health" hx-get="/ui/health" hx-target="#content" hx-push-url="true">Health</a>
         <button class="logout-link"
             hx-post="/ui/logout"
             hx-swap="none"
@@ -183,7 +198,11 @@
                 var active = href === path;
                 a.classList.toggle('active', active);
                 if (active && href !== '/ui') {
-                    title = a.textContent.trim() + ' — Mosaic Bridge';
+                    // Prefer the .nav-label span where present (links
+                    // that also carry a count badge, e.g. Needs Match)
+                    // so the badge number stays out of the tab title.
+                    var label = a.querySelector('.nav-label') || a;
+                    title = label.textContent.trim() + ' — Mosaic Bridge';
                 }
             });
             document.title = title;

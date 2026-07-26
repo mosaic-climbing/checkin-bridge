@@ -64,7 +64,7 @@ func TestUIDeepLinks_RenderTheNamedPage(t *testing.T) {
 		"/ui/needs-match": "Needs Match",
 		"/ui/checkins":    "Check-in History",
 		"/ui/sync":        "Sync &amp; Jobs",
-		"/ui/metrics":     "Metrics",
+		"/ui/health":      "go-live capabilities", // health subtitle
 	}
 	for path, marker := range pages {
 		w := getUI(t, h, path, cookies, false)
@@ -106,9 +106,14 @@ func TestUIDeepLinks_UnknownPage404s(t *testing.T) {
 	h := wrapUI(t, srv)
 	cookies := uiSession(t, srv)
 
-	w := getUI(t, h, "/ui/definitely-not-a-page", cookies, false)
-	if w.Code != http.StatusNotFound {
-		t.Errorf("unknown page = %d, want 404 (the old silent dashboard fallback masked broken links)", w.Code)
+	// /ui/doors and /ui/metrics are RETIRED pages (Door Policies died
+	// with the policy-engine deprecation; Metrics became /ui/health) —
+	// they must 404 via the HasPage allowlist like any unknown path.
+	for _, path := range []string{"/ui/definitely-not-a-page", "/ui/doors", "/ui/metrics"} {
+		w := getUI(t, h, path, cookies, false)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("GET %s = %d, want 404 (the old silent dashboard fallback masked broken links)", path, w.Code)
+		}
 	}
 }
 

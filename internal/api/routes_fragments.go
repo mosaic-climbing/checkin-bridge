@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mosaic-climbing/checkin-bridge/internal/jobs"
 	"github.com/mosaic-climbing/checkin-bridge/internal/redpoint"
 	"github.com/mosaic-climbing/checkin-bridge/internal/statusync"
 	"github.com/mosaic-climbing/checkin-bridge/internal/store"
@@ -281,25 +282,70 @@ func (s *Server) handleFragPolicyTable(w http.ResponseWriter, r *http.Request) {
 	ui.RenderFragment(w, ui.PolicyTableFragment(rows))
 }
 
-func (s *Server) handleFragMetricsSummary(w http.ResponseWriter, r *http.Request) {
-	if s.metrics == nil {
-		ui.RenderFragment(w, "")
-		return
+// healthJobTypes is the fixed render order for the Health page's
+// last-run list — the same five types the sync-page pills track.
+var healthJobTypes = []string{
+	jobs.TypeCacheSync, jobs.TypeStatusSync, jobs.TypeDirectorySync,
+	jobs.TypeUniFiIngest, jobs.TypeUAHubSync,
+}
+
+// handleFragHealthSummary renders the /ui/health body: the go-live
+// capability ladder (resolved values threaded through ServerDeps at
+// construction), UniFi connection state, last run per job type, the
+// pending Needs Match count, taps today, humanized uptime, and whether
+// push alerting is configured. Replaces the old metrics dump, which
+// answered neither "is it healthy?" nor "what mode am I in?".
+func (s *Server) handleFragHealthSummary(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	d := ui.HealthData{
+		InstanceName:         s.instanceName,
+		ShadowMode:           s.shadowMode,
+		CheckinRecordingLive: s.checkinRecordingLive,
+		StatusWritesMode:     s.statusWritesMode,
+		RecheckUnlockLive:    s.recheckUnlockLive,
+		AlertingConfigured:   s.alertingConfigured,
 	}
-	summary := s.metrics.JSONSummary()
-	uptime := "unknown"
-	if u, ok := summary["uptime"].(string); ok {
-		uptime = u
+	if s.unifi != nil {
+		d.UnifiConnected = s.unifi.Connected()
 	}
-	counters := make(map[string]int64)
-	if c, ok := summary["counters"].(map[string]int64); ok {
-		counters = c
+	if s.metrics != nil {
+		if u, ok := s.metrics.JSONSummary()["uptime"].(string); ok {
+			if parsed, err := time.ParseDuration(u); err == nil {
+				d.Uptime = parsed
+			}
+		}
 	}
-	gauges := make(map[string]float64)
-	if g, ok := summary["gauges"].(map[string]float64); ok {
-		gauges = g
+	if s.store != nil {
+		if stats, err := s.store.CheckInStats(ctx); err == nil && stats != nil {
+			d.TapsToday = stats.TotalToday
+		}
+		if count, err := s.store.PendingCount(ctx); err == nil {
+			d.PendingMatches = count
+		}
+		for _, jt := range healthJobTypes {
+			run := ui.HealthJobRun{Type: jt}
+			if job, err := s.store.LastJobByType(ctx, jt); err == nil && job != nil {
+				run.Status = job.Status
+				run.CreatedAt = job.CreatedAt
+			}
+			d.JobRuns = append(d.JobRuns, run)
+		}
 	}
-	ui.RenderFragment(w, ui.MetricsSummaryFragment(uptime, counters, gauges))
+	ui.RenderFragment(w, ui.HealthFragment(d))
+}
+
+// handleFragNeedsMatchBadge renders the sidebar Needs Match count pill.
+// The fragment self-polls (60s, visibility-gated) via the hx attributes
+// it carries; zero pending renders an empty span so nothing shows but
+// the poller survives.
+func (s *Server) handleFragNeedsMatchBadge(w http.ResponseWriter, r *http.Request) {
+	count := 0
+	if s.store != nil {
+		if c, err := s.store.PendingCount(r.Context()); err == nil {
+			count = c
+		}
+	}
+	ui.RenderFragment(w, ui.NeedsMatchBadgeFragment(count))
 }
 
 // handleFragShadowDecisions renders the panel comparing UniFi's native

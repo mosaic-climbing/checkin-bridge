@@ -1,0 +1,8 @@
+<div class="page-header">
+    <h2>Health</h2>
+    <p>Is the bridge healthy — and which go-live capabilities are live right now?</p>
+</div>
+
+<div hx-get="/ui/frag/health-summary" hx-trigger="load, every 15s [document.visibilityState === 'visible']" hx-swap="innerHTML">
+    <p style="color: var(--text-muted)">Loading health…</p>
+</div>
