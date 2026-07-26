@@ -3,7 +3,9 @@
     <p>Real-time gym access overview</p>
 </div>
 
-<div hx-get="/ui/frag/stats" hx-trigger="load, every 10s" hx-swap="innerHTML">
+<!-- Pollers are visibility-gated: a forgotten background tab must not
+     hammer the SQLite-backed fragment endpoints all day. -->
+<div hx-get="/ui/frag/stats" hx-trigger="load, every 10s [document.visibilityState === 'visible']" hx-swap="innerHTML">
     <div class="stats-grid">
         <div class="stat-card"><div class="stat-value">...</div><div class="stat-label">Loading</div></div>
     </div>
@@ -11,7 +13,7 @@
 
 <div class="card">
     <h3>Recent Check-ins</h3>
-    <div hx-get="/ui/frag/recent-checkins" hx-trigger="load, every 5s" hx-swap="innerHTML">
+    <div hx-get="/ui/frag/recent-checkins" hx-trigger="load, every 5s [document.visibilityState === 'visible']" hx-swap="innerHTML">
         <p style="color: var(--text-muted)">Loading...</p>
     </div>
 </div>
@@ -20,9 +22,9 @@
     <h3>Shadow Decisions</h3>
     <p style="color: var(--text-muted); margin-top: 4px">
         UniFi's native decision vs. the bridge's decision for each tap.
-        Rows shown are <strong>disagreements only</strong> — investigate every one before flipping shadow mode off.
+        Rows shown are <strong>disagreements only</strong> — investigate every one before enabling the next live capability.
     </p>
-    <div hx-get="/ui/frag/shadow-decisions" hx-trigger="load, every 10s" hx-swap="innerHTML">
+    <div hx-get="/ui/frag/shadow-decisions" hx-trigger="load, every 10s [document.visibilityState === 'visible']" hx-swap="innerHTML">
         <p style="color: var(--text-muted)">Loading...</p>
     </div>
 </div>

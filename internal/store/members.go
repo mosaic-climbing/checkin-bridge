@@ -128,18 +128,16 @@ func (s *Store) AllMembers(ctx context.Context) ([]Member, error) {
 	return members, err
 }
 
-// AllMembersPaged returns a page of members ordered by most-recently-bound first
-// (mapping.matched_at DESC, NULLS LAST so orphans sort to the bottom), with
-// (last_name, first_name) as the tiebreak so identical timestamps fall back to
-// alphabetical order. total is the count across all pages (not affected by
-// limit/offset).
+// AllMembersPaged returns a page of members in alphabetical order
+// (last_name, first_name, case-insensitive), the order a front-desk
+// staffer can predict and scan. total is the count across all pages
+// (not affected by limit/offset).
 //
-// v0.5.9 sort rationale: after a bulk ingest the newly-bound members are the
-// ones staff is most likely to open the detail panel on — misassignments
-// surface at the top of the list rather than needing a scroll through the
-// alphabetical back-catalogue. Orphaned members (no mapping row) sort to the
-// bottom because they're almost always historical debris from an aborted sync
-// run and the recovery action is "Remove", which doesn't care about position.
+// The v0.5.9 "most-recently-bound first" order (mapping.matched_at
+// DESC) keyed on a column the table doesn't display, so to staff it
+// read as random — the UI-overhaul review flagged it and the ordering
+// was switched to plain alphabetical. NFC UID tiebreaks identically-
+// named members so pagination is stable.
 func (s *Store) AllMembersPaged(ctx context.Context, limit, offset int) ([]Member, int, error) {
 	if limit <= 0 {
 		limit = 50
@@ -151,18 +149,11 @@ func (s *Store) AllMembersPaged(ctx context.Context, limit, offset int) ([]Membe
 	if err := s.db.GetContext(ctx, &total, `SELECT COUNT(*) FROM members`); err != nil {
 		return nil, 0, err
 	}
-	// LEFT JOIN rather than INNER: members whose customer_id has no
-	// mapping row still appear in the result set — their matched_at
-	// comes back NULL and the trailing `matched_at IS NULL` sort clause
-	// shoves them to the bottom of the list. SQLite doesn't support
-	// `NULLS LAST`; ordering by `matched_at IS NULL` (which is 0 for
-	// mapped rows and 1 for orphans) first achieves the same effect.
 	var members []Member
 	err := s.db.SelectContext(ctx, &members, `
-        SELECT mem.*
-          FROM members mem
-          LEFT JOIN ua_user_mappings map ON map.redpoint_customer_id = mem.customer_id
-         ORDER BY map.matched_at IS NULL, map.matched_at DESC, mem.last_name, mem.first_name
+        SELECT *
+          FROM members
+         ORDER BY last_name COLLATE NOCASE, first_name COLLATE NOCASE, nfc_uid
          LIMIT ? OFFSET ?
     `, limit, offset)
 	return members, total, err

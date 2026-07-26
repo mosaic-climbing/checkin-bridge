@@ -85,14 +85,25 @@ func (s *Store) MarkRedpointRecorded(ctx context.Context, id int64, redpointID s
 	return err
 }
 
-// RecentCheckIns returns the N most recent check-in events.
+// RecentCheckIns returns the N most recent check-in events, newest first
+// by EVENT TIME, not insert order. Backfill/replay batches (reconnect
+// sweeps, boot-time since-midnight replays) get insert ids that diverge
+// from tap order, so `ORDER BY id DESC` rendered them oldest-or-arbitrary
+// first.
+//
+// datetime() normalizes the two stored forms — RFC3339 ("…T12:00:00Z")
+// and SQLite's space format ("… 12:00:00") — before comparing. Raw
+// string ORDER BY would be wrong across formats: ' ' sorts before 'T',
+// so every SQLite-format row would sink below same-day RFC3339 rows
+// regardless of time. Unparseable timestamps yield NULL, which DESC
+// sorts last; id DESC tiebreaks same-second rows.
 func (s *Store) RecentCheckIns(ctx context.Context, limit int) ([]CheckInEvent, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	var events []CheckInEvent
 	err := s.db.SelectContext(ctx, &events,
-		`SELECT * FROM checkins ORDER BY id DESC LIMIT ?`, limit)
+		`SELECT * FROM checkins ORDER BY datetime(timestamp) DESC, id DESC LIMIT ?`, limit)
 	return events, err
 }
 
@@ -267,7 +278,7 @@ func (s *Store) DisagreementEvents(ctx context.Context, limit int) ([]CheckInEve
               (unifi_result = 'ACCESS'  AND result != 'allowed' AND result != 'recheck_allowed')
            OR (unifi_result = 'BLOCKED' AND (result = 'allowed' OR result = 'recheck_allowed'))
           )
-        ORDER BY id DESC
+        ORDER BY datetime(timestamp) DESC, id DESC
         LIMIT ?
     `, limit)
 	return events, err

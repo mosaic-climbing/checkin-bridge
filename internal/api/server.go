@@ -374,7 +374,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /ui/frag/policy-table", withTimeout(shortTimeout, s.handleFragPolicyTable))
 	s.mux.HandleFunc("GET /ui/frag/metrics-summary", withTimeout(shortTimeout, s.handleFragMetricsSummary))
 	s.mux.HandleFunc("GET /ui/frag/shadow-decisions", withTimeout(shortTimeout, s.handleFragShadowDecisions))
-	s.mux.HandleFunc("GET /ui/frag/unmatched-table", withTimeout(longTimeout, s.handleFragUnmatchedTable))
+	// Pending-count chip on the Sync page (replaces the removed
+	// /ui/frag/unmatched-table dry-run-ingest panel).
+	s.mux.HandleFunc("GET /ui/frag/pending-summary", withTimeout(shortTimeout, s.handleFragPendingSummary))
 
 	// v0.5.1 sync-page "Last run" pills. Backs the hx-get on each
 	// sync card so the pill auto-refreshes after a click (via

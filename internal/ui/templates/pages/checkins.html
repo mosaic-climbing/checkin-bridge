@@ -3,16 +3,18 @@
     <p>Durable record of all NFC tap events</p>
 </div>
 
+<!-- Pollers are visibility-gated: a forgotten background tab must not
+     hammer the SQLite-backed fragment endpoints all day. -->
 <div class="card">
     <h3>Today's Activity</h3>
-    <div hx-get="/ui/frag/checkin-stats" hx-trigger="load, every 10s" hx-swap="innerHTML">
+    <div hx-get="/ui/frag/checkin-stats" hx-trigger="load, every 10s [document.visibilityState === 'visible']" hx-swap="innerHTML">
         <p style="color: var(--text-muted)">Loading...</p>
     </div>
 </div>
 
 <div class="card">
     <h3>Recent Events</h3>
-    <div hx-get="/ui/frag/checkin-table" hx-trigger="load, every 5s" hx-swap="innerHTML">
+    <div hx-get="/ui/frag/checkin-table" hx-trigger="load, every 5s [document.visibilityState === 'visible']" hx-swap="innerHTML">
         <p style="color: var(--text-muted)">Loading...</p>
     </div>
 </div>

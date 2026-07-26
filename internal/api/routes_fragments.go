@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mosaic-climbing/checkin-bridge/internal/ingest"
 	"github.com/mosaic-climbing/checkin-bridge/internal/redpoint"
 	"github.com/mosaic-climbing/checkin-bridge/internal/statusync"
 	"github.com/mosaic-climbing/checkin-bridge/internal/store"
@@ -58,13 +57,12 @@ func (s *Server) handleFragRecentCheckins(w http.ResponseWriter, r *http.Request
 		if name == "" {
 			name = "Unknown"
 		}
-		// Format time to HH:MM:SS
-		t := e.Timestamp
-		if len(t) > 19 {
-			t = t[11:19]
-		}
+		// Raw timestamp through — CheckInTableFragment renders it in
+		// local wall-clock via ui.FormatRecent. (The old [11:19] slice
+		// showed bare UTC HH:MM:SS, hours off the gym clock, and let
+		// 19-char SQLite-format rows through completely raw.)
 		rows[i] = ui.CheckInRow{
-			Time: t, Name: name, NfcUID: e.NfcUID,
+			Time: e.Timestamp, Name: name, NfcUID: e.NfcUID,
 			Door: e.DoorName, Result: e.Result, DenyReason: e.DenyReason,
 		}
 	}
@@ -243,12 +241,8 @@ func (s *Server) handleFragCheckinTable(w http.ResponseWriter, r *http.Request) 
 		if name == "" {
 			name = "Unknown"
 		}
-		t := e.Timestamp
-		if len(t) > 19 {
-			t = t[11:19]
-		}
 		rows[i] = ui.CheckInRow{
-			Time: t, Name: name, NfcUID: e.NfcUID,
+			Time: e.Timestamp, Name: name, NfcUID: e.NfcUID,
 			Door: e.DoorName, Result: e.Result, DenyReason: e.DenyReason,
 		}
 	}
@@ -337,12 +331,8 @@ func (s *Server) handleFragShadowDecisions(w http.ResponseWriter, r *http.Reques
 		if name == "" {
 			name = "Unknown"
 		}
-		t := e.Timestamp
-		if len(t) > 19 {
-			t = t[11:19]
-		}
 		rows[i] = ui.ShadowDecisionRow{
-			Time:        t,
+			Time:        e.Timestamp,
 			Name:        name,
 			NfcUID:      e.NfcUID,
 			Door:        e.DoorName,
@@ -359,58 +349,23 @@ func (s *Server) handleFragShadowDecisions(w http.ResponseWriter, r *http.Reques
 	))
 }
 
-// handleFragUnmatchedTable renders the list of UniFi users with NFC tags
-// that couldn't be paired with a Redpoint customer. Backed by a dry-run
-// ingest against UniFi — slow-ish (hits the UA-Hub for every user) so this
-// fragment is load-triggered once per page visit, not on a poll. Each row
-// ends in a "Search Redpoint →" button that deep-links into the Members
-// page with the UniFi name/email prefilled.
-func (s *Server) handleFragUnmatchedTable(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "private, max-age=5")
-
-	if s.ingester == nil {
-		ui.RenderFragment(w, `<p style="color: var(--text-muted)">Ingester not configured.</p>`)
+// handleFragPendingSummary renders the one-line "N users pending manual
+// match → Needs Match" chip on the Sync page. Replaces the old
+// "Unmatched UniFi Users" panel (a full duplicate of the Needs Match
+// queue whose Open buttons targeted a div that only exists on the
+// Needs Match page — a silent htmx targetError on every click).
+func (s *Server) handleFragPendingSummary(w http.ResponseWriter, r *http.Request) {
+	if s.store == nil {
+		ui.RenderFragment(w, ui.PendingSummaryFragment(0))
 		return
 	}
-
-	const key = "frag-unmatched-table"
-	if body, hit := s.htmlCache.Get(key); hit {
-		w.Write(body)
-		return
-	}
-
-	result, err := s.ingester.Run(r.Context(), true) // always dry run
+	count, err := s.store.PendingCount(r.Context())
 	if err != nil {
-		ui.RenderFragment(w, ui.AlertFragment(false, "Ingest scan failed: "+err.Error()))
+		s.logger.Warn("pending count failed", "error", err)
+		ui.RenderFragment(w, ui.AlertFragment(false, "Failed to read pending count"))
 		return
 	}
-
-	rows := make([]ui.UnmatchedRow, 0)
-	for _, m := range result.Mappings {
-		if m.Method != ingest.MatchNone {
-			continue
-		}
-		cat := "no_match"
-		if strings.Contains(m.Warning, "multiple") {
-			cat = "multiple_match"
-		}
-		rows = append(rows, ui.UnmatchedRow{
-			UniFiUserID: m.UniFiUserID,
-			UniFiName:   m.UniFiName,
-			UniFiEmail:  m.UniFiEmail,
-			NfcTokens:   m.NfcTokens,
-			Category:    cat,
-			Warning:     m.Warning,
-		})
-	}
-
-	html := ui.UnmatchedTableFragment(
-		result.UniFiUsers, result.Matched, result.Unmatched, rows,
-	)
-	s.htmlCache.Set(key, []byte(html), 30*time.Second)
-
-	w.Write([]byte(html))
+	ui.RenderFragment(w, ui.PendingSummaryFragment(count))
 }
 
 // ─── "Needs Match" staff UI (C2) ─────────────────────────────
@@ -850,8 +805,10 @@ func (s *Server) handleFragUnmatchedDefer(w http.ResponseWriter, r *http.Request
 	}
 	s.audit.Log("staff_defer", r.RemoteAddr, map[string]any{"uaUserId": uaUserID, "graceUntil": newGrace})
 
+	// Alert-only vocabulary + local wall-clock time: nothing is
+	// deactivated when the window closes, the row is just flagged again.
 	ui.RenderFragment(w, ui.AlertFragment(true,
-		fmt.Sprintf("Deferred — grace window extended to %s.", newGrace)))
+		fmt.Sprintf("Snoozed — this row will be flagged again after %s.", ui.FormatLocal(newGrace))))
 }
 
 // splitCandidates parses the pipe-separated Candidates field from a
