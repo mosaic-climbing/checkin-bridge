@@ -25,15 +25,15 @@ import (
 // NfcTokens accessor decodes on read; callers that write through
 // UpsertUAUser pass a []string and the store handles marshalling.
 type UAUser struct {
-	ID             string `db:"id"              json:"id"`
-	FirstName      string `db:"first_name"      json:"firstName"`
-	LastName       string `db:"last_name"       json:"lastName"`
-	Name           string `db:"name"            json:"name"`
-	Email          string `db:"email"           json:"email"`
-	Status         string `db:"status"          json:"status"`
-	NfcTokensJSON  string `db:"nfc_tokens"      json:"-"`
-	FirstSeen      string `db:"first_seen"      json:"firstSeen"`
-	LastSyncedAt   string `db:"last_synced_at"  json:"lastSyncedAt"`
+	ID            string `db:"id"              json:"id"`
+	FirstName     string `db:"first_name"      json:"firstName"`
+	LastName      string `db:"last_name"       json:"lastName"`
+	Name          string `db:"name"            json:"name"`
+	Email         string `db:"email"           json:"email"`
+	Status        string `db:"status"          json:"status"`
+	NfcTokensJSON string `db:"nfc_tokens"      json:"-"`
+	FirstSeen     string `db:"first_seen"      json:"firstSeen"`
+	LastSyncedAt  string `db:"last_synced_at"  json:"lastSyncedAt"`
 }
 
 // NfcTokens decodes the stored JSON array. Returns nil on empty or on

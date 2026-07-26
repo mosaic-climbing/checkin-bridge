@@ -20,11 +20,11 @@ func TestParseRetryAfter_DeltaSeconds(t *testing.T) {
 		in   string
 		want time.Duration
 	}{
-		{"0", 0},                  // "retry immediately" → 0; loop floors with its own backoff
-		{"1", 1 * time.Second},    // smallest useful hint
-		{"30", 30 * time.Second},  // typical
+		{"0", 0},                 // "retry immediately" → 0; loop floors with its own backoff
+		{"1", 1 * time.Second},   // smallest useful hint
+		{"30", 30 * time.Second}, // typical
 		{"120", 120 * time.Second},
-		{"3600", time.Hour},       // long hint (Redpoint daily cap?)
+		{"3600", time.Hour}, // long hint (Redpoint daily cap?)
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
@@ -63,9 +63,9 @@ func TestParseRetryAfter_EmptyIsZero(t *testing.T) {
 func TestParseRetryAfter_GarbageIsZero(t *testing.T) {
 	cases := []string{
 		"later",
-		"5m",              // we don't parse Go-style durations
-		"1.5",             // no fractional seconds in the spec
-		"30s",             // the header spec is bare integer, not "30s"
+		"5m",  // we don't parse Go-style durations
+		"1.5", // no fractional seconds in the spec
+		"30s", // the header spec is bare integer, not "30s"
 		"tomorrow",
 		"{}",
 	}
@@ -291,4 +291,3 @@ func TestHTTPError_RetryAfterGarbageIsZero(t *testing.T) {
 		t.Errorf("RetryAfter = %v, want 0 (malformed header)", herr.RetryAfter)
 	}
 }
-

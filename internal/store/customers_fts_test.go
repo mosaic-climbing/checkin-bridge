@@ -236,10 +236,10 @@ func TestBuildFTSQuery_SanitisesMetaCharacters(t *testing.T) {
 		{"  spaced   tokens  ", `"spaced"* "tokens"*`},
 		{"alice@example.com", `"alice@example.com"*`},
 		{"smith-jones", `"smith-jones"*`},
-		{"!!! ::: ()", ""},     // all stripped
-		{"", ""},               // empty input
-		{"  ", ""},             // whitespace only
-		{`a"b"c`, `"abc"*`},    // quotes inside token stripped
+		{"!!! ::: ()", ""},                    // all stripped
+		{"", ""},                              // empty input
+		{"  ", ""},                            // whitespace only
+		{`a"b"c`, `"abc"*`},                   // quotes inside token stripped
 		{"OR AND NOT", `"OR"* "AND"* "NOT"*`}, // operator words quoted, neutralised
 	}
 	for _, c := range cases {

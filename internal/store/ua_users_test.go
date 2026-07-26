@@ -85,7 +85,7 @@ func TestUpsertUAUser_MissingRow_NilResult(t *testing.T) {
 // TestUpsertUAUser_PreservesFirstSeen is the main invariant we want to
 // protect: the nightly sync re-upserts every user every 24h; the audit
 // trail value of first_seen depends on not being stomped by those
-// refreshes. The store does this with COALESCE(NULLIF(?, ''), (SELECT
+// refreshes. The store does this with COALESCE(NULLIF(?, ”), (SELECT
 // first_seen FROM ua_users WHERE id = ?), ?); this test fails loudly
 // if that clause is ever simplified back to excluded.first_seen.
 func TestUpsertUAUser_PreservesFirstSeen(t *testing.T) {

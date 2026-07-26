@@ -19,6 +19,7 @@ import (
 	"github.com/mosaic-climbing/checkin-bridge/internal/store"
 	"github.com/mosaic-climbing/checkin-bridge/internal/ui"
 )
+
 // ─── HTMX Fragment Handlers ──────────────────────────────────
 
 func (s *Server) handleFragStats(w http.ResponseWriter, r *http.Request) {

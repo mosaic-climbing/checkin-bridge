@@ -47,10 +47,10 @@ var wsPingInterval = 30 * time.Second
 type ConnectionState string
 
 const (
-	Connecting    ConnectionState = "connecting"
-	Connected     ConnectionState = "connected"
-	Degraded      ConnectionState = "degraded"
-	Disconnected  ConnectionState = "disconnected"
+	Connecting   ConnectionState = "connecting"
+	Connected    ConnectionState = "connected"
+	Degraded     ConnectionState = "degraded"
+	Disconnected ConnectionState = "disconnected"
 )
 
 // HealthStatus represents the current health of the UniFi client connection.
@@ -144,15 +144,15 @@ type Client struct {
 	httpClient *http.Client
 
 	// Health tracking
-	state              atomic.Value // stores ConnectionState
-	lastConnected      atomic.Value // stores time.Time
-	lastDisconnected   atomic.Value // stores time.Time
-	lastEventAt        atomic.Value // stores time.Time
-	reconnectCount     atomic.Int64
-	onStateChange      StateChangeCallback
-	onReconnect        ReconnectCallback
-	healthMu           sync.RWMutex
-	degradedThreshold  time.Duration // default 5 minutes
+	state             atomic.Value // stores ConnectionState
+	lastConnected     atomic.Value // stores time.Time
+	lastDisconnected  atomic.Value // stores time.Time
+	lastEventAt       atomic.Value // stores time.Time
+	reconnectCount    atomic.Int64
+	onStateChange     StateChangeCallback
+	onReconnect       ReconnectCallback
+	healthMu          sync.RWMutex
+	degradedThreshold time.Duration // default 5 minutes
 
 	// Throughput counters. Snapshotted into the metrics registry at scrape
 	// time by main.go's /metrics handler; kept here so the unifi package
@@ -738,7 +738,7 @@ type UniFiUser struct {
 	ID        string   `json:"id"`
 	FirstName string   `json:"first_name"`
 	LastName  string   `json:"last_name"`
-	Name      string   `json:"name"`      // display name (may be "First Last")
+	Name      string   `json:"name"` // display name (may be "First Last")
 	Email     string   `json:"email"`
 	Status    string   `json:"status"`    // ACTIVE, etc.
 	NfcTokens []string `json:"nfcTokens"` // extracted NFC card UIDs

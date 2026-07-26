@@ -362,9 +362,9 @@ func TestTrack_NilStore(t *testing.T) {
 // otherwise start → 2× → cap-at-max.
 func TestNextBackoff(t *testing.T) {
 	cases := []struct {
-		name              string
+		name                string
 		current, start, max time.Duration
-		want              time.Duration
+		want                time.Duration
 	}{
 		{"disabled when start is 0", 30 * time.Second, 0, 5 * time.Minute, 0},
 		{"first failure jumps to start", 0, 5 * time.Second, 5 * time.Minute, 5 * time.Second},

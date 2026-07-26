@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -135,26 +136,50 @@ func (s *Syncer) RefreshAllStatuses(ctx context.Context) error {
 	)
 	start := time.Now()
 
-	refreshed, err := s.redpoint.RefreshCustomers(ctx, customerIDs)
+	outcome, err := s.redpoint.RefreshCustomers(ctx, customerIDs)
 	if err != nil {
 		return err
 	}
 
-	byID := make(map[string]*redpoint.Customer, len(refreshed))
-	for _, c := range refreshed {
+	byID := make(map[string]*redpoint.Customer, len(outcome.Customers))
+	for _, c := range outcome.Customers {
 		byID[c.ID] = c
+	}
+	// Only IDs Redpoint POSITIVELY answered "no such customer" for may
+	// be marked DELETED. Failed lookups mean the customer's state is
+	// unknown — a Redpoint outage must never read as a mass deletion
+	// (it used to: every member got DELETED and the job stayed green).
+	deletedIDs := make(map[string]struct{}, len(outcome.DeletedIDs))
+	for _, id := range outcome.DeletedIDs {
+		deletedIDs[id] = struct{}{}
+	}
+	failedIDs := make(map[string]struct{}, len(outcome.FailedIDs))
+	for _, id := range outcome.FailedIDs {
+		failedIDs[id] = struct{}{}
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	updated := 0
 	staleCount := 0
+	skippedUnknown := 0
 
 	for i := range members {
 		existing := &members[i]
 
 		cust, found := byID[existing.CustomerID]
 		if !found {
-			// Customer no longer exists in Redpoint — mark inactive but keep in cache
+			if _, failed := failedIDs[existing.CustomerID]; failed {
+				// No information — keep the member exactly as cached.
+				skippedUnknown++
+				continue
+			}
+			if _, deleted := deletedIDs[existing.CustomerID]; !deleted {
+				// Not fetched, not failed, not confirmed-deleted: an ID
+				// we never asked about (shouldn't happen — the request
+				// list is built from this member set). Leave untouched.
+				continue
+			}
+			// Customer confirmed gone from Redpoint — mark inactive but keep in cache
 			if existing.Active {
 				existing.Active = false
 				existing.BadgeStatus = "DELETED"
@@ -218,12 +243,20 @@ func (s *Syncer) RefreshAllStatuses(ctx context.Context) error {
 			"requested", len(customerIDs),
 			"updated", updated,
 			"stale", staleCount,
+			"skippedUnknown", skippedUnknown,
 			"cacheTotal", stats.Total,
 			"cacheActive", stats.Active,
 			"duration", time.Since(start).Round(time.Millisecond),
 		)
 	}
 
+	// A degraded refresh is a FAILED job, even though the successful
+	// subset was applied above: returning an error makes jobs.Loop back
+	// off and turns the sync page's last-run pill red, so an outage is
+	// visible instead of silently green with a stale cache.
+	if len(outcome.FailedIDs) > 0 {
+		return fmt.Errorf("refresh incomplete: %d of %d customers unreachable (statuses left untouched)",
+			len(outcome.FailedIDs), len(customerIDs))
+	}
 	return nil
 }
-

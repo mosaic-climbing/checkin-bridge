@@ -425,6 +425,7 @@ func TestNonNFCEvent(t *testing.T) {
 //     locally (so dashboards still show activity).
 //   - ZERO unlock calls are sent to UniFi.
 //   - ZERO createCheckIn mutations are sent to Redpoint.
+//
 // This is the contract the deployment relies on for safe parallel-run.
 func TestShadowMode_NoSideEffects(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

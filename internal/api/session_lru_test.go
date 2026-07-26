@@ -42,7 +42,7 @@ func TestLoginLRU_EvictsOldestNonLocked(t *testing.T) {
 
 	// Fill to capacity with three distinct IPs, oldest to newest.
 	base := time.Now().Add(-time.Hour)
-	insertTracker(sm, "1.1.1.1", base, time.Time{}, 0)            // oldest
+	insertTracker(sm, "1.1.1.1", base, time.Time{}, 0) // oldest
 	insertTracker(sm, "2.2.2.2", base.Add(time.Minute), time.Time{}, 0)
 	insertTracker(sm, "3.3.3.3", base.Add(2*time.Minute), time.Time{}, 0) // newest
 

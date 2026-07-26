@@ -52,6 +52,7 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -420,7 +421,7 @@ func (s *Server) handleMembersNewEnrollStart(w http.ResponseWriter, r *http.Requ
 		"deviceId":  deviceID,
 		"sessionId": sessionID,
 	})
-	ui.RenderFragment(w, ui.EnrollmentPollingFragment(uaUserID, s.resolveDisplayName(r, uaUserID), sessionID))
+	ui.RenderFragment(w, ui.EnrollmentPollingFragment(uaUserID, s.resolveDisplayName(r, uaUserID), sessionID, 0))
 }
 
 // handleMembersNewEnrollPoll runs orchestration step 6: §6.3 fetches
@@ -451,6 +452,25 @@ func (s *Server) handleMembersNewEnrollPoll(w http.ResponseWriter, r *http.Reque
 	}
 
 	displayName := s.resolveDisplayName(r, uaUserID)
+
+	// Bounded lifetime: the polling fragment threads a poll counter
+	// through ?n=. Past the cap (~60s at 500ms/poll) the session is
+	// dropped so the reader exits enrollment mode, and staff get a
+	// retry fragment instead of an eternal spinner — the timeout the
+	// flow always documented but never enforced.
+	const maxEnrollmentPolls = 120
+	pollCount, _ := strconv.Atoi(r.URL.Query().Get("n"))
+	if pollCount > maxEnrollmentPolls {
+		_ = s.unifi.DeleteNFCEnrollmentSession(r.Context(), sessionID)
+		s.audit.Log("members_new_enroll_timeout", s.clientIP(r), map[string]any{
+			"uaUserId": uaUserID, "sessionId": sessionID,
+		})
+		ui.RenderFragment(w, ui.EnrollmentFailedFragment(uaUserID, displayName,
+			"No card tap within 60 seconds — enrollment session closed. Pick a reader to try again.",
+			s.listReaderOptions(r)))
+		return
+	}
+
 	status, err := s.unifi.GetNFCEnrollmentStatus(r.Context(), sessionID)
 	if err != nil {
 		ui.RenderFragment(w, ui.EnrollmentFailedFragment(uaUserID, displayName,
@@ -459,8 +479,8 @@ func (s *Server) handleMembersNewEnrollPoll(w http.ResponseWriter, r *http.Reque
 	}
 	if status == nil || status.Token == "" {
 		// Tap hasn't happened yet — re-render the polling fragment so
-		// HTMX continues the every-500ms loop.
-		ui.RenderFragment(w, ui.EnrollmentPollingFragment(uaUserID, displayName, sessionID))
+		// HTMX continues the every-500ms loop, carrying the counter.
+		ui.RenderFragment(w, ui.EnrollmentPollingFragment(uaUserID, displayName, sessionID, pollCount))
 		return
 	}
 

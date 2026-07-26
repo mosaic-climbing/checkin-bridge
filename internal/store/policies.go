@@ -11,7 +11,7 @@ import (
 type DoorPolicy struct {
 	DoorID        string `db:"door_id"        json:"doorId"`
 	DoorName      string `db:"door_name"      json:"doorName"`
-	Policy        string `db:"policy"         json:"policy"`         // "membership", "waiver", "staff_only", "open"
+	Policy        string `db:"policy"         json:"policy"` // "membership", "waiver", "staff_only", "open"
 	RequireWaiver bool   `db:"require_waiver" json:"requireWaiver"`
 	AllowedBadges string `db:"allowed_badges" json:"allowedBadges"` // comma-separated badge names, empty = all
 	Notes         string `db:"notes"          json:"notes"`

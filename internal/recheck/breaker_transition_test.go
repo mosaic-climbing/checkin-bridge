@@ -192,7 +192,6 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
-
 // ─── onTransition hook (Phase 1 alerting) ────────────────────
 
 // hookRecorder collects (transition, reason) pairs the hook receives.

@@ -97,10 +97,10 @@ func TestParseAllowedNetworks(t *testing.T) {
 		{"", 0, false},
 		{"10.0.1.0/24", 1, false},
 		{"10.0.1.0/24, 192.168.1.0/24", 2, false},
-		{"10.0.1.5", 1, false},                   // single IP → /32
-		{"10.0.1.0/24, 10.0.1.5", 2, false},      // mixed
-		{"not-an-ip", 0, true},                    // invalid
-		{"10.0.1.0/33", 0, true},                  // invalid CIDR
+		{"10.0.1.5", 1, false},              // single IP → /32
+		{"10.0.1.0/24, 10.0.1.5", 2, false}, // mixed
+		{"not-an-ip", 0, true},              // invalid
+		{"10.0.1.0/33", 0, true},            // invalid CIDR
 	}
 
 	for _, tt := range tests {
@@ -127,10 +127,10 @@ func TestIsAllowedIP(t *testing.T) {
 	}{
 		{"10.0.1.5", true},
 		{"10.0.1.254", true},
-		{"10.0.2.5", false},      // wrong subnet
+		{"10.0.2.5", false}, // wrong subnet
 		{"192.168.50.1", true},
-		{"192.168.51.1", false},  // wrong subnet
-		{"172.16.0.1", false},    // not in any allowed range
+		{"192.168.51.1", false}, // wrong subnet
+		{"172.16.0.1", false},   // not in any allowed range
 	}
 
 	for _, tt := range tests {

@@ -77,7 +77,7 @@ type Store interface {
 // depends on. Same rationale as Store: tests can stub this without a
 // live GraphQL endpoint or recorded fixtures.
 type RedpointClient interface {
-	RefreshCustomers(ctx context.Context, customerIDs []string) ([]*redpoint.Customer, error)
+	RefreshCustomers(ctx context.Context, customerIDs []string) (*redpoint.RefreshOutcome, error)
 }
 
 // UnifiClient is the slice of *unifi.Client the recheck path depends on.
@@ -274,24 +274,32 @@ func (s *Service) RecheckDeniedTap(ctx context.Context, nfcToken string) (*Resul
 		"customerId", cached.CustomerID,
 	)
 
-	customers, err := s.redpoint.RefreshCustomers(ctx, []string{cached.CustomerID})
+	outcome, err := s.redpoint.RefreshCustomers(ctx, []string{cached.CustomerID})
 	if err != nil {
 		// Count this as a breaker failure — network/5xx/auth errors are
 		// the signals the breaker exists to protect against.
 		s.breaker.failure()
 		return nil, fmt.Errorf("redpoint live query failed: %w", err)
 	}
+	// A failed per-ID lookup is an upstream-health failure too. Before
+	// RefreshOutcome existed, these were swallowed into "customer not
+	// found" — which both fed the breaker a false success AND told the
+	// denied member "you're not in Redpoint" during an outage.
+	if len(outcome.FailedIDs) > 0 {
+		s.breaker.failure()
+		return nil, fmt.Errorf("redpoint live query failed for customer %s", cached.CustomerID)
+	}
 	// Redpoint responded successfully; reset the breaker regardless of
 	// whether the customer was found. A missing customer is an
 	// application-level answer, not an upstream health signal.
 	s.breaker.success()
 
-	if len(customers) == 0 {
+	if len(outcome.Customers) == 0 {
 		result.Reason = "customer not found in Redpoint"
 		return result, nil
 	}
 
-	cust := customers[0]
+	cust := outcome.Customers[0]
 
 	// Check fresh status
 	badgeStatus := ""

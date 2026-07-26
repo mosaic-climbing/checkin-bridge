@@ -706,10 +706,15 @@ func PostCreateFragment(uaUserID, displayName, redpointCustomerID string, reader
 // POST /ui/members/new/{id}/enroll returns. It contains an HTMX
 // hx-trigger="every 500ms" pointing at the poll endpoint, so the same
 // slot will re-render itself with a new fragment as soon as the tap
-// is detected (or the timeout fires).
-func EnrollmentPollingFragment(uaUserID, displayName, sessionID string) string {
-	pollURL := fmt.Sprintf(`/ui/members/new/%s/enroll/%s/poll`,
-		HTMLEscape(uaUserID), HTMLEscape(sessionID))
+// is detected or the timeout fires.
+//
+// pollCount is the number of polls completed so far; each re-render
+// passes it back incremented via the ?n= query so the handler can
+// bound the loop (the timeout this fragment always promised but
+// didn't have — an abandoned session used to spin forever).
+func EnrollmentPollingFragment(uaUserID, displayName, sessionID string, pollCount int) string {
+	pollURL := fmt.Sprintf(`/ui/members/new/%s/enroll/%s/poll?n=%d`,
+		HTMLEscape(uaUserID), HTMLEscape(sessionID), pollCount+1)
 	cancelURL := fmt.Sprintf(`/ui/members/new/%s/enroll/%s`,
 		HTMLEscape(uaUserID), HTMLEscape(sessionID))
 	return fmt.Sprintf(`<div class="card" id="members-new-result">`+

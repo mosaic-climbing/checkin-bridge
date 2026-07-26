@@ -10,9 +10,9 @@ import (
 // Two independent decisions are recorded per event:
 //   - Result      — the bridge's verdict ("allowed", "denied", "recheck_allowed")
 //   - UnifiResult — the UA-Hub's own verdict ("ACCESS" or "BLOCKED"), read off
-//                    the WebSocket AccessEvent.Result field. Used by the shadow
-//                    decisions panel to surface disagreements before flipping
-//                    from shadow to live.
+//     the WebSocket AccessEvent.Result field. Used by the shadow
+//     decisions panel to surface disagreements before flipping
+//     from shadow to live.
 type CheckInEvent struct {
 	ID                int    `db:"id"                  json:"id"`
 	Timestamp         string `db:"timestamp"           json:"timestamp"`
@@ -21,11 +21,11 @@ type CheckInEvent struct {
 	CustomerName      string `db:"customer_name"       json:"customerName"`
 	DoorID            string `db:"door_id"             json:"doorId"`
 	DoorName          string `db:"door_name"           json:"doorName"`
-	Result            string `db:"result"              json:"result"`       // "allowed", "denied", "recheck_allowed"
+	Result            string `db:"result"              json:"result"` // "allowed", "denied", "recheck_allowed"
 	DenyReason        string `db:"deny_reason"         json:"denyReason"`
 	RedpointRecorded  bool   `db:"redpoint_recorded"   json:"redpointRecorded"`
 	RedpointCheckInID string `db:"redpoint_checkin_id" json:"redpointCheckInId"`
-	UnifiResult       string `db:"unifi_result"        json:"unifiResult"`  // "ACCESS", "BLOCKED", "" if unknown
+	UnifiResult       string `db:"unifi_result"        json:"unifiResult"` // "ACCESS", "BLOCKED", "" if unknown
 	// UnifiLogID is the stable UA-Hub system-log `_id` that produced
 	// this check-in (v0.5.0+, tap-poller path). Empty on historical
 	// rows and on rows that never had a UniFi side (e.g. devhooks
@@ -277,12 +277,12 @@ func (s *Store) DisagreementEvents(ctx context.Context, limit int) ([]CheckInEve
 // for today's traffic. Emitted by the shadow-decisions panel so operators
 // can see at a glance whether they're safe to flip to live.
 type ShadowDecisionStats struct {
-	Total        int `db:"total"         json:"total"`
-	Agree        int `db:"agree"         json:"agree"`
-	Disagree     int `db:"disagree"      json:"disagree"`
-	Unknown      int `db:"unknown"       json:"unknown"`  // no unifi_result recorded
-	WouldMiss    int `db:"would_miss"    json:"wouldMiss"`    // UniFi ACCESS, bridge denied — paying members we'd lock out
-	WouldAdmit   int `db:"would_admit"   json:"wouldAdmit"`   // UniFi BLOCKED, bridge allowed — UniFi policy we'd override
+	Total      int `db:"total"         json:"total"`
+	Agree      int `db:"agree"         json:"agree"`
+	Disagree   int `db:"disagree"      json:"disagree"`
+	Unknown    int `db:"unknown"       json:"unknown"`    // no unifi_result recorded
+	WouldMiss  int `db:"would_miss"    json:"wouldMiss"`  // UniFi ACCESS, bridge denied — paying members we'd lock out
+	WouldAdmit int `db:"would_admit"   json:"wouldAdmit"` // UniFi BLOCKED, bridge allowed — UniFi policy we'd override
 }
 
 // ShadowDecisionStatsToday returns agreement counters for today.

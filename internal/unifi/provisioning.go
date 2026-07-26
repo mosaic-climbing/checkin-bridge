@@ -275,10 +275,10 @@ func (c *Client) DeleteNFCEnrollmentSession(ctx context.Context, sessionID strin
 // If UserID is empty, the card is enrolled but unbound, which is the
 // expected state right after §6.3 completes and before §3.7 runs.
 type NFCCardOwner struct {
-	Token     string `json:"token"`
-	CardID    string `json:"card_id"`
-	UserID    string `json:"user_id"`
-	UserName  string `json:"user_name"`
+	Token    string `json:"token"`
+	CardID   string `json:"card_id"`
+	UserID   string `json:"user_id"`
+	UserName string `json:"user_name"`
 }
 
 // FetchNFCCardByToken looks up the current owner of an NFC card (§6.7).

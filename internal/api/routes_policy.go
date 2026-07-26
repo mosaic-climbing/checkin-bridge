@@ -11,6 +11,7 @@ import (
 	"github.com/mosaic-climbing/checkin-bridge/internal/store"
 	"github.com/mosaic-climbing/checkin-bridge/internal/ui"
 )
+
 func (s *Server) handleAddDoorPolicy(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
 		ui.RenderFragment(w, ui.AlertFragment(false, "Store not available"))

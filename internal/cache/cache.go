@@ -1,10 +1,10 @@
 // Package cache maintains a local membership cache for offline door validation.
 //
 // The cache serves two purposes:
-//   1. On every successful check-in, the member is written to the cache
-//      so that if Redpoint goes down, the bridge can still validate them locally.
-//   2. A daily sync job queries Redpoint for all active members, refreshes
-//      the cache, and prunes anyone whose badge is no longer ACTIVE.
+//  1. On every successful check-in, the member is written to the cache
+//     so that if Redpoint goes down, the bridge can still validate them locally.
+//  2. A daily sync job queries Redpoint for all active members, refreshes
+//     the cache, and prunes anyone whose badge is no longer ACTIVE.
 //
 // Cache is persisted to a JSON file under data/member_cache.json so it
 // survives bridge restarts.

@@ -74,11 +74,11 @@ func TestRun_PrefersExistingMappingOverFuzzyMatch(t *testing.T) {
 	// deliberately different from the UA-Hub user's email so the
 	// auto-match heuristics WOULD miss without the mapping check.
 	if err := db.UpsertCustomer(ctx, &store.Customer{
-		RedpointID: "rp-garibay",
-		FirstName:  "Sean",
-		LastName:   "Garibay",
-		Email:      "sean.garibay@redpoint.example", // canonical
-		Active:     true,
+		RedpointID:  "rp-garibay",
+		FirstName:   "Sean",
+		LastName:    "Garibay",
+		Email:       "sean.garibay@redpoint.example", // canonical
+		Active:      true,
 		BadgeStatus: "ACTIVE",
 		BadgeName:   "Member",
 	}); err != nil {

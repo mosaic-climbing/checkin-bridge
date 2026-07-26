@@ -1,24 +1,25 @@
 // Package checkin orchestrates the check-in flow.
 //
 // STORE-FIRST ARCHITECTURE:
-//   The door unlock decision uses the unified store for member data and access policies.
-//   Member lookups and check-in recording happen through the store.
-//   No network call to Redpoint happens in the critical path.
 //
-//   Fast path (NFC tap → door unlock):
-//     1. Resolve card UID → nfcUID (via card mapper overrides or passthrough)
-//     2. Look up nfcUID in store (~0ms)
-//     3. Evaluate door policy: policy.EvaluateAccess(member) → unlock, deny, or recheck
-//     4. Unlock the door via UniFi REST API
+//	The door unlock decision uses the unified store for member data and access policies.
+//	Member lookups and check-in recording happen through the store.
+//	No network call to Redpoint happens in the critical path.
 //
-//   Background (async, does not block the door):
-//     5. Record the check-in event in store
-//     6. Record the check-in in Redpoint via GraphQL (if applicable)
+//	Fast path (NFC tap → door unlock):
+//	  1. Resolve card UID → nfcUID (via card mapper overrides or passthrough)
+//	  2. Look up nfcUID in store (~0ms)
+//	  3. Evaluate door policy: policy.EvaluateAccess(member) → unlock, deny, or recheck
+//	  4. Unlock the door via UniFi REST API
 //
-//   Store integration (separate goroutines):
-//     - Member sync from Redpoint on startup + periodic updates
-//     - Every successful live check-in records a CheckInEvent in store
-//     - Door policy evaluation is decoupled from member data
+//	Background (async, does not block the door):
+//	  5. Record the check-in event in store
+//	  6. Record the check-in in Redpoint via GraphQL (if applicable)
+//
+//	Store integration (separate goroutines):
+//	  - Member sync from Redpoint on startup + periodic updates
+//	  - Every successful live check-in records a CheckInEvent in store
+//	  - Door policy evaluation is decoupled from member data
 package checkin
 
 import (
@@ -124,12 +125,12 @@ type HandlerDeps struct {
 
 func NewHandler(deps HandlerDeps) *Handler {
 	return &Handler{
-		unifiClient:    deps.UniFi,
-		redpointClient: deps.Redpoint,
-		cardMapper:     deps.CardMapper,
-		store:          deps.Store,
-		rechecker:      deps.Rechecker,
-		metrics:        deps.Metrics,
+		unifiClient:          deps.UniFi,
+		redpointClient:       deps.Redpoint,
+		cardMapper:           deps.CardMapper,
+		store:                deps.Store,
+		rechecker:            deps.Rechecker,
+		metrics:              deps.Metrics,
 		gateID:               deps.GateID,
 		shadowMode:           deps.ShadowMode,
 		checkinRecordingLive: deps.CheckinRecordingLive,

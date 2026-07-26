@@ -206,7 +206,7 @@ func NewFakeRedpoint() *FakeRedpoint {
 	return f
 }
 
-func (f *FakeRedpoint) Close() { f.Server.Close() }
+func (f *FakeRedpoint) Close()             { f.Server.Close() }
 func (f *FakeRedpoint) GraphQLURL() string { return f.Server.URL + "/api/graphql" }
 func (f *FakeRedpoint) CheckInCount() int {
 	f.mu.Lock()

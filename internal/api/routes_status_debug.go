@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"net/http"
 )
+
 func (s *Server) handleStatusSync(w http.ResponseWriter, r *http.Request) {
 	if s.statusSyncer == nil {
 		writeError(w, http.StatusServiceUnavailable, "status syncer not configured")
@@ -154,7 +155,5 @@ func (s *Server) handleDebugResetBreakers(w http.ResponseWriter, r *http.Request
 		"wasOpen": wasOpen,
 	})
 }
-
-
 
 // ─── Helpers ─────────────────────────────────────────────────

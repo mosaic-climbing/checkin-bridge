@@ -187,14 +187,14 @@ type pageShape struct {
 		} `json:"pageInfo"`
 		Edges []struct {
 			Node struct {
-				ID             string   `json:"id"`
-				Active         bool     `json:"active"`
-				FirstName      string   `json:"firstName"`
-				LastName       string   `json:"lastName"`
-				Email          string   `json:"email"`
-				Barcode        string   `json:"barcode"`
-				ExternalID     string   `json:"externalId"`
-				PastDueBalance flexF64  `json:"pastDueBalance"`
+				ID             string  `json:"id"`
+				Active         bool    `json:"active"`
+				FirstName      string  `json:"firstName"`
+				LastName       string  `json:"lastName"`
+				Email          string  `json:"email"`
+				Barcode        string  `json:"barcode"`
+				ExternalID     string  `json:"externalId"`
+				PastDueBalance flexF64 `json:"pastDueBalance"`
 				HomeFacility   *struct {
 					ShortName string `json:"shortName"`
 				} `json:"homeFacility"`
@@ -398,7 +398,7 @@ func (w *Walker) Walk(ctx context.Context) error {
 // overwrites every column. So we round-trip it through the resume
 // state, and for fresh starts we pass "" which UpdateSyncState will
 // write, but we don't care because StartSync stamped it and a
-// subsequent started_at='' write is actually what we observe. That's
+// subsequent started_at=” write is actually what we observe. That's
 // a latent bug in UpdateSyncState's shape — for now we preserve the
 // resume value, and in the fresh case accept that started_at gets
 // cleared mid-run. The /admin/mirror/stats endpoint surfaces

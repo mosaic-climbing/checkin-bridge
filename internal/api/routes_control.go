@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 )
+
 func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request) {
 	doorID := sanitizeID(r.PathValue("doorId"))
 	if doorID == "" {

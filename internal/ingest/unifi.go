@@ -63,8 +63,8 @@ type IngestResult struct {
 	WithNFC    int            `json:"unifiUsersWithNfc"`
 	Matched    int            `json:"matched"`
 	Unmatched  int            `json:"unmatched"`
-	Skipped    int            `json:"skipped"`  // matched but badge not ACTIVE
-	Applied    int            `json:"applied"`   // written to cache (0 if dry run)
+	Skipped    int            `json:"skipped"` // matched but badge not ACTIVE
+	Applied    int            `json:"applied"` // written to cache (0 if dry run)
 	DryRun     bool           `json:"dryRun"`
 	Mappings   []*UserMapping `json:"mappings"`
 }
@@ -185,20 +185,57 @@ func (ing *Ingester) Run(ctx context.Context, dryRun bool) (*IngestResult, error
 			// /directory/sync will plug the gap.
 		}
 
-		// Try email match first (most reliable)
+		// Try email match first (most reliable). Households share emails,
+		// so the full collision set is fetched and a multi-hit only binds
+		// when exactly one candidate also matches the UA user's name —
+		// the same disambiguation rule the statusync matcher applies.
+		// Anything still ambiguous is left unbound with a warning; the
+		// Needs Match flow owns those. (Pre-fix this used a first-row-
+		// wins single lookup, silently binding e.g. a child's fob to the
+		// parent's account.)
 		if m.Method == MatchNone && u.Email != "" {
-			rec, err := ing.store.SearchCustomersByEmail(ctx, u.Email)
-			if err == nil && rec != nil {
-				m.RedpointID = rec.RedpointID
-				m.RedpointName = rec.FirstName + " " + rec.LastName
-				m.RedpointEmail = rec.Email
-				m.Active = rec.Active
-				m.Method = MatchByEmail
+			recs, err := ing.store.SearchAllCustomersByEmail(ctx, u.Email)
+			if err == nil && len(recs) > 0 {
+				var chosen *store.Customer
+				if len(recs) == 1 {
+					chosen = &recs[0]
+				} else {
+					uaFirst, uaLast := parseUAUserName(u)
+					var nameHits []*store.Customer
+					for i := range recs {
+						if namesEqualFold(recs[i].FirstName, recs[i].LastName, uaFirst, uaLast) {
+							nameHits = append(nameHits, &recs[i])
+						}
+					}
+					if len(nameHits) == 1 {
+						chosen = nameHits[0]
+					}
+				}
+				if chosen != nil {
+					m.RedpointID = chosen.RedpointID
+					m.RedpointName = chosen.FirstName + " " + chosen.LastName
+					m.RedpointEmail = chosen.Email
+					m.Active = chosen.Active
+					m.Method = MatchByEmail
+				} else {
+					ids := make([]string, 0, len(recs))
+					for _, r := range recs {
+						ids = append(ids, r.RedpointID)
+					}
+					m.Warning = fmt.Sprintf(
+						"multiple Redpoint customers share this email (%d) and none is a unique name match — needs manual mapping; candidates: [%s]",
+						len(recs), strings.Join(ids, ", "),
+					)
+				}
 			}
 		}
 
-		// Fall back to name match
-		if m.Method == MatchNone {
+		// Fall back to name match. Skipped when the email branch already
+		// flagged a collision: a directory-wide name hit could bind the
+		// user to a customer who doesn't even share their email, and the
+		// statusync matcher's rule for email collisions is "park it for
+		// staff", not "widen the search".
+		if m.Method == MatchNone && m.Warning == "" {
 			first, last := parseUAUserName(u)
 			if first != "" || last != "" {
 				records, err := ing.store.SearchCustomersByName(ctx, first, last)
@@ -322,6 +359,18 @@ func (ing *Ingester) Run(ctx context.Context, dryRun bool) (*IngestResult, error
 }
 
 // ─── Helpers ─────────────────────────────────────────────────
+
+// namesEqualFold reports whether a customer's (first, last) equals the
+// UA user's parsed (first, last), case-insensitively after trimming.
+// Deliberately strict — used only to disambiguate an email-collision
+// set, where a false positive binds the wrong household member.
+func namesEqualFold(custFirst, custLast, uaFirst, uaLast string) bool {
+	if strings.TrimSpace(uaFirst) == "" && strings.TrimSpace(uaLast) == "" {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(custFirst), strings.TrimSpace(uaFirst)) &&
+		strings.EqualFold(strings.TrimSpace(custLast), strings.TrimSpace(uaLast))
+}
 
 func parseUAUserName(u store.UAUser) (first, last string) {
 	if u.FirstName != "" || u.LastName != "" {

@@ -139,7 +139,7 @@ func TestAllMembersPaged_PagingRespectsSort(t *testing.T) {
 
 	for i, lastName := range []string{"Alpha", "Bravo", "Charlie", "Delta", "Echo"} {
 		if err := s.UpsertMember(ctx, &Member{
-			NfcUID:      string(rune('A' + i)) + string(rune('A' + i)),
+			NfcUID:      string(rune('A'+i)) + string(rune('A'+i)),
 			CustomerID:  "rp-" + lastName,
 			FirstName:   "F",
 			LastName:    lastName,

@@ -25,7 +25,7 @@ func TestCustomersByEmail_SingleMatch(t *testing.T) {
 	f.AddCustomer(testutil.FakeCustomer{
 		ID: "rp-1", ExternalID: "ext-1",
 		FirstName: "Alex", LastName: "Smith",
-		Email: "alex@example.com",
+		Email:  "alex@example.com",
 		Active: true, Badge: "ACTIVE",
 	})
 
@@ -56,20 +56,20 @@ func TestCustomersByEmail_HouseholdCollision(t *testing.T) {
 	f.AddCustomer(testutil.FakeCustomer{
 		ID: "rp-parent", ExternalID: "ext-parent",
 		FirstName: "Jamie", LastName: "Lee",
-		Email: "jamie@example.com",
+		Email:  "jamie@example.com",
 		Active: true, Badge: "ACTIVE",
 	})
 	f.AddCustomer(testutil.FakeCustomer{
 		ID: "rp-child", ExternalID: "ext-child",
 		FirstName: "Robin", LastName: "Lee",
-		Email: "jamie@example.com", // parent's email on the child's account
+		Email:  "jamie@example.com", // parent's email on the child's account
 		Active: true, Badge: "ACTIVE",
 	})
 	// An unrelated customer with a different email must NOT surface.
 	f.AddCustomer(testutil.FakeCustomer{
 		ID: "rp-stranger", ExternalID: "ext-stranger",
 		FirstName: "Unrelated", LastName: "Person",
-		Email: "stranger@example.com",
+		Email:  "stranger@example.com",
 		Active: true, Badge: "ACTIVE",
 	})
 
