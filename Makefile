@@ -83,6 +83,27 @@ deploy: ## Tell the gym MacBook to pull + install the latest (or a specific) rel
 	# Type the password once per deploy — the whole run finishes in that single sudo session.
 	ssh -t $(GYM) "sudo /usr/local/mosaic-bridge/update.sh $(TAG)"
 
+# ── M0 spike (read-only Redpoint probes; see gymos docs/PLAN.md §3) ──
+#
+# The RPHQ key only exists in the bridge's .env on the gym Mac, so the
+# spike binary ships there and runs in place. spike-run needs one typed
+# sudo password (to read the .env); spike-push/spike-pull are plain
+# ssh/scp. Run from the gym LAN:
+#   make spike-push spike-run spike-pull
+
+spike-push: ## Build the spike binary and copy it to the gym MacBook
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -o dist/rphq-spike ./cmd/spike
+	scp dist/rphq-spike $(GYM):/tmp/rphq-spike
+
+spike-run: ## Run the read-only probes on the gym MacBook (one sudo prompt)
+	ssh -t $(GYM) "sudo /tmp/rphq-spike --env-file /usr/local/mosaic-bridge/.env --out /tmp/spike-results.md --schema-out /tmp/rphq-schema.json"
+
+spike-pull: ## Fetch spike results back into docs/spike-results/ and clean up
+	mkdir -p docs/spike-results
+	scp $(GYM):/tmp/spike-results.md docs/spike-results/$$(date +%Y-%m-%d)-m0-readonly.md
+	-scp $(GYM):/tmp/rphq-schema.json docs/spike-results/rphq-public-schema.json
+	ssh $(GYM) 'rm -f /tmp/rphq-spike /tmp/spike-results.md /tmp/rphq-schema.json'
+
 # ── Staging ──────────────────────────────────────────────
 #
 # Staging runs as com.mosaic.bridge.stage on the same gym MacBook,
