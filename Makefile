@@ -102,7 +102,10 @@ spike-pull: ## Fetch spike results back into docs/spike-results/ and clean up
 	mkdir -p docs/spike-results
 	scp $(GYM):/tmp/spike-results.md docs/spike-results/$$(date +%Y-%m-%d)-m0-readonly.md
 	-scp $(GYM):/tmp/rphq-schema.json docs/spike-results/rphq-public-schema.json
-	ssh $(GYM) 'rm -f /tmp/rphq-spike /tmp/spike-results.md /tmp/rphq-schema.json'
+	# The spike ran under sudo, so its output files are root-owned and
+	# /tmp's sticky bit blocks a plain rm — cleanup needs sudo too (-t for
+	# the password prompt, same as spike-run).
+	ssh -t $(GYM) 'sudo rm -f /tmp/rphq-spike /tmp/spike-results.md /tmp/rphq-schema.json'
 
 # ── Staging ──────────────────────────────────────────────
 #
