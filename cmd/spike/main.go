@@ -472,10 +472,17 @@ func parseEnvFile(path string) (map[string]string, error) {
 	return env, nil
 }
 
-// window returns [now-back, now-until] as RFC3339 UTC strings for
-// DateTimeFilter after/before values.
+// rphqDateTime is the DateTime input format the server actually accepts.
+// Empirically verified 2026-08-02: RFC3339 ("2026-08-01T22:23:29Z") is
+// REJECTED with `DateTime must be a UTC date formatted as such:
+// 2000-01-01 00:00:00`, despite the public docs showing an RFC3339
+// example. Space-separated, no zone suffix, parsed as UTC.
+const rphqDateTime = "2006-01-02 15:04:05"
+
+// window returns [now-back, now-until] as UTC strings in the server's
+// required DateTimeFilter format.
 func window(now time.Time, back, until time.Duration) (after, before string) {
-	return now.Add(-back).Format(time.RFC3339), now.Add(-until).Format(time.RFC3339)
+	return now.Add(-back).Format(rphqDateTime), now.Add(-until).Format(rphqDateTime)
 }
 
 // dig walks nested map[string]any by key path, returning nil on any miss.

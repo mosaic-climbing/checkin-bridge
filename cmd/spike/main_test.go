@@ -47,10 +47,12 @@ REDPOINT_GATE_ID= spaced-value
 func TestWindow(t *testing.T) {
 	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
 	after, before := window(now, 24*time.Hour, 0)
-	if after != "2026-08-01T12:00:00Z" {
+	// The server's empirically-required format: space-separated UTC, no
+	// zone suffix. RFC3339 is rejected (see rphqDateTime).
+	if after != "2026-08-01 12:00:00" {
 		t.Errorf("after = %q", after)
 	}
-	if before != "2026-08-02T12:00:00Z" {
+	if before != "2026-08-02 12:00:00" {
 		t.Errorf("before = %q", before)
 	}
 }
