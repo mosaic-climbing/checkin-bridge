@@ -156,7 +156,7 @@ func Open(dataDir string, logger *slog.Logger) (*Store, error) {
 	//     immediately read there" code.
 	//   - Writes from N goroutines on N connections all try to grab the
 	//     SQLite reserved-lock; only one wins. The rest block on
-	//     `_busy_timeout` or fail with SQLITE_BUSY — more contention,
+	//     `busy_timeout` or fail with SQLITE_BUSY — more contention,
 	//     not more throughput.
 	//   - Prepared statements and the FTS5 virtual-table session are
 	//     bound to the conn that prepared them. With a pool, the cache
@@ -243,18 +243,22 @@ func (s *Store) Close() error {
 // sqlite, which is the pure-Go driver this codebase has used since
 // day one. A probe shows pre-A4 installs ran with journal_mode=delete,
 // foreign_keys=0, and busy_timeout=0 — not what the string implies.
-// The correct modernc syntax is `?_pragma=NAME(VAL)` (one query param
-// per pragma), which the driver runs on every new connection.
+// The modernc syntax is `?_pragma=NAME(VAL)` (one query param per
+// pragma), which the driver runs on every new connection.
 //
-// A4's mandate is the audit/cache split; changing pragma semantics
-// across the codebase is NOT in A4's scope because every test and
-// production call site has implicitly depended on the current (no-FK,
-// no-WAL, no-busy-timeout) behaviour. We preserve that exact behaviour
-// here and log the discrepancy in architecture-review.md as a separate
-// follow-up. Any A5+ pragma work can flip to `_pragma=` form once the
-// downstream churn is planned for.
+// busy_timeout now uses that honoured form. With the effective timeout
+// at 0, any concurrent reader holding a SHARED lock (gymos's nightly
+// oracle diff reads cache.db from the same machine) made our rollback-
+// journal COMMITs fail instantly with SQLITE_BUSY instead of waiting.
+// gymos keeps its lock-holds sub-second by snapshotting via VACUUM
+// INTO, so 5s is generous headroom on top.
+//
+// journal_mode and foreign_keys deliberately stay at SQLite defaults
+// (delete / off) — every test and production call site has run with
+// that behaviour since day one, and flipping either is its own
+// planned change (see architecture-review.md), not a drive-by here.
 func dsnFor(path string) string {
-	return fmt.Sprintf("file:%s?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=ON", path)
+	return fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)", path)
 }
 
 // escapeSQLString escapes single-quotes for use inside a SQL string
