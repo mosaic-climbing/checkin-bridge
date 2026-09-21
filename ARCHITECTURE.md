@@ -72,6 +72,33 @@ Key operations the bridge uses:
 - **`gates`** — discover your gate ID during setup
 - **Badge status:** `ACTIVE` / `FROZEN` / `EXPIRED`
 
+### Rate limiting
+
+Redpoint's limiter is undocumented. Observed (Sep 2026): roughly 60 requests
+per minute per API key, answered with `429` + `Retry-After` (≈ the remainder
+of the window, ~50 s) and an HTML body. Three things in the bridge respect it:
+
+- **One client-wide pacer** (`internal/redpoint/pacer.go`): every outbound
+  request — the daily cache refresh, the directory walk, ingest, taps — takes a
+  token from one bucket (`REDPOINT_MAX_RPS`, default 0.8; `REDPOINT_BURST`,
+  default 5). A `429` seen by *any* request pauses *all* requests for its
+  `Retry-After`, so the other 1,199 lookups in a walk stop burning their
+  attempts against a window that is already closed.
+- **Degraded ≠ failed** (`internal/cache/sync.go`): the daily status refresh
+  retries first-pass failures once, and tolerates up to
+  `SYNC_MAX_FAILED_FRACTION` (default 5%) unreachable customers as a degraded
+  success — their cached status is left untouched until the next tick. Above
+  that, or with zero reached, the job fails, `/ui/sync` goes red and
+  `jobs.Loop` backs off. A walk against a dead upstream aborts after 25
+  consecutive failures instead of grinding through every ID.
+- **Backoff cap of 1 h** for the daily jobs. The previous 5-minute cap turned a
+  walk that failed *because of* the rate limit into an immediate re-walk that
+  tripped it again — a self-sustaining storm that also starved the analytics
+  service sharing the key.
+
+The analytics service (`climbing-analytics`) uses the same key from its own
+process; the 0.8 rps default deliberately leaves it headroom.
+
 ---
 
 ## Project Structure

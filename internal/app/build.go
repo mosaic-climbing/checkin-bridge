@@ -122,6 +122,9 @@ func Build(ctx context.Context, opts BuildOptions) (*App, error) {
 	// here (not in NewClient) so the redpoint package keeps its
 	// construction signature stable for unit tests that don't care.
 	redpointClient.SetMetrics(met)
+	// Client-wide pacing against Redpoint's rate limit. Wired here for
+	// the same reason as metrics; config carries the operator knobs.
+	redpointClient.SetRateLimit(cfg.Redpoint.MaxRPS, cfg.Redpoint.Burst)
 
 	cardMapper, err := cardmap.New(cfg.Bridge.DataDir, logger.With("component", "cardmap"))
 	if err != nil {
@@ -147,9 +150,10 @@ func Build(ctx context.Context, opts BuildOptions) (*App, error) {
 	// Subsequent ticks use jitter (±10%) so the four schedules diverge
 	// over time even when InitialDelay only applies to the first run.
 	syncer := cache.NewSyncer(db, redpointClient, cache.SyncConfig{
-		SyncInterval: cfg.Sync.Interval,
-		PageSize:     cfg.Sync.PageSize,
-		InitialDelay: 120 * time.Second,
+		SyncInterval:      cfg.Sync.Interval,
+		PageSize:          cfg.Sync.PageSize,
+		InitialDelay:      120 * time.Second,
+		MaxFailedFraction: cfg.Sync.MaxFailedFraction,
 	}, logger.With("component", "syncer"))
 
 	ingester := ingest.NewIngester(redpointClient, db, logger.With("component", "ingest"))

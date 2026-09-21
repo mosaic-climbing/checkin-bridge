@@ -169,8 +169,16 @@ func TestExecWithRetry_HonoursRetryAfter(t *testing.T) {
 // a 429 arrives WITHOUT a Retry-After, we use our own exponential
 // backoff and don't wait any longer than that. Guards against a bug
 // where we misparse "absent" as "huge" and block for minutes.
+//
+// The client-wide 429 cooldown (pacer.go) has its own fallback for a
+// hint-less 429 — defaultCooldown — which this test pins to ~0 so it
+// exercises only the per-request backoff path; the cooldown fallback
+// is covered in pacer_test.go.
 func TestExecWithRetry_NoRetryAfterFallsBackToBackoff(t *testing.T) {
 	withFastBackoff(t)
+	prevCooldown := defaultCooldown
+	defaultCooldown = time.Microsecond
+	t.Cleanup(func() { defaultCooldown = prevCooldown })
 
 	fs, s := newFlakingServer(t, 429, 200)
 	c := newClientFor(t, s.URL)

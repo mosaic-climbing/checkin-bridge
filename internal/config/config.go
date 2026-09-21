@@ -50,6 +50,15 @@ type RedpointConfig struct {
 	APIKey       string `json:"apiKey"`       // REQUIRED (prefer env: REDPOINT_API_KEY)
 	FacilityCode string `json:"facilityCode"` // default: "Mosaic"
 	GateID       string `json:"gateId"`       // optional, omit to disable check-in recording
+
+	// MaxRPS caps outbound Redpoint requests, client-wide, across every
+	// caller (cache refresh, directory sync, ingest, taps). 0 disables
+	// pacing; the 429 cooldown still applies. Default 0.8 — see
+	// redpoint.DefaultMaxRPS for the observed limit this is sized to.
+	MaxRPS float64 `json:"maxRps"` // env: REDPOINT_MAX_RPS
+	// Burst is how many requests may go out back-to-back before pacing
+	// kicks in, so a tap arriving mid-walk isn't queued. Default 5.
+	Burst int `json:"burst"` // env: REDPOINT_BURST
 }
 
 func (r RedpointConfig) GraphQLURL() string {
@@ -259,6 +268,11 @@ type SyncConfig struct {
 	// shortly after that window to minimise effective propagation lag.
 	// Leave empty to fall back to interval-ticker behaviour.
 	TimeLocal string `json:"timeLocal"`
+
+	// MaxFailedFraction is the share of cached customers the daily
+	// status refresh may fail to reach and still count as a (degraded)
+	// success. Default 0.05. See cache.SyncConfig.MaxFailedFraction.
+	MaxFailedFraction float64 `json:"maxFailedFraction"` // env: SYNC_MAX_FAILED_FRACTION
 }
 
 // NotifyConfig holds push-alerting settings. Everything here is
@@ -344,6 +358,8 @@ func defaults() *Config {
 		Redpoint: RedpointConfig{
 			APIURL:       "https://lefclimbing.rphq.com",
 			FacilityCode: "Mosaic",
+			MaxRPS:       0.8,
+			Burst:        5,
 		},
 		Bridge: BridgeConfig{
 			Port:                3500,
@@ -357,8 +373,9 @@ func defaults() *Config {
 			InstanceName:        "prod",
 		},
 		Sync: SyncConfig{
-			IntervalHours: 24,
-			PageSize:      100,
+			IntervalHours:     24,
+			PageSize:          100,
+			MaxFailedFraction: 0.05,
 		},
 		Notify: NotifyConfig{
 			NtfyURL: "https://ntfy.sh",
@@ -386,6 +403,8 @@ func applyEnvOverrides(cfg *Config) {
 	envStr(&cfg.Redpoint.APIKey, "REDPOINT_API_KEY")
 	envStr(&cfg.Redpoint.FacilityCode, "REDPOINT_FACILITY_CODE")
 	envStr(&cfg.Redpoint.GateID, "REDPOINT_GATE_ID")
+	envFloat(&cfg.Redpoint.MaxRPS, "REDPOINT_MAX_RPS")
+	envInt(&cfg.Redpoint.Burst, "REDPOINT_BURST")
 
 	// Bridge
 	envInt(&cfg.Bridge.Port, "BRIDGE_PORT")
@@ -418,6 +437,7 @@ func applyEnvOverrides(cfg *Config) {
 	envInt(&cfg.Sync.IntervalHours, "SYNC_INTERVAL_HOURS")
 	envInt(&cfg.Sync.PageSize, "SYNC_PAGE_SIZE")
 	envStr(&cfg.Sync.TimeLocal, "SYNC_TIME_LOCAL")
+	envFloat(&cfg.Sync.MaxFailedFraction, "SYNC_MAX_FAILED_FRACTION")
 
 	// Notify
 	envStr(&cfg.Notify.NtfyURL, "NTFY_URL")
@@ -673,6 +693,14 @@ func envInt(target *int, key string) {
 
 // envBool accepts 1/true/yes/on (case-insensitive) as true; 0/false/no/off as false.
 // Unrecognized values leave the target unchanged.
+func envFloat(target *float64, key string) {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			*target = f
+		}
+	}
+}
+
 func envBool(target *bool, key string) {
 	v := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
 	if v == "" {

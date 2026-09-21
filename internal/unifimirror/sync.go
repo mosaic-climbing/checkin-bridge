@@ -203,7 +203,7 @@ func (s *Syncer) refreshFn(ctx context.Context) (any, error) {
 const (
 	defaultJitter       = 0.1
 	defaultBackoffStart = 5 * time.Second
-	defaultBackoffMax   = 5 * time.Minute
+	defaultBackoffMax   = 1 * time.Hour // must match app.schedulerBackoffMax
 )
 
 // Refresh fetches the full UA-Hub user directory and upserts each
