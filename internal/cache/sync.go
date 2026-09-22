@@ -22,7 +22,26 @@ type SyncConfig struct {
 	// the four schedulers that share Sync.Interval, so they don't all
 	// hit Redpoint and UA-Hub simultaneously. Zero = run immediately.
 	InitialDelay time.Duration
+	// MaxFailedFraction is the share of cached customers a refresh may
+	// fail to reach and still count as a successful (degraded) run.
+	// Zero means DefaultMaxFailedFraction. Failures above it — or a
+	// walk with no successes at all — fail the job so an outage shows
+	// red on /ui/sync and jobs.Loop backs off.
+	//
+	// Why tolerate any: the walk is ~1,200 single-customer lookups.
+	// A handful tripping Redpoint's rate limiter is not an outage, and
+	// treating it as one made jobs.Loop re-run the entire walk within
+	// minutes, which tripped the limiter again — a self-sustaining
+	// storm (232 refreshes in 9 days, Sep 2026) that also starved the
+	// analytics service sharing the API key. Unreached customers keep
+	// their cached status and are retried on the next scheduled tick.
+	MaxFailedFraction float64
 }
+
+// DefaultMaxFailedFraction tolerates 5% unreachable customers per
+// refresh — well above the 0.2–0.6% seen during rate-limit blips and
+// well below anything that looks like an upstream outage.
+const DefaultMaxFailedFraction = 0.05
 
 // Syncer periodically refreshes the local membership cache from Redpoint.
 type Syncer struct {
@@ -96,7 +115,7 @@ func (s *Syncer) refreshFn(ctx context.Context) (any, error) {
 const (
 	defaultJitter       = 0.1             // ±10% of Interval per tick
 	defaultBackoffStart = 5 * time.Second // first wait after a failure
-	defaultBackoffMax   = 5 * time.Minute // cap on doubled waits
+	defaultBackoffMax   = 1 * time.Hour   // cap on doubled waits — a 24 h job re-running every 5 min was a storm amplifier
 )
 
 // RefreshAllStatuses fetches fresh membership status for every member in the
@@ -250,13 +269,30 @@ func (s *Syncer) RefreshAllStatuses(ctx context.Context) error {
 		)
 	}
 
-	// A degraded refresh is a FAILED job, even though the successful
-	// subset was applied above: returning an error makes jobs.Loop back
-	// off and turns the sync page's last-run pill red, so an outage is
-	// visible instead of silently green with a stale cache.
-	if len(outcome.FailedIDs) > 0 {
-		return fmt.Errorf("refresh incomplete: %d of %d customers unreachable (statuses left untouched)",
-			len(outcome.FailedIDs), len(customerIDs))
+	// A refresh that could not reach more than MaxFailedFraction of the
+	// customers — or reached none — is a FAILED job even though the
+	// successful subset was applied above: returning an error makes
+	// jobs.Loop back off and turns the sync page's last-run pill red,
+	// so an outage is visible instead of silently green with a stale
+	// cache. Below that line it is a DEGRADED success: logged loudly,
+	// unreached statuses left untouched, retried next tick. See
+	// SyncConfig.MaxFailedFraction for why the tolerance exists.
+	if failed := len(outcome.FailedIDs); failed > 0 {
+		reached := len(outcome.Customers) + len(outcome.DeletedIDs)
+		frac := float64(failed) / float64(len(customerIDs))
+		if reached == 0 || frac > s.maxFailedFraction() {
+			return fmt.Errorf("refresh incomplete: %d of %d customers unreachable (statuses left untouched)",
+				failed, len(customerIDs))
+		}
+		s.logger.Warn("refresh degraded: some customers unreachable, statuses left untouched until next tick",
+			"failed", failed, "requested", len(customerIDs), "tolerance", s.maxFailedFraction())
 	}
 	return nil
+}
+
+func (s *Syncer) maxFailedFraction() float64 {
+	if s.config.MaxFailedFraction > 0 {
+		return s.config.MaxFailedFraction
+	}
+	return DefaultMaxFailedFraction
 }

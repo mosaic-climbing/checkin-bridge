@@ -64,7 +64,21 @@ type Client struct {
 	// construction-time dependency on internal/metrics — tests and ad-hoc
 	// uses can leave it nil and the instrumentation is a no-op.
 	metrics *metrics.Registry
+
+	// pacer governs every outbound request: token bucket + 429
+	// cooldown shared by all callers. See pacer.go.
+	pacer *pacer
 }
+
+// Default pacing. Redpoint's limiter is undocumented; observed
+// behaviour (Sep 2026, ~1,200 single-customer lookups per walk) is a
+// ~60 requests/minute window with Retry-After ≈ 50 s once tripped.
+// 0.8 rps keeps a full walk under the window and leaves headroom for
+// the analytics service and interactive taps that share the API key.
+const (
+	DefaultMaxRPS = 0.8
+	DefaultBurst  = 5
+)
 
 func NewClient(graphqlURL, apiKey, facilityCode string, logger *slog.Logger) *Client {
 	return &Client{
@@ -73,6 +87,7 @@ func NewClient(graphqlURL, apiKey, facilityCode string, logger *slog.Logger) *Cl
 		facilityCode: facilityCode,
 		httpClient:   &http.Client{Timeout: 30 * time.Second},
 		logger:       logger,
+		pacer:        newPacer(DefaultMaxRPS, DefaultBurst),
 	}
 }
 
@@ -218,6 +233,12 @@ func (c *Client) exec(ctx context.Context, query string, vars map[string]any) (r
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
+	// Wait for the client-wide pacer BEFORE the request timer starts,
+	// so a cooldown wait isn't reported as Redpoint latency.
+	if err := c.pacer.wait(ctx); err != nil {
+		return nil, err
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.graphqlURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -252,11 +273,25 @@ func (c *Client) exec(ctx context.Context, query string, vars map[string]any) (r
 		// the undocumented Redpoint rate limiter, which is the only channel
 		// telling us "don't come back for N seconds". We parse regardless
 		// of status; the loop only reads it on retryable errors.
-		return nil, &httpError{
+		herr := &httpError{
 			Status:     resp.StatusCode,
-			Body:       string(respBody),
+			Body:       summarizeBody(respBody),
 			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
 		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			// One 429 means the window is closed for EVERYONE on this
+			// key, not just this request. Pause the pacer so the other
+			// in-flight walks stop burning attempts against it.
+			until, extended := c.pacer.pause(herr.RetryAfter)
+			if c.metrics != nil {
+				c.metrics.Counter("redpoint_rate_limited_total").Inc()
+			}
+			if extended {
+				c.logger.Warn("redpoint rate limited; pausing all requests",
+					"retryAfter", herr.RetryAfter, "until", until.Format(time.RFC3339))
+			}
+		}
+		return nil, herr
 	}
 
 	var gqlResp gqlResponse
@@ -514,6 +549,32 @@ func (e *httpError) Error() string {
 	return fmt.Sprintf("HTTP %d: %s", e.Status, e.Body)
 }
 
+// maxErrorBody caps how much of a non-2xx response body we keep. The
+// body only ever feeds log lines, and Redpoint's 429 page is ~8 KB of
+// HTML — one of those per attempt turned the journal into wallpaper.
+const maxErrorBody = 256
+
+// summarizeBody trims a non-2xx body for logging: HTML documents are
+// replaced by a one-line marker, anything else is truncated.
+func summarizeBody(b []byte) string {
+	trimmed := strings.TrimSpace(string(b))
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "<!doctype") || strings.HasPrefix(lower, "<html") {
+		title := ""
+		if i := strings.Index(lower, "<title>"); i >= 0 {
+			rest := trimmed[i+len("<title>"):]
+			if j := strings.Index(strings.ToLower(rest), "</title>"); j >= 0 {
+				title = strings.TrimSpace(rest[:j])
+			}
+		}
+		return fmt.Sprintf("[html body, %d bytes: %s]", len(b), title)
+	}
+	if len(trimmed) > maxErrorBody {
+		return trimmed[:maxErrorBody] + "…"
+	}
+	return trimmed
+}
+
 // transportError flags failures at the HTTP transport layer (DNS, TCP,
 // TLS handshake, idle connection, mid-stream read). These are always
 // transient by nature, so the retry wrapper retries them unconditionally —
@@ -679,37 +740,44 @@ func (c *Client) RefreshCustomers(ctx context.Context, customerIDs []string) (*R
 
 	out := &RefreshOutcome{}
 
+	// Pacing is the client-wide pacer's job (see pacer.go); no per-loop
+	// sleeps here. If Redpoint is down outright, stop after a run of
+	// consecutive failures instead of grinding through every ID at
+	// three attempts each — a 1,200-member walk against a dead upstream
+	// used to take ~30 minutes to conclude "unreachable".
+	consecutiveFailures := 0
 	for i, id := range customerIDs {
-		// Rate-limit: small delay between requests
-		if i > 0 && i%10 == 0 {
-			select {
-			case <-ctx.Done():
-				return out, ctx.Err()
-			case <-time.After(1 * time.Second):
+		if consecutiveFailures >= outageAbortAfter && len(out.Customers)+len(out.DeletedIDs) == 0 {
+			c.logger.Error("aborting customer refresh: upstream appears down",
+				"consecutiveFailures", consecutiveFailures, "remaining", len(customerIDs)-i)
+			out.FailedIDs = append(out.FailedIDs, customerIDs[i:]...)
+			break
+		}
+		if err := ctx.Err(); err != nil {
+			out.FailedIDs = append(out.FailedIDs, customerIDs[i:]...)
+			return out, err
+		}
+		if err := c.refreshOne(ctx, id, out); err != nil {
+			consecutiveFailures++
+			continue
+		}
+		consecutiveFailures = 0
+	}
+
+	// Second pass: IDs that failed on a transient (a 429 window, a
+	// blip) usually succeed once the cooldown has cleared. Only worth
+	// it for a partial failure — a total outage just repeats itself,
+	// and a single-ID call (the tap recheck path) already retried.
+	if n := len(out.FailedIDs); n > 0 && n < len(customerIDs) && len(customerIDs) > 1 && ctx.Err() == nil {
+		c.logger.Info("retrying customers that failed on the first pass", "count", n)
+		retry := out.FailedIDs
+		out.FailedIDs = nil
+		for _, id := range retry {
+			if ctx.Err() != nil {
+				out.FailedIDs = append(out.FailedIDs, id)
+				continue
 			}
-		}
-
-		data, err := c.execWithRetry(ctx, customerByIDQuery, map[string]any{"id": id})
-		if err != nil {
-			c.logger.Warn("failed to refresh customer", "id", id, "error", err)
-			out.FailedIDs = append(out.FailedIDs, id)
-			continue
-		}
-
-		var result struct {
-			Customer *Customer `json:"customer"`
-		}
-		if err := json.Unmarshal(data, &result); err != nil {
-			c.logger.Warn("failed to unmarshal customer", "id", id, "error", err)
-			out.FailedIDs = append(out.FailedIDs, id)
-			continue
-		}
-
-		if result.Customer != nil {
-			out.Customers = append(out.Customers, result.Customer)
-		} else {
-			c.logger.Info("customer no longer exists in Redpoint", "id", id)
-			out.DeletedIDs = append(out.DeletedIDs, id)
+			_ = c.refreshOne(ctx, id, out)
 		}
 	}
 
@@ -720,6 +788,40 @@ func (c *Client) RefreshCustomers(ctx context.Context, customerIDs []string) (*R
 		"failed", len(out.FailedIDs),
 	)
 	return out, nil
+}
+
+// outageAbortAfter is how many consecutive failed lookups, with no
+// success yet in the walk, make RefreshCustomers conclude the upstream
+// is down and stop. Tests lower it.
+var outageAbortAfter = 25
+
+// refreshOne fetches a single customer into out. Returns non-nil only
+// when the lookup FAILED (transport / 5xx / unmarshal) — a confirmed
+// "no such customer" is a successful answer and lands in DeletedIDs.
+func (c *Client) refreshOne(ctx context.Context, id string, out *RefreshOutcome) error {
+	data, err := c.execWithRetry(ctx, customerByIDQuery, map[string]any{"id": id})
+	if err != nil {
+		c.logger.Warn("failed to refresh customer", "id", id, "error", err)
+		out.FailedIDs = append(out.FailedIDs, id)
+		return err
+	}
+
+	var result struct {
+		Customer *Customer `json:"customer"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		c.logger.Warn("failed to unmarshal customer", "id", id, "error", err)
+		out.FailedIDs = append(out.FailedIDs, id)
+		return err
+	}
+
+	if result.Customer != nil {
+		out.Customers = append(out.Customers, result.Customer)
+	} else {
+		c.logger.Info("customer no longer exists in Redpoint", "id", id)
+		out.DeletedIDs = append(out.DeletedIDs, id)
+	}
+	return nil
 }
 
 // ─── Name-Based Customer Search (for UniFi-first ingest) ─────

@@ -138,5 +138,8 @@ func logBootBanner(logger *slog.Logger, cfg *config.Config) {
 		"gateId", cfg.Redpoint.GateID,
 		"dataDir", cfg.Bridge.DataDir,
 		"syncInterval", cfg.Sync.Interval,
+		"redpointMaxRps", cfg.Redpoint.MaxRPS,
+		"redpointBurst", cfg.Redpoint.Burst,
+		"syncMaxFailedFraction", cfg.Sync.MaxFailedFraction,
 	)
 }
