@@ -177,6 +177,8 @@ func (ing *Ingester) Run(ctx context.Context, dryRun bool) (*IngestResult, error
 				m.RedpointName = rec.FirstName + " " + rec.LastName
 				m.RedpointEmail = rec.Email
 				m.Active = rec.Active
+				m.BadgeStatus = rec.BadgeStatus
+				m.BadgeName = rec.BadgeName
 				m.Method = MatchByMapping
 			}
 			// If GetCustomerByID returned nothing the mapping points at a
@@ -216,6 +218,8 @@ func (ing *Ingester) Run(ctx context.Context, dryRun bool) (*IngestResult, error
 					m.RedpointName = chosen.FirstName + " " + chosen.LastName
 					m.RedpointEmail = chosen.Email
 					m.Active = chosen.Active
+					m.BadgeStatus = chosen.BadgeStatus
+					m.BadgeName = chosen.BadgeName
 					m.Method = MatchByEmail
 				} else {
 					ids := make([]string, 0, len(recs))
@@ -246,6 +250,8 @@ func (ing *Ingester) Run(ctx context.Context, dryRun bool) (*IngestResult, error
 						m.RedpointName = rec.FirstName + " " + rec.LastName
 						m.RedpointEmail = rec.Email
 						m.Active = rec.Active
+						m.BadgeStatus = rec.BadgeStatus
+						m.BadgeName = rec.BadgeName
 						m.Method = MatchByName
 					} else if len(records) > 1 {
 						// Surface the candidate Redpoint IDs (capped) so staff
@@ -284,7 +290,7 @@ func (ing *Ingester) Run(ctx context.Context, dryRun bool) (*IngestResult, error
 	// The daily syncer (RefreshAllStatuses) will fetch live badge status
 	// from Redpoint once the cache is populated — no need to hit the
 	// rate-limited API during ingest.
-	ing.logger.Info("step 3: using directory data for initial status (daily syncer will refresh live status)")
+	ing.logger.Info("step 3: using directory badge status for initial status (daily syncer will refresh live status)")
 
 	result.Mappings = mappings
 
@@ -313,9 +319,18 @@ func (ing *Ingester) Run(ctx context.Context, dryRun bool) (*IngestResult, error
 			// so their status gets tracked and they auto-reactivate later.
 			for _, token := range m.NfcTokens {
 				// Use directory active status; badge details populated by daily syncer
-				badgeStatus := "PENDING_SYNC"
-				if m.Active {
-					badgeStatus = "ACTIVE"
+				// The directory row carries the customer's real badge
+				// status (same GraphQL field the live refresh reads).
+				// Use it. Deriving ACTIVE from the customer's active flag
+				// — as this once did — marked every matched member as
+				// door-allowed after each daily ingest (the directory
+				// walk only fetches active customers), and only the next
+				// cache refresh put the ~60% with EXPIRED/FROZEN badges
+				// back. A row with no badge stays PENDING_SYNC (not
+				// allowed) until the live refresh decides.
+				badgeStatus := m.BadgeStatus
+				if badgeStatus == "" {
+					badgeStatus = "PENDING_SYNC"
 				}
 				member := &store.Member{
 					NfcUID:      strings.ToUpper(token),
